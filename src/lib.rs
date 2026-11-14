@@ -1,5 +1,9 @@
 pub mod app;
+pub mod cli;
+pub mod config;
 pub mod connect;
+pub mod doctor;
 pub mod maintenance;
 pub mod paths;
 pub mod process;
+pub mod proposal;

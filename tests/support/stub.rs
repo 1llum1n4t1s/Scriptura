@@ -15,6 +15,34 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     // 保守 worker（Claude Code CLI）のスタブ。
     if role == "claude" {
+        // `claude auth status`（doctor の認証確認）。worker 用の記録・書込みはせず、応答だけ返す。
+        if args.first().map(String::as_str) == Some("auth")
+            && args.get(1).map(String::as_str) == Some("status")
+        {
+            // worker と同じ環境変数除去がかかっているかをテストで確認するため、漏れた変数名だけ記録する。
+            if let Some(log) = env::var_os("HOOK_STUB_AUTH_LOG") {
+                let inherited: Vec<&str> = ["CLAUDECODE", "CLAUDE_CODE_SIMPLE", "ANTHROPIC_BASE_URL"]
+                    .into_iter()
+                    .filter(|k| env::var_os(k).is_some())
+                    .collect();
+                fs::write(log, json!({"inherited_host_env": inherited}).to_string()).unwrap();
+            }
+            // 秘密風の文字列を含む応答でも doctor が出力へ写さないことを確かめる（既定は未設定）。
+            println!(
+                "{}",
+                env::var("HOOK_STUB_AUTH_JSON")
+                    .unwrap_or_else(|_| json!({"loggedIn": true, "authMethod": "claude.ai"}).to_string())
+            );
+            if let Ok(message) = env::var("HOOK_STUB_AUTH_STDERR") {
+                eprintln!("{message}");
+            }
+            std::process::exit(
+                env::var("HOOK_STUB_AUTH_EXIT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
+            );
+        }
         let mut input = String::new();
         std::io::stdin().read_to_string(&mut input).unwrap();
         // デスクトップセッション由来の環境変数が worker へ漏れていないかをテストで確認するために記録する。
@@ -24,6 +52,10 @@ fn main() {
             .collect();
         let oauth_token_kept = env::var_os("CLAUDE_CODE_OAUTH_TOKEN").is_some();
         fs::write(env::var_os("HOOK_STUB_PROMPT").unwrap(),json!({"args":args,"prompt":input,"worker_env":env::var("SCRIPTURA_WORKER").ok(),"inherited_host_env":inherited,"oauth_token_kept":oauth_token_kept}).to_string()).unwrap();
+        // timeout の順守を確かめるため、指定秒数だけ居座る（親が期限で強制終了する想定）。
+        if let Ok(seconds) = env::var("HOOK_STUB_SLEEP") {
+            std::thread::sleep(std::time::Duration::from_secs(seconds.parse().unwrap_or(0)));
+        }
         if let Ok(p) = env::var("HOOK_STUB_WRITES") {
             let writes: Value = serde_json::from_str(&p).unwrap();
             for (path, value) in writes.as_object().unwrap() {

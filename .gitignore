@@ -2,3 +2,9 @@
 /.build
 /.tmp
 /validation
+
+# プラグイン配布用の生成物（ビルド時に配置する）
+/plugins/scriptura/bin/scriptura.exe
+/plugins/scriptura/libexec/
+/plugins/scriptura/SHA256SUMS
+/xtask/target

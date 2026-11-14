@@ -1,0 +1,2 @@
+# sh ランチャーは CRLF で取得されると動かないため、常に LF で扱う。
+plugins/scriptura/bin/scriptura text eol=lf

@@ -1,6 +1,7 @@
 #![cfg(feature = "test-support")]
-use scriptura::maintenance::*;
 use rusqlite::Connection;
+use scriptura::config::{self, Config, Document, Mode, Permission, Policy, Repository, Worker};
+use scriptura::maintenance::*;
 use serde_json::{Value, json};
 use std::{
     env, fs,
@@ -233,18 +234,25 @@ struct Fixture {
     old_path: std::ffi::OsString,
 }
 impl Fixture {
+    /// 旧動作相当の設定（policy=all・push・bypass・同意あり・3 文書）を置いた環境。
     fn new() -> Self {
+        Self::with_config(Some(Config::legacy_all_push()))
+    }
+    /// 利用者設定を `SCRIPTURA_CONFIG` の一時ファイルへ置く（None なら設定ファイル無し）。
+    fn with_config(config: Option<Config>) -> Self {
         let guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("validation")
-            .join(format!(
-                "maintenance-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
+        // 置き場は `SCRIPTURA_TEST_BASE` で変えられる（未指定なら従来どおり `validation/`）。
+        let parent = env::var_os("SCRIPTURA_TEST_BASE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("validation"));
+        let base = parent.join(format!(
+            "maintenance-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         fs::create_dir_all(&base).unwrap();
         let root = base.join("repo");
         let remote = base.join("remote.git");
@@ -281,15 +289,14 @@ impl Fixture {
                 "PATH",
                 format!("{};{}", bin.display(), old_path.to_string_lossy()),
             );
-            env::set_var(
-                "SCRIPTURA_DB",
-                base.join("state/state.sqlite3"),
-            );
+            env::set_var("SCRIPTURA_DB", base.join("state/state.sqlite3"));
             env::set_var("HOOK_STUB_PROMPT", base.join("prompt.json"));
+            env::set_var("SCRIPTURA_CONFIG", base.join("config.toml"));
             env::set_var("HOOK_REAL_GIT", real);
             for key in [
                 "HOOK_STUB_WRITES",
                 "HOOK_STUB_EXIT",
+                "HOOK_STUB_SLEEP",
                 "HOOK_STUB_GH_JSON",
                 "HOOK_STUB_GH_EXIT",
                 "HOOK_STUB_GITHUB_AFTER_WORKER",
@@ -302,6 +309,7 @@ impl Fixture {
                 "HOOK_STUB_HEAD_CHANGE",
                 "HOOK_GIT_UNCERTAIN_OPERATION",
                 "SCRIPTURA_TEST_GIT_TIMEOUT_MS",
+                "SCRIPTURA_HOME",
             ] {
                 env::remove_var(key);
             }
@@ -334,7 +342,60 @@ impl Fixture {
         );
         f.git(&["remote", "add", "origin", f.remote.to_str().unwrap()]);
         f.git(&["push", "-u", "origin", "main"]);
+        if let Some(config) = config {
+            f.set_config(&config);
+        }
         f
+    }
+    fn config_path(&self) -> PathBuf {
+        self.base.join("config.toml")
+    }
+    fn set_config(&self, config: &Config) {
+        config::save_to(&self.config_path(), config).unwrap();
+    }
+    /// 登録リポジトリ 1 件だけを対象にする設定（policy=explicit）。
+    fn registered_config(&self, edit: impl FnOnce(&mut Repository)) -> Config {
+        let mut config = Config::legacy_all_push();
+        config.enrollment.policy = Policy::Explicit;
+        let mut repo = Repository {
+            root: self.root.to_string_lossy().into_owned(),
+            remote: None,
+            mode: None,
+            branches: vec![],
+            documents: None,
+            exclude: vec![],
+            paused: false,
+        };
+        edit(&mut repo);
+        config.repository.push(repo);
+        config
+    }
+    /// source.txt を変更して commit・push する（新しい push を 1 つ作る）。
+    fn push_change(&self, body: &str) {
+        fs::write(self.root.join("source.txt"), body).unwrap();
+        self.git(&["add", "source.txt"]);
+        self.git(&["commit", "-m", body]);
+        self.git(&["push"]);
+    }
+    fn hook(&self, event: &str) -> Option<String> {
+        handle_hook(&json!({"hook_event_name":event,"cwd":self.root})).unwrap()
+    }
+    /// poll_cursors の (fingerprint, pushed_commit)。DB が無ければ None（作成しない）。
+    fn cursor(&self) -> Option<(String, String)> {
+        let path = state_db_path();
+        if !path.exists() {
+            return None;
+        }
+        let db = Connection::open(path).unwrap();
+        db.query_row(
+            "SELECT fingerprint,pushed_commit FROM poll_cursors",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
+    }
+    fn prompt_record(&self) -> Value {
+        serde_json::from_slice(&fs::read(self.base.join("prompt.json")).unwrap()).unwrap()
     }
     fn git(&self, args: &[&str]) -> String {
         let r = Command::new("git")
@@ -414,6 +475,8 @@ impl Drop for Fixture {
             env::set_var("PATH", &self.old_path);
             for k in [
                 "SCRIPTURA_DB",
+                "SCRIPTURA_CONFIG",
+                "HOOK_STUB_SLEEP",
                 "HOOK_STUB_PROMPT",
                 "HOOK_REAL_GIT",
                 "HOOK_STUB_WRITES",
@@ -1390,4 +1453,614 @@ fn unmanaged_success_does_not_kill_detached_helper() {
     assert!(r.status.success());
     let r=Command::new("pwsh").args(["-NoProfile","-Command",&format!("$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue; if($p){{$p.WaitForExit(5000);if(-not $p.HasExited){{exit 1}}}};exit 0")]).output().unwrap();
     assert!(r.status.success());
+}
+
+// ---------------------------------------------------------------------------
+// P3: 利用者設定による起動判定・旧利用者の移行・documents の絞り込み
+// ---------------------------------------------------------------------------
+#[test]
+fn no_config_and_no_state_does_nothing_and_creates_nothing() {
+    let f = Fixture::with_config(None);
+    assert_eq!(f.hook("UserPromptSubmit"), None);
+    f.push_change("pushed by a brand new user");
+    assert_eq!(f.hook("Stop"), None);
+    // 同意なしに状態 DB も状態フォルダーも設定ファイルも作らない。
+    assert!(!state_db_path().exists());
+    assert!(!state_db_path().parent().unwrap().exists());
+    assert!(!f.config_path().exists());
+    assert!(!f.base.join("prompt.json").exists());
+}
+/// 状態 DB の user_version を直接書き換える（旧 DB は 0、新版が開いた DB は 1）。
+fn set_state_db_version(version: i64) {
+    let db = Connection::open(state_db_path()).unwrap();
+    db.execute_batch(&format!("PRAGMA user_version={version}"))
+        .unwrap();
+}
+#[test]
+fn state_created_by_the_new_version_never_triggers_legacy_migration() {
+    // 新版の hook / enable が作った DB（user_version=1）は、poll_cursors に行があっても旧利用者ではない。
+    // 設定を失った（消した・保存に失敗した）新規利用者に「全リポジトリ・push・権限バイパス」を作らない。
+    let f = Fixture::new();
+    assert_eq!(f.hook("UserPromptSubmit"), None);
+    assert!(f.cursor().is_some());
+    let version: i64 = Connection::open(state_db_path())
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, STATE_SCHEMA_VERSION);
+    fs::remove_file(f.config_path()).unwrap();
+    f.push_change("push without config");
+    f.writes(json!({f.root.join("README.md").to_str().unwrap():"must not be written"}));
+    assert_eq!(f.hook("Stop"), None);
+    assert!(!f.config_path().exists());
+    assert!(!f.base.join("prompt.json").exists());
+    // enable 相当の baseline だけで作られた DB でも同じ（fixture は環境変数を共有するので先に破棄する）。
+    drop(f);
+    let g = Fixture::with_config(None);
+    baseline(&g.root).unwrap();
+    assert!(g.cursor().is_some());
+    g.push_change("push after baseline only");
+    assert_eq!(g.hook("Stop"), None);
+    assert!(!g.config_path().exists());
+    assert!(!g.base.join("prompt.json").exists());
+}
+#[test]
+fn legacy_state_without_config_migrates_once_and_behaves_as_before() {
+    let f = Fixture::new();
+    assert_eq!(f.hook("UserPromptSubmit"), None);
+    // 設定導入前の旧利用者（版を持たない user_version=0 の状態 DB だけがある）の状態にする。
+    set_state_db_version(0);
+    fs::remove_file(f.config_path()).unwrap();
+    f.push_change("new push");
+    f.writes(json!({f.root.join("README.md").to_str().unwrap():"documented change"}));
+    let message = f.hook("Stop").unwrap();
+    assert!(message.contains("引き継"), "{message}");
+    match config::load_from(&f.config_path()) {
+        config::Loaded::Ok(c) => {
+            assert_eq!(
+                c.consent.unwrap().source,
+                config::ConsentSource::LegacyMigration
+            );
+            assert_eq!(c.enrollment.policy, Policy::All);
+            assert_eq!(c.defaults.mode, Mode::Push);
+            assert_eq!(c.worker.permission, Permission::Bypass);
+            assert_eq!(c.defaults.documents, Document::ALL.to_vec());
+        }
+        other => panic!("{other:?}"),
+    }
+    // 従来と同一の動作: worker が走り、文書 commit が push される。
+    assert_eq!(f.state()["phase"], "complete");
+    assert_eq!(f.git(&["rev-list", "--count", "HEAD"]).trim(), "3");
+    assert_eq!(
+        f.git(&["rev-parse", "HEAD"]),
+        f.git(&["rev-parse", "origin/main"])
+    );
+    // 2 回目以降は案内も設定の書き直しも無い。
+    let text = fs::read_to_string(f.config_path()).unwrap();
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(fs::read_to_string(f.config_path()).unwrap(), text);
+    // 状態 DB は schema 版を持つ。
+    let db = Connection::open(state_db_path()).unwrap();
+    let version: i64 = db
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, STATE_SCHEMA_VERSION);
+}
+#[test]
+fn missing_consent_and_unenrolled_repositories_are_ignored_silently() {
+    let mut no_consent = Config::legacy_all_push();
+    no_consent.consent = None;
+    let mut unenrolled = Config::legacy_all_push();
+    unenrolled.enrollment.policy = Policy::Explicit;
+    for config in [no_consent, unenrolled] {
+        let f = Fixture::with_config(Some(config));
+        assert_eq!(f.hook("UserPromptSubmit"), None);
+        f.push_change("ignored push");
+        assert_eq!(f.hook("Stop"), None);
+        assert!(!state_db_path().exists());
+        assert!(!f.base.join("prompt.json").exists());
+    }
+}
+#[test]
+fn remote_mismatch_and_disallowed_branch_hold_the_cursor() {
+    let f = Fixture::new();
+    f.hook("UserPromptSubmit");
+    let before = f.cursor().unwrap();
+    f.push_change("held push");
+    f.set_config(&f.registered_config(|r| r.remote = Some("github.com/acme/other".into())));
+    let message = f.hook("Stop").unwrap();
+    assert!(message.contains("remote"), "{message}");
+    assert_eq!(f.cursor().unwrap(), before);
+    f.set_config(&f.registered_config(|r| r.branches = vec!["develop".into()]));
+    let message = f.hook("Stop").unwrap();
+    assert!(message.contains("ブランチ"), "{message}");
+    assert_eq!(f.cursor().unwrap(), before);
+    assert!(!f.base.join("prompt.json").exists());
+    // 設定が整うと、位置を進めていなかった push が処理される。
+    f.set_config(&f.registered_config(|r| r.branches = vec!["main".into()]));
+    assert_eq!(f.hook("Stop"), None);
+    assert!(f.base.join("prompt.json").exists());
+    assert_ne!(f.cursor().unwrap(), before);
+}
+#[test]
+fn paused_and_off_advance_the_cursor_without_running() {
+    for off in ["paused", "mode-off"] {
+        let f = Fixture::new();
+        f.hook("UserPromptSubmit");
+        let before = f.cursor().unwrap();
+        f.push_change("skipped push");
+        f.set_config(&f.registered_config(|r| {
+            if off == "paused" {
+                r.paused = true
+            } else {
+                r.mode = Some(Mode::Off)
+            }
+        }));
+        assert_eq!(f.hook("Stop"), None);
+        assert_ne!(f.cursor().unwrap(), before, "{off}");
+        assert!(!f.base.join("prompt.json").exists());
+        // 有効に戻しても、見送った過去の push は処理しない。
+        f.set_config(&f.registered_config(|_| {}));
+        assert_eq!(f.hook("Stop"), None);
+        assert!(!f.base.join("prompt.json").exists(), "{off}");
+        f.push_change("processed push");
+        assert_eq!(f.hook("Stop"), None);
+        assert!(f.base.join("prompt.json").exists(), "{off}");
+    }
+}
+#[test]
+fn repository_local_files_never_enable_maintenance() {
+    let enabling = toml::to_string_pretty(&Config::legacy_all_push()).unwrap();
+    let mut explicit = Config::legacy_all_push();
+    explicit.enrollment.policy = Policy::Explicit;
+    for user_config in [None, Some(explicit)] {
+        let f = Fixture::with_config(user_config);
+        fs::create_dir_all(f.root.join(".scriptura")).unwrap();
+        for name in [
+            ".scriptura.toml",
+            "scriptura.toml",
+            ".scriptura/config.toml",
+        ] {
+            fs::write(f.root.join(name), &enabling).unwrap();
+        }
+        fs::write(
+            f.root.join("AGENTS.md"),
+            format!("```toml\n{enabling}\n```\n"),
+        )
+        .unwrap();
+        f.git(&["add", "."]);
+        f.git(&["commit", "-m", "repository-local enabling attempts"]);
+        f.git(&["push"]);
+        assert_eq!(f.hook("UserPromptSubmit"), None);
+        f.push_change("push after local config");
+        assert_eq!(f.hook("Stop"), None);
+        assert!(!state_db_path().exists());
+        assert!(!f.base.join("prompt.json").exists());
+    }
+}
+#[test]
+fn documents_setting_narrows_prompt_and_allowed_paths() {
+    let mut config = Config::legacy_all_push();
+    config.defaults.documents = vec![Document::Readme];
+    let f = Fixture::with_config(Some(config));
+    f.hook("UserPromptSubmit");
+    f.push_change("docs filter");
+    f.writes(json!({f.root.join("README.md").to_str().unwrap():"readme only"}));
+    assert_eq!(f.hook("Stop"), None);
+    let prompt = f.prompt_record()["prompt"].as_str().unwrap().to_owned();
+    assert!(prompt.contains("README.md"));
+    assert!(
+        !prompt.contains("AGENTS") && !prompt.contains("DESIGN"),
+        "{prompt}"
+    );
+    let state = f.state();
+    assert!(state["before"].get("README.md").is_some());
+    assert!(state["before"].get("AGENTS.md").is_none());
+    assert!(state["before"].get("DESIGN.md").is_none());
+    assert_eq!(
+        f.git(&["show", "--format=", "--name-only", "HEAD"]),
+        "README.md\n"
+    );
+}
+#[test]
+fn documents_outside_the_setting_are_out_of_scope_for_the_worker() {
+    let f = Fixture::new();
+    // 対象外の変更の検出（全体比較）は Restricted のときだけ行う。
+    let options = MaintenanceOptions {
+        documents: vec![Document::Readme],
+        ..options_with(Permission::Restricted)
+    };
+    f.writes(json!({f.root.join("AGENTS.md").to_str().unwrap():"not allowed"}));
+    let head = f.git(&["rev-parse", "HEAD"]);
+    let message = maintain_and_publish_with(
+        &f.root,
+        "fixture reason",
+        &[f.root.join("README.md")],
+        Some("fixture"),
+        &[f.root.clone()],
+        &options,
+    )
+    .unwrap();
+    assert!(message.contains("AGENTS.md"), "{message}");
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(f.state()["phase"], "worker_failed");
+}
+#[test]
+fn newer_state_schema_is_left_untouched() {
+    let f = Fixture::new();
+    let path = state_db_path();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    {
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("PRAGMA user_version=99").unwrap();
+    }
+    assert_eq!(f.hook("UserPromptSubmit"), None);
+    f.push_change("newer schema");
+    assert_eq!(f.hook("Stop"), None);
+    let db = Connection::open(&path).unwrap();
+    let version: i64 = db
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 99);
+    let tables: i64 = db
+        .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(tables, 0);
+    assert!(!path.with_extension("poll-lock.sqlite3").exists());
+    assert!(!f.base.join("prompt.json").exists());
+}
+#[test]
+fn broken_config_does_nothing_with_a_single_message() {
+    for text in [
+        "not = [toml",
+        "schema = 1\nunknown_key = true\n",
+        "schema = 99\n",
+    ] {
+        let f = Fixture::with_config(None);
+        fs::write(f.config_path(), text).unwrap();
+        let message = f.hook("UserPromptSubmit").unwrap();
+        assert!(message.contains("設定"), "{message}");
+        // TOML のエラー全文（設定ファイルの該当行の抜粋）は出さず、先頭 1 行だけにする。
+        assert!(!message.contains('\n'), "{message}");
+        f.push_change("broken config");
+        let message = f.hook("Stop").unwrap();
+        assert!(message.contains("設定"), "{message}");
+        assert!(!message.contains('\n'), "{message}");
+        assert!(!state_db_path().exists());
+        assert!(!f.base.join("prompt.json").exists());
+        // 壊れた設定は書き換えない。
+        assert_eq!(fs::read_to_string(f.config_path()).unwrap(), text);
+    }
+}
+#[test]
+fn baseline_records_the_current_push_without_processing_it() {
+    let f = Fixture::new();
+    f.push_change("before enabling");
+    baseline(&f.root).unwrap();
+    assert!(f.cursor().is_some());
+    assert_eq!(f.hook("Stop"), None);
+    assert!(!f.base.join("prompt.json").exists());
+    f.push_change("after enabling");
+    assert_eq!(f.hook("Stop"), None);
+    assert!(f.base.join("prompt.json").exists());
+}
+#[test]
+fn run_now_processes_the_current_state_even_when_already_recorded() {
+    let f = Fixture::new();
+    f.hook("UserPromptSubmit");
+    f.push_change("recorded");
+    assert_eq!(f.hook("Stop"), None);
+    fs::write(f.base.join("prompt.json"), "").unwrap();
+    f.writes(json!({f.root.join("DESIGN.md").to_str().unwrap():"forced"}));
+    // 通常の poll は位置が同じなので何もしない。
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(fs::read_to_string(f.base.join("prompt.json")).unwrap(), "");
+    assert_eq!(
+        run_now(&f.root, MaintenanceOptions::default()).unwrap(),
+        None
+    );
+    assert!(f.prompt_record()["prompt"].is_string());
+}
+
+// ---------------------------------------------------------------------------
+// P4: worker の権限制限・設定反映・対象外変更の検出
+// ---------------------------------------------------------------------------
+fn section(args: &[Value], flag: &str) -> Vec<String> {
+    let start = args.iter().position(|a| a == flag).unwrap() + 1;
+    args[start..]
+        .iter()
+        .map(|a| a.as_str().unwrap().to_owned())
+        .take_while(|a| !a.starts_with("--"))
+        .collect()
+}
+fn pair(args: &[Value], flag: &str, value: &str) -> bool {
+    args.windows(2).any(|w| w[0] == flag && w[1] == value)
+}
+#[test]
+fn restricted_worker_argument_contract_and_settings() {
+    let f = Fixture::new();
+    // PATH のスタブを退避し、設定の claude_path だけで起動できること（優先されること）を確かめる。
+    let alt = f.base.join("alt");
+    fs::create_dir_all(&alt).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_hook-test-stub"), alt.join("claude.exe")).unwrap();
+    fs::rename(
+        f.base.join("bin/claude.exe"),
+        f.base.join("bin/claude-disabled.exe"),
+    )
+    .unwrap();
+    let extra = vec!["custom/**".to_string()];
+    let options = MaintenanceOptions {
+        documents: Document::ALL.to_vec(),
+        exclude: config::effective_exclude(&[&extra]),
+        worker: Worker {
+            model: "model-x".into(),
+            effort: "low".into(),
+            timeout_secs: 300,
+            max_budget_usd: 2.5,
+            permission: Permission::Restricted,
+            claude_path: alt.join("claude.exe").to_string_lossy().into_owned(),
+        },
+    };
+    let keys = [
+        "CLAUDECODE",
+        "CLAUDE_CODE_SIMPLE",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+    ];
+    unsafe {
+        for k in keys {
+            env::set_var(k, "1");
+        }
+    }
+    let result = maintain_and_publish_with(
+        &f.root,
+        "fixture reason",
+        &f.docs(),
+        Some("fixture"),
+        &[f.root.clone()],
+        &options,
+    );
+    unsafe {
+        for k in keys {
+            env::remove_var(k);
+        }
+    }
+    assert_eq!(result, None);
+    let p = f.prompt_record();
+    let args = p["args"].as_array().unwrap();
+    assert!(!args.iter().any(|a| a == "--dangerously-skip-permissions"));
+    for flag in [
+        "-p",
+        "--safe-mode",
+        "--no-session-persistence",
+        "--strict-mcp-config",
+    ] {
+        assert!(args.iter().any(|a| a == flag), "{flag}");
+    }
+    for (flag, value) in [
+        ("--model", "model-x"),
+        ("--effort", "low"),
+        ("--permission-mode", "dontAsk"),
+        ("--tools", "Read,Edit,Write,Glob,Grep,Bash"),
+        ("--max-budget-usd", "2.5"),
+        ("--output-format", "text"),
+    ] {
+        assert!(pair(args, flag, value), "{flag} {value}");
+    }
+    let allowed = section(args, "--allowedTools");
+    for rule in [
+        "Read(./**)",
+        "Edit(./AGENTS.md)",
+        "Edit(./DESIGN.md)",
+        "Edit(./README.md)",
+        "Bash(git status *)",
+        "Bash(git check-ignore *)",
+        "Bash(git ls-files *)",
+    ] {
+        assert!(allowed.iter().any(|a| a == rule), "{rule}: {allowed:?}");
+    }
+    // 無条件の Read / Glob / Grep / Edit / Write / Bash は許可しない（読み取りは cwd 配下、編集は許可パス、
+    // git は読み取り専用の 3 種だけ）。
+    for bare in ["Read", "Glob", "Grep", "Edit", "Write", "Bash"] {
+        assert!(!allowed.iter().any(|a| a == bare), "{bare}");
+    }
+    // git diff 系は --output= などで作業ツリー外へ書けるため許可しない（検証は Rust 側の事後検査が担う）。
+    assert!(
+        !allowed.iter().any(|a| a.contains("git diff")),
+        "{allowed:?}"
+    );
+    let denied = section(args, "--disallowedTools");
+    for rule in [
+        "Read(.env*)",
+        "Edit(.env*)",
+        "Read(**/.env*)",
+        "Read(*.pem)",
+        "Read(**/secrets/**)",
+        "Edit(**/secrets/**)",
+        "Read(custom/**)",
+    ] {
+        assert!(denied.iter().any(|a| a == rule), "{rule}: {denied:?}");
+    }
+    // 環境変数の除去は restricted でも維持される。
+    assert_eq!(p["inherited_host_env"], json!([]));
+    assert_eq!(p["oauth_token_kept"], true);
+    assert_eq!(p["worker_env"], "1");
+}
+#[test]
+fn worker_args_omit_budget_when_zero_and_keep_bypass_contract() {
+    let worker = Worker {
+        permission: Permission::Bypass,
+        ..Worker::default()
+    };
+    let args = worker_args(&worker, &[], &[]);
+    assert!(!args.iter().any(|a| a == "--max-budget-usd"));
+    assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
+    assert!(
+        !args
+            .iter()
+            .any(|a| a == "--safe-mode" || a == "--allowedTools")
+    );
+    // 規則として安全に書けないパスは許可規則に出さない。
+    let restricted = Worker {
+        permission: Permission::Restricted,
+        ..Worker::default()
+    };
+    let args = worker_args(
+        &restricted,
+        &["a*b/AGENTS.md".into(), "ok/README.md".into()],
+        &[],
+    );
+    assert!(args.iter().any(|a| a == "Edit(./ok/README.md)"));
+    assert!(!args.iter().any(|a| a.contains("a*b")));
+}
+#[test]
+fn find_in_path_works_like_which() {
+    let f = Fixture::new();
+    let bin = f.base.join("bin");
+    let joined = env::join_paths([f.base.join("missing"), bin.clone()]).unwrap();
+    assert_eq!(
+        find_in_path("claude.exe", Some(joined.clone())),
+        Some(bin.join("claude.exe"))
+    );
+    assert_eq!(find_in_path("no-such-tool.exe", Some(joined)), None);
+    assert_eq!(find_in_path("claude.exe", None), None);
+}
+#[test]
+fn worker_timeout_comes_from_settings() {
+    let f = Fixture::new();
+    unsafe { env::set_var("HOOK_STUB_SLEEP", "30") };
+    let options = MaintenanceOptions {
+        worker: Worker {
+            timeout_secs: 1,
+            permission: Permission::Restricted,
+            ..Worker::default()
+        },
+        ..MaintenanceOptions::default()
+    };
+    let started = std::time::Instant::now();
+    let message = run_maintenance_worker_with(&f.root, "prompt", &[], &options).unwrap();
+    assert!(
+        message.contains("1 秒") && message.contains("タイムアウト"),
+        "{message}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(20));
+}
+fn options_with(permission: Permission) -> MaintenanceOptions {
+    MaintenanceOptions {
+        worker: Worker {
+            permission,
+            ..Worker::default()
+        },
+        ..MaintenanceOptions::default()
+    }
+}
+impl Fixture {
+    fn maintain_with(&self, permission: Permission) -> Option<String> {
+        maintain_and_publish_with(
+            &self.root,
+            "fixture reason",
+            &self.docs(),
+            Some("fixture"),
+            &[self.root.clone()],
+            &options_with(permission),
+        )
+    }
+    /// HEAD コミットが変更したファイルの一覧。
+    fn head_files(&self) -> Vec<String> {
+        self.git(&["show", "--name-only", "--format=", "HEAD"])
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+#[test]
+fn out_of_scope_change_fails_without_commit_when_restricted() {
+    // push モードの全体比較は Restricted のときだけ。追跡・未追跡・入れ子の対象外変更を検出する。
+    for case in ["tracked", "untracked", "nested"] {
+        let f = Fixture::new();
+        let (target, shown) = match case {
+            "tracked" => ("source.txt", "source.txt"),
+            "untracked" => ("extra.txt", "extra.txt"),
+            _ => ("deep/er/new.txt", "deep/er/new.txt"),
+        };
+        f.writes(json!({
+            f.root.join(target).to_str().unwrap(): "tampered",
+            f.root.join("AGENTS.md").to_str().unwrap(): "legitimate doc edit"
+        }));
+        let head = f.git(&["rev-parse", "HEAD"]);
+        let remote = f.git(&["rev-parse", "origin/main"]);
+        let message = f.maintain_with(Permission::Restricted).unwrap();
+        assert!(message.contains(shown), "{case}: {message}");
+        assert!(message.contains("許可文書以外"), "{message}");
+        // commit もパッチ（push）も作らない。
+        assert_eq!(f.git(&["rev-parse", "HEAD"]), head, "{case}");
+        assert_eq!(f.git(&["rev-parse", "origin/main"]), remote, "{case}");
+        assert_eq!(f.state()["phase"], "worker_failed", "{case}");
+    }
+}
+#[test]
+fn ignored_files_changed_during_worker_are_not_violations_in_push_mode() {
+    // push モードは利用者の実作業ツリーで動く。target/ や node_modules/ のような無視対象は
+    // 利用者・ツールが並行して書き換えるので、worker の違反として扱わない（文書の commit は成立する）。
+    let f = Fixture::new();
+    fs::write(
+        f.root.join(".gitignore"),
+        "cache/
+",
+    )
+    .unwrap();
+    f.git(&["add", ".gitignore"]);
+    f.git(&["commit", "-m", "ignore cache"]);
+    f.git(&["push"]);
+    f.writes(json!({
+        f.root.join("cache/x.bin").to_str().unwrap(): "concurrent build output",
+        f.root.join("AGENTS.md").to_str().unwrap(): "legitimate doc edit"
+    }));
+    assert_eq!(f.maintain_with(Permission::Restricted), None);
+    assert_eq!(f.state()["phase"], "complete");
+    assert_eq!(f.head_files(), vec!["AGENTS.md".to_string()]);
+}
+#[test]
+fn bypass_only_guards_the_commit_target_hashes() {
+    // Bypass（旧動作互換）は全体比較をせず、従来どおり commit 対象文書のハッシュ検査だけを守る。
+    // 対象外ファイルの変更は commit に混ざらない（文書だけが commit される）。
+    for target in ["source.txt", "extra.txt"] {
+        let f = Fixture::new();
+        f.writes(json!({
+            f.root.join(target).to_str().unwrap(): "changed beside the docs",
+            f.root.join("AGENTS.md").to_str().unwrap(): "legitimate doc edit"
+        }));
+        assert_eq!(f.maintain_with(Permission::Bypass), None, "{target}");
+        assert_eq!(f.state()["phase"], "complete", "{target}");
+        assert_eq!(f.head_files(), vec!["AGENTS.md".to_string()], "{target}");
+        assert_eq!(
+            fs::read_to_string(f.root.join(target)).unwrap(),
+            "changed beside the docs",
+            "{target}"
+        );
+    }
+}
+#[test]
+fn out_of_scope_change_blocks_retry_until_reverted() {
+    let f = Fixture::new();
+    f.writes(json!({f.root.join("source.txt").to_str().unwrap():"tampered"}));
+    assert!(
+        f.maintain_with(Permission::Restricted)
+            .unwrap()
+            .contains("許可文書以外")
+    );
+    // 変更が残っている間は worker を再実行しない。
+    fs::write(f.base.join("prompt.json"), "").unwrap();
+    assert!(
+        f.maintain_with(Permission::Restricted)
+            .unwrap()
+            .contains("前回")
+    );
+    assert_eq!(fs::read_to_string(f.base.join("prompt.json")).unwrap(), "");
+    // 利用者が元に戻すと再開する。
+    fs::write(f.root.join("source.txt"), "initial").unwrap();
+    f.writes(json!({}));
+    assert_eq!(f.maintain_with(Permission::Restricted), None);
+    assert_eq!(f.state()["phase"], "complete");
+    assert!(f.base.join("prompt.json").metadata().unwrap().len() > 0);
 }

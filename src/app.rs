@@ -1,6 +1,7 @@
 // 単独アプリとしての導入（install）と状態表示（status）。
 //
-// Scriptura は個人用の保守ツールで、リリースは配布せず `cargo build --release` で作った実行ファイルを使う。
+// Scriptura は Claude Code プラグインとして配布できる（本体は plugins/scriptura/ に同梱し、xtask が梱包する）。
+// 単独でも使え、その場合は `cargo build --release` で作った実行ファイルを `install` で置く。
 // install は実行中の自分自身を、利用者ごとの導入先（crate::paths::app_dir）の固定パスへ置く。
 // hook の登録は常にこの固定パスを指すため、更新しても登録をやり直す必要はない。
 //
@@ -10,11 +11,7 @@
 use crate::paths;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{
-    fs,
-    io::Write,
-    path::Path,
-};
+use std::{fs, io::Write, path::Path};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -119,7 +116,7 @@ pub fn install() -> Result<Value, String> {
     }))
 }
 
-/// 導入状態・状態フォルダ・worker CLI の有無を表示する。
+/// 導入状態と状態フォルダの場所。worker の設定は利用者設定（config）が正本なので、cli::status が足す。
 pub fn status() -> Value {
     let app = paths::app_dir();
     let exe = paths::app_executable(&app);
@@ -133,9 +130,7 @@ pub fn status() -> Value {
         "installed": exe.is_file(),
         "installedVersion": installed.as_ref().map(|v| v["version"].clone()),
         "stateDir": paths::state_dir(),
-        "stateDb": crate::maintenance::state_db_path(),
-        "workerModel": crate::maintenance::WORKER_MODEL,
-        "workerEffort": crate::maintenance::WORKER_EFFORT
+        "stateDb": crate::maintenance::state_db_path()
     })
 }
 
@@ -147,11 +142,20 @@ mod tests {
     fn executable_placement_is_idempotent_and_replaces_by_rename() {
         let root = std::env::temp_dir().join(format!("scriptura-app-{}", uuid::Uuid::new_v4()));
         let target = root.join("bin").join("scriptura.bin");
-        assert_eq!(place_executable(&target, b"one").unwrap(), Placement::Created);
-        assert_eq!(place_executable(&target, b"one").unwrap(), Placement::Unchanged);
+        assert_eq!(
+            place_executable(&target, b"one").unwrap(),
+            Placement::Created
+        );
+        assert_eq!(
+            place_executable(&target, b"one").unwrap(),
+            Placement::Unchanged
+        );
         // 開いたままのファイル（Windows の起動中の実行ファイルと同じ状態）でも置き換えられる。
         let held = fs::File::open(&target).unwrap();
-        assert_eq!(place_executable(&target, b"two").unwrap(), Placement::Replaced);
+        assert_eq!(
+            place_executable(&target, b"two").unwrap(),
+            Placement::Replaced
+        );
         assert_eq!(fs::read(&target).unwrap(), b"two");
         drop(held);
         cleanup_retired(&root.join("bin"));

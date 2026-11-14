@@ -1,0 +1,33 @@
+#!/bin/sh
+# Scriptura の POSIX sh ランチャー。
+# OS と CPU から同梱バイナリを選んで exec する。
+#   - macOS / Linux: libexec/scriptura-<target>
+#   - Windows（Git Bash / MSYS / Cygwin の sh 経由。uname -s が MINGW64_NT-* などになる）:
+#     同じディレクトリの scriptura.exe
+# 対応外・本体不在のときは hook を壊さないよう、標準エラーに短く出して exit 0 で終わる。
+here=$(cd "$(dirname "$0")" && pwd) || exit 0
+os=$(uname -s 2>/dev/null)
+cpu=$(uname -m 2>/dev/null)
+case "$os/$cpu" in
+  MINGW*/*|MSYS*/*|CYGWIN*/*)
+    bin="$here/scriptura.exe"
+    if [ ! -f "$bin" ]; then
+      echo "scriptura: binary not found for windows (skipped)" >&2
+      exit 0
+    fi
+    exec "$bin" "$@"
+    ;;
+  Darwin/arm64|Darwin/aarch64) target=aarch64-apple-darwin ;;
+  Linux/x86_64|Linux/amd64) target=x86_64-unknown-linux-musl ;;
+  Linux/aarch64|Linux/arm64) target=aarch64-unknown-linux-musl ;;
+  *)
+    echo "scriptura: unsupported platform $os/$cpu (skipped)" >&2
+    exit 0
+    ;;
+esac
+bin="$here/../libexec/scriptura-$target"
+if [ ! -x "$bin" ]; then
+  echo "scriptura: binary not found for $target (skipped)" >&2
+  exit 0
+fi
+exec "$bin" "$@"

@@ -1,0 +1,16 @@
+# Scriptura プラグインの配布用梱包ツール。
+# 空の [workspace] でルートのワークスペースから切り離している。
+# 本体（ルートの Cargo.toml）を別作業でビルドしている間も、独立して build / test できるようにするため。
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+sha2 = "0.10"
+serde_json = "1"
+# zip は圧縮に deflate のみを使う（既定機能の暗号化・時刻取得などは不要）。
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
