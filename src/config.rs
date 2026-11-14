@@ -40,6 +40,9 @@ pub const DEFAULT_SENSITIVE_PATTERNS: &[&str] = &[
     "id_rsa*",
     "id_ed25519*",
     "**/secrets/**",
+    // 実機検証（P0）で、Read(./**) だけだと .git/config を読めると分かったため追加。
+    // remote の URL にトークンが埋め込まれている場合に漏れるのを防ぐ。
+    ".git/config",
 ];
 
 /// 動作モード。優先は repository > defaults。
