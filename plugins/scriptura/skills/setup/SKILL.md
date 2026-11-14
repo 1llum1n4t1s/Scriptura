@@ -22,4 +22,6 @@ scriptura enable --repo <cwd> --mode propose --accept-consent 1 --json
 
 `--accept-consent` の値は同意文書の現行の版（現在は 1）です。版が違う、または省略すると CLI が説明文つきで拒否します（その場合は説明をあらためて伝え、同意を得直します）。push モード（`--mode push`）は利用者が明示的に求めたときだけ使い、既定にしません。
 
+保守する文書は既定で AGENTS.md / DESIGN.md / README.md の 3 種です。CHANGELOG.md やカスタム種類（設定ファイルの `[kinds.<id>]` で定義した id）は、利用者が求めたときだけ `--documents AGENTS.md,DESIGN.md,README.md,CHANGELOG.md` のように明示して加えます（定義の無い id は CLI が拒否します）。
+
 4. 実行結果の JSON（`ok`、`mode`、`branches`、`documents`、`configPath`、失敗時は `error`）を簡潔に要約して伝えます。失敗時は `error` の内容を伝え、必要なら `/scriptura:doctor` を案内します。
