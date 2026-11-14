@@ -1800,6 +1800,7 @@ fn restricted_worker_argument_contract_and_settings() {
             permission: Permission::Restricted,
             claude_path: alt.join("claude.exe").to_string_lossy().into_owned(),
         },
+        kinds: Vec::new(),
     };
     let keys = [
         "CLAUDECODE",
@@ -2063,4 +2064,1247 @@ fn out_of_scope_change_blocks_retry_until_reverted() {
     assert_eq!(f.maintain_with(Permission::Restricted), None);
     assert_eq!(f.state()["phase"], "complete");
     assert!(f.base.join("prompt.json").metadata().unwrap().len() > 0);
+}
+// ---------------------------------------------------------------------------
+// P2: 文書種類対応（カスタム種類・CHANGELOG・上限と必須見出し・テンプレート・追加指示）
+// ---------------------------------------------------------------------------
+
+/// README とカスタム種類 `architecture`（`docs/ARCHITECTURE.md`）を対象にした push モードの設定。
+fn kinds_config(edit: impl FnOnce(&mut Config)) -> Config {
+    let mut config = Config::legacy_all_push();
+    config.kinds.insert(
+        "architecture".into(),
+        config::KindSettings {
+            paths: vec!["docs/ARCHITECTURE.md".into()],
+            guidance: Some("システム構成を書く".into()),
+            ..Default::default()
+        },
+    );
+    config.defaults.documents = vec![Document::Readme, Document::Custom("architecture".into())];
+    edit(&mut config);
+    config
+}
+fn arch(config: &mut Config) -> &mut config::KindSettings {
+    config.kinds.get_mut("architecture").unwrap()
+}
+impl Fixture {
+    /// ファイルを置いて commit・push する（作業ツリーを clean に保つ）。
+    fn commit_push_file(&self, rel: &str, body: &str) {
+        let path = self.root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body).unwrap();
+        self.git(&["add", rel]);
+        self.git(&["commit", "-m", &format!("add {rel}")]);
+        self.git(&["push"]);
+    }
+    fn arch_path(&self) -> String {
+        self.root
+            .join("docs/ARCHITECTURE.md")
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+    fn prompt_text(&self) -> String {
+        self.prompt_record()["prompt"].as_str().unwrap().to_owned()
+    }
+    /// 保存済みの worker 引数の `--allowedTools` 区間。
+    fn allowed_rules(&self) -> Vec<String> {
+        let record = self.prompt_record();
+        section(record["args"].as_array().unwrap(), "--allowedTools")
+    }
+}
+
+#[test]
+fn custom_kind_paths_reach_restricted_worker_args_and_prompt() {
+    let config = kinds_config(|c| c.worker.permission = Permission::Restricted);
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("docs/ARCHITECTURE.md", "# 構成");
+    f.hook("UserPromptSubmit");
+    f.push_change("custom kind");
+    f.writes(json!({f.arch_path(): "# 構成\n更新"}));
+    assert_eq!(f.hook("Stop"), None);
+    let rules = f.allowed_rules();
+    assert!(
+        rules.contains(&"Edit(./docs/ARCHITECTURE.md)".to_string()),
+        "{rules:?}"
+    );
+    assert!(
+        rules.contains(&"Edit(./README.md)".to_string()),
+        "{rules:?}"
+    );
+    assert!(
+        !rules
+            .iter()
+            .any(|r| r.contains("AGENTS") || r.contains("DESIGN")),
+        "{rules:?}"
+    );
+    let prompt = f.prompt_text();
+    assert!(
+        prompt.contains("architecture 対象: `docs/ARCHITECTURE.md`。"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("architecture の記載指針: システム構成を書く。"),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains("AGENTS") && !prompt.contains("DESIGN"),
+        "{prompt}"
+    );
+    // カスタム種類の文書だけが commit・push される（commit 対象ハッシュ検査は従来どおり）。
+    assert_eq!(
+        f.git(&["show", "--format=", "--name-only", "HEAD"]),
+        "docs/ARCHITECTURE.md\n"
+    );
+    assert!(f.state()["before"].get("docs/ARCHITECTURE.md").is_some());
+}
+
+#[test]
+fn custom_kind_without_create_if_missing_is_absent_until_the_file_exists() {
+    let config = kinds_config(|c| c.worker.permission = Permission::Restricted);
+    let f = Fixture::with_config(Some(config));
+    f.hook("UserPromptSubmit");
+    f.push_change("no architecture yet");
+    f.writes(json!({f.root.join("README.md").to_str().unwrap(): "readme v2"}));
+    assert_eq!(f.hook("Stop"), None);
+    let prompt = f.prompt_text();
+    assert!(
+        !prompt.contains("architecture") && !prompt.contains("ARCHITECTURE"),
+        "{prompt}"
+    );
+    assert!(
+        !f.allowed_rules().iter().any(|r| r.contains("ARCHITECTURE")),
+        "{:?}",
+        f.allowed_rules()
+    );
+    assert!(f.state()["before"].get("docs/ARCHITECTURE.md").is_none());
+    // 作成されると対象になる。
+    f.commit_push_file("docs/ARCHITECTURE.md", "# 構成");
+    f.push_change("architecture exists");
+    f.writes(json!({}));
+    assert_eq!(f.hook("Stop"), None);
+    assert!(
+        f.prompt_text()
+            .contains("architecture 対象: `docs/ARCHITECTURE.md`")
+    );
+    assert!(
+        f.allowed_rules()
+            .contains(&"Edit(./docs/ARCHITECTURE.md)".to_string())
+    );
+}
+
+#[test]
+fn custom_kind_with_create_if_missing_asks_for_creation_and_allows_the_path() {
+    let config = kinds_config(|c| {
+        c.worker.permission = Permission::Restricted;
+        arch(c).create_if_missing = Some(true);
+    });
+    let f = Fixture::with_config(Some(config));
+    f.hook("UserPromptSubmit");
+    f.push_change("create architecture");
+    f.writes(json!({f.arch_path(): "# 構成"}));
+    assert_eq!(f.hook("Stop"), None);
+    let prompt = f.prompt_text();
+    assert!(
+        prompt.contains("architecture の対象（`docs/ARCHITECTURE.md`）がありません。"),
+        "{prompt}"
+    );
+    assert!(
+        f.allowed_rules()
+            .contains(&"Edit(./docs/ARCHITECTURE.md)".to_string())
+    );
+    assert_eq!(
+        f.git(&["show", "--format=", "--name-only", "HEAD"]),
+        "docs/ARCHITECTURE.md\n"
+    );
+}
+
+#[test]
+fn deleted_custom_document_is_reported_as_previously_existing() {
+    let config = kinds_config(|c| arch(c).create_if_missing = Some(true));
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("docs/ARCHITECTURE.md", "# 構成");
+    f.hook("UserPromptSubmit");
+    f.push_change("first processed push");
+    assert_eq!(f.hook("Stop"), None);
+    f.git(&["rm", "docs/ARCHITECTURE.md"]);
+    f.push_change("architecture removed");
+    assert_eq!(f.hook("Stop"), None);
+    let prompt = f.prompt_text();
+    assert!(
+        prompt.contains("前回存在した architecture の対象（`docs/ARCHITECTURE.md`）がありません。"),
+        "{prompt}"
+    );
+}
+
+#[test]
+fn limit_violation_keeps_ready_and_never_commits_in_any_permission_mode() {
+    for permission in [Permission::Bypass, Permission::Restricted] {
+        let config = kinds_config(|c| {
+            c.worker.permission = permission;
+            arch(c).max_chars = Some(10);
+        });
+        let f = Fixture::with_config(Some(config));
+        f.commit_push_file("docs/ARCHITECTURE.md", "short");
+        f.hook("UserPromptSubmit");
+        f.push_change("limit");
+        let head = f.git(&["rev-parse", "HEAD"]);
+        let remote = f.git(&["rev-parse", "origin/main"]);
+        f.writes(json!({f.arch_path(): "x".repeat(20)}));
+        let message = f.hook("Stop").expect("上限超過の通知があるはず");
+        assert!(
+            message.contains("上限") && message.contains("docs/ARCHITECTURE.md"),
+            "{permission:?}: {message}"
+        );
+        // AGENTS の上限超過と同じ扱い: commit も push もせず、phase は ready のまま・error を残す。
+        assert_eq!(f.git(&["rev-parse", "HEAD"]), head, "{permission:?}");
+        assert_eq!(
+            f.git(&["rev-parse", "origin/main"]),
+            remote,
+            "{permission:?}"
+        );
+        let state = f.state();
+        assert_eq!(state["phase"], "ready", "{permission:?}");
+        assert!(state["error"].as_str().unwrap().contains("上限"));
+    }
+}
+
+#[test]
+fn limit_violation_is_checked_again_when_a_ready_checkpoint_resumes() {
+    // 中断復旧（ready の記録から再開）でも、同じ検査を通ってから commit する。
+    let mut config = kinds_config(|_| {});
+    config.kinds.insert(
+        "readme".into(),
+        config::KindSettings {
+            max_chars: Some(5),
+            ..Default::default()
+        },
+    );
+    let f = Fixture::with_config(Some(config.clone()));
+    let mut state = f.checkpoint("ready");
+    fs::write(f.root.join("README.md"), "far too long for the limit").unwrap();
+    state["after"]["README.md"] = json!(document_hash(&f.root, "README.md").unwrap());
+    f.save(&mut state);
+    let head = f.git(&["rev-parse", "HEAD"]);
+    let options = MaintenanceOptions {
+        documents: vec![Document::Readme],
+        kinds: scriptura::kinds::resolve_kinds(&config, &[Document::Readme]),
+        ..options_with(Permission::Bypass)
+    };
+    let message = maintain_and_publish_with(
+        &f.root,
+        "",
+        &[f.root.join("README.md")],
+        Some("fixture"),
+        &[f.root.clone()],
+        &options,
+    )
+    .expect("上限超過で止まるはず");
+    assert!(
+        message.contains("上限") && message.contains("README.md"),
+        "{message}"
+    );
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(f.state()["phase"], "ready");
+}
+
+#[test]
+fn required_headings_are_checked_after_the_worker() {
+    // (worker の書く内容, 見出しが保たれているか)。Fixture は環境変数を握るので 1 件ずつ作って捨てる。
+    for (body, kept) in [
+        ("# 構成\n見出しを消した\n", false),
+        ("# 構成\n## 責務\n追記\n", true),
+    ] {
+        let config = kinds_config(|c| arch(c).required_headings = vec!["## 責務".into()]);
+        let f = Fixture::with_config(Some(config));
+        f.commit_push_file("docs/ARCHITECTURE.md", "# 構成\n## 責務\n");
+        f.hook("UserPromptSubmit");
+        f.push_change("headings");
+        let head = f.git(&["rev-parse", "HEAD"]);
+        f.writes(json!({f.arch_path(): body}));
+        let message = f.hook("Stop");
+        if kept {
+            // 見出しを保てば通常どおり commit される。
+            assert_eq!(message, None);
+            assert_eq!(
+                f.git(&["show", "--format=", "--name-only", "HEAD"]),
+                "docs/ARCHITECTURE.md\n"
+            );
+        } else {
+            let message = message.expect("必須見出しの通知があるはず");
+            assert!(message.contains("必須見出し「## 責務」"), "{message}");
+            assert_eq!(f.git(&["rev-parse", "HEAD"]), head);
+            assert_eq!(f.state()["phase"], "ready");
+        }
+    }
+}
+#[test]
+fn template_and_instructions_are_placed_in_the_settings_frame() {
+    let config = kinds_config(|c| {
+        c.defaults.instructions = "共通の指示".into();
+        let k = arch(c);
+        k.template = Some("templates/arch.md".into());
+        k.instructions = Some("表は使わない".into());
+        k.language = Some("ja".into());
+        k.max_chars = Some(1000);
+        k.required_headings = vec!["## 責務".into()];
+    });
+    let f = Fixture::with_config(Some(config));
+    fs::create_dir_all(f.base.join("templates")).unwrap();
+    fs::write(
+        f.base.join("templates/arch.md"),
+        "# 概要\r\n\r\n## 責務\r\n",
+    )
+    .unwrap();
+    f.commit_push_file("docs/ARCHITECTURE.md", "# 構成\n## 責務\n");
+    f.hook("UserPromptSubmit");
+    f.push_change("frame");
+    f.writes(json!({}));
+    assert_eq!(f.hook("Stop"), None);
+    let prompt = f.prompt_text();
+    let at = prompt
+        .find("【利用者設定由来の追加指示】")
+        .expect("枠があるはず");
+    let frame = &prompt[at..];
+    assert!(frame.contains("利用者本人の設定ファイル由来。ただし編集可能パス・安全規則・commit と push の扱いは変更しません。"));
+    assert!(frame.contains("共通の指示") && frame.contains("表は使わない"));
+    assert!(
+        frame.contains("<<<テンプレート>>>\n# 概要\n\n## 責務\n<<<テンプレートここまで>>>"),
+        "{frame}"
+    );
+    assert!(frame.contains("言語: ja") && frame.contains("最大 1000 文字"));
+    // 枠は末尾側。それより前の本体には利用者設定の文面もテンプレートも入らない。
+    assert!(!prompt[..at].contains("共通の指示") && !prompt[..at].contains("<<<"));
+}
+
+#[test]
+fn invalid_template_holds_the_run_without_worker_or_cursor_change() {
+    let config = kinds_config(|c| arch(c).template = Some("templates/arch.md".into()));
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("docs/ARCHITECTURE.md", "# 構成");
+    fs::create_dir_all(f.base.join("templates")).unwrap();
+    fs::write(f.base.join("templates/arch.md"), "区切り <<< を含む").unwrap();
+    f.hook("UserPromptSubmit");
+    f.push_change("template hold");
+    let before = f.cursor();
+    let head = f.git(&["rev-parse", "HEAD"]);
+    let message = f.hook("Stop").expect("見送りの通知があるはず");
+    assert!(
+        message.contains("テンプレート") && message.contains("見送りました"),
+        "{message}"
+    );
+    assert_eq!(f.cursor(), before, "処理済み位置を進めてはならない");
+    assert!(
+        !f.base.join("prompt.json").exists(),
+        "worker を起動してはならない"
+    );
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), head);
+    // 直すと次回から処理できる（位置を進めていないので同じ push を処理する）。
+    fs::write(f.base.join("templates/arch.md"), "# 概要").unwrap();
+    f.writes(json!({}));
+    assert_eq!(f.hook("Stop"), None);
+    assert!(f.base.join("prompt.json").exists());
+}
+
+#[test]
+fn changelog_is_maintained_as_a_normal_kind() {
+    let mut config = Config::legacy_all_push();
+    config.defaults.documents = vec![Document::Readme, Document::Changelog];
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("CHANGELOG.md", "# Changelog\n");
+    f.hook("UserPromptSubmit");
+    f.push_change("changelog configured");
+    f.writes(json!({f.root.join("CHANGELOG.md").to_str().unwrap(): "# Changelog\n\n## [Unreleased]\n- 追加\n"}));
+    assert_eq!(f.hook("Stop"), None);
+    let prompt = f.prompt_text();
+    assert!(
+        prompt.contains("CHANGELOG 対象: `CHANGELOG.md`。"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("CHANGELOG.md には利用者に見える変更"),
+        "{prompt}"
+    );
+    assert!(
+        !prompt.contains("AGENTS") && !prompt.contains("DESIGN"),
+        "{prompt}"
+    );
+    assert!(f.state()["before"].get("CHANGELOG.md").is_some());
+    assert_eq!(
+        f.git(&["show", "--format=", "--name-only", "HEAD"]),
+        "CHANGELOG.md\n"
+    );
+    // 処理済み位置は進む（Hold ではない）。
+    let head = f.git(&["rev-parse", "HEAD~1"]);
+    assert_eq!(f.cursor().unwrap().1, head.trim());
+}
+
+#[test]
+fn run_now_resolves_changelog_but_holds_for_an_unresolvable_custom_kind() {
+    let f = Fixture::new();
+    f.hook("UserPromptSubmit");
+    f.push_change("run-now with changelog");
+    let before = f.cursor();
+    assert!(before.is_some());
+    // CHANGELOG は組み込み既定で解決できるので実行される。
+    let options = MaintenanceOptions {
+        documents: vec![Document::Readme, Document::Changelog],
+        ..MaintenanceOptions::default()
+    };
+    assert_eq!(run_now(&f.root, options).unwrap(), None);
+    assert!(f.prompt_text().contains("CHANGELOG の対象"));
+    // 定義の無いカスタム種類（kinds が空のまま）は解決できないので worker を起動せず、位置も進めない。
+    fs::remove_file(f.base.join("prompt.json")).unwrap();
+    let before = f.cursor();
+    let options = MaintenanceOptions {
+        documents: vec![Document::Custom("architecture".into())],
+        ..MaintenanceOptions::default()
+    };
+    let message = run_now(&f.root, options)
+        .unwrap()
+        .expect("見送りの通知があるはず");
+    assert!(
+        message.contains("architecture") && message.contains("解決できない"),
+        "{message}"
+    );
+    assert_eq!(f.cursor(), before);
+    assert!(!f.base.join("prompt.json").exists());
+}
+
+#[test]
+fn plan_no_longer_holds_for_changelog_or_custom_kinds() {
+    let process = |documents: Vec<Document>| {
+        let mut config = Config::legacy_all_push();
+        config.kinds.insert(
+            "architecture".into(),
+            config::KindSettings {
+                paths: vec!["docs/ARCHITECTURE.md".into()],
+                guidance: Some("構成".into()),
+                ..Default::default()
+            },
+        );
+        config.defaults.documents = documents;
+        let decision = config::resolve(&config, std::path::Path::new("D:/x"), &[], "main");
+        assert!(decision.skip_reason.is_none());
+        match plan_for_decision(&decision) {
+            PollPlan::Process(options) => options.resolved_kinds().len(),
+            other => panic!("Process を期待: {other:?}"),
+        }
+    };
+    assert_eq!(process(Document::ALL.to_vec()), 3);
+    assert_eq!(process(vec![Document::Readme, Document::Changelog]), 2);
+    assert_eq!(
+        process(vec![
+            Document::Agents,
+            Document::Custom("architecture".into())
+        ]),
+        2
+    );
+}
+
+#[test]
+fn readme_only_never_mentions_other_kinds_even_when_they_exist_and_are_defined() {
+    let config = kinds_config(|c| c.defaults.documents = vec![Document::Readme]);
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("docs/ARCHITECTURE.md", "# 構成");
+    f.commit_push_file("CHANGELOG.md", "# Changelog");
+    f.hook("UserPromptSubmit");
+    f.push_change("readme only");
+    f.writes(json!({f.root.join("README.md").to_str().unwrap(): "readme only"}));
+    assert_eq!(f.hook("Stop"), None);
+    let prompt = f.prompt_text();
+    for word in [
+        "AGENTS",
+        "DESIGN",
+        "CHANGELOG",
+        "architecture",
+        "ARCHITECTURE",
+    ] {
+        assert!(!prompt.contains(word), "{word}: {prompt}");
+    }
+    // 許可された編集対象（記録）に、対象外の種類の文書は入らない。
+    let state = f.state();
+    let before = state["before"].as_object().unwrap();
+    for name in [
+        "AGENTS.md",
+        "DESIGN.md",
+        "CHANGELOG.md",
+        "docs/ARCHITECTURE.md",
+    ] {
+        assert!(before.get(name).is_none(), "{name}: {before:?}");
+    }
+    assert!(before.get("README.md").is_some());
+}
+
+#[test]
+fn ignored_custom_document_is_owned_and_unignored_like_builtin_documents() {
+    // 共有文書の判定は「対象に含まれ、AGENTS.override.md でも .gitignore でもない」に一般化されている。
+    let f = Fixture::new();
+    f.commit_push_file("docs/ARCHITECTURE.md", "# 構成");
+    f.git(&["rm", "--cached", "docs/ARCHITECTURE.md"]);
+    fs::write(f.root.join(".gitignore"), "docs/ARCHITECTURE.md\n").unwrap();
+    f.git(&["add", ".gitignore"]);
+    f.git(&["commit", "-m", "ignored architecture"]);
+    f.git(&["push"]);
+    f.writes(json!({f.root.join(".gitignore").to_str().unwrap(): "docs/ARCHITECTURE.md\n!/docs/ARCHITECTURE.md\n"}));
+    assert_eq!(
+        maintain_and_publish_with(
+            &f.root,
+            "fixture reason",
+            &[f.root.join("docs/ARCHITECTURE.md")],
+            Some("fixture"),
+            &[f.root.clone()],
+            &options_with(Permission::Bypass),
+        ),
+        None
+    );
+    assert_eq!(f.state()["ignored_before"], json!(["docs/ARCHITECTURE.md"]));
+    assert!(
+        f.git(&["ls-files", "docs/ARCHITECTURE.md"])
+            .contains("ARCHITECTURE.md")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P3: 文書種類ごとのメンテナンスタイミング（期限前の種類は worker に渡さない）
+// ---------------------------------------------------------------------------
+
+/// タイミング設定だけの `[kinds.<id>.timing]`。
+fn timing(when: config::When, paths: &[&str], hours: Option<u32>) -> Option<config::Timing> {
+    Some(config::Timing {
+        when: Some(when),
+        paths: paths.iter().map(|p| p.to_string()).collect(),
+        min_interval_hours: hours,
+    })
+}
+/// 組み込み種類 `id` にタイミングを設定する（`[kinds.<id>]` が無ければ作る）。
+fn set_timing(config: &mut Config, id: &str, value: Option<config::Timing>) {
+    config.kinds.entry(id.into()).or_default().timing = value;
+}
+impl Fixture {
+    /// 種類別の最終完了（公開 API `timing::read_kind_runs`。読み取り専用で開く）。
+    fn kind_runs(&self) -> std::collections::BTreeMap<String, scriptura::timing::KindRun> {
+        scriptura::timing::read_kind_runs(&self.root)
+    }
+    fn kind_run_ids(&self) -> Vec<String> {
+        self.kind_runs().into_keys().collect()
+    }
+    fn head(&self) -> String {
+        self.git(&["rev-parse", "HEAD"]).trim().to_owned()
+    }
+}
+
+#[test]
+fn no_due_kind_skips_the_worker_and_advances_the_cursor() {
+    // README・architecture とも src/** の変更があったときだけ対象。
+    let config = kinds_config(|c| {
+        arch(c).timing = timing(config::When::Push, &["src/**"], None);
+        set_timing(c, "readme", timing(config::When::Push, &["src/**"], None));
+    });
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("docs/ARCHITECTURE.md", "# 構成");
+    f.hook("UserPromptSubmit");
+    let before = f.cursor().unwrap();
+    f.push_change("no source change");
+    let pushed = f.head();
+    assert_eq!(f.hook("Stop"), None);
+    assert!(
+        !f.base.join("prompt.json").exists(),
+        "worker を起動してはならない"
+    );
+    // phase が空なので AdvanceOnly と同じく処理済み位置を進める（error なし）。
+    let after = f.cursor().unwrap();
+    assert_ne!(after, before);
+    assert_eq!(after.1, pushed);
+    assert!(f.kind_runs().is_empty(), "完了していない種類を記録しない");
+    // 同じ push は再評価しない（fingerprint が同じなら早期 return）。
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.cursor().unwrap(), after);
+    // src/** の変更がある push では両方が対象になる。
+    f.commit_push_file("src/lib.rs", "fn main() {}");
+    assert_eq!(f.hook("Stop"), None);
+    let prompt = f.prompt_text();
+    assert!(prompt.contains("README.md") && prompt.contains("docs/ARCHITECTURE.md"));
+    assert_eq!(f.kind_run_ids(), ["architecture", "readme"]);
+}
+
+#[test]
+fn no_due_kind_keeps_the_cursor_while_a_publication_is_unfinished() {
+    let mut config = Config::legacy_all_push();
+    for id in ["agents", "design", "readme"] {
+        set_timing(
+            &mut config,
+            id,
+            timing(config::When::Push, &["src/**"], None),
+        );
+    }
+    let f = Fixture::with_config(Some(config));
+    f.hook("UserPromptSubmit");
+    let before = f.cursor().unwrap();
+    // 未完了の保守（worker 失敗の記録）が残っている間は、AdvanceOnly と同じく位置を進めない。
+    let mut state = f.checkpoint("worker_failed");
+    f.save(&mut state);
+    f.push_change("unfinished publication");
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.cursor().unwrap(), before);
+    assert!(!f.base.join("prompt.json").exists());
+    assert_eq!(f.state()["phase"], "worker_failed");
+    // 完了済み（complete）の記録なら進める。
+    let mut state = f.checkpoint("complete");
+    f.save(&mut state);
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.cursor().unwrap().1, f.head());
+    assert!(!f.base.join("prompt.json").exists());
+}
+
+#[test]
+fn only_due_kinds_reach_the_prompt_allowed_paths_and_kind_runs() {
+    let config = kinds_config(|c| {
+        c.worker.permission = Permission::Restricted;
+        arch(c).timing = timing(config::When::Push, &["src/**"], None);
+    });
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("docs/ARCHITECTURE.md", "# 構成");
+    f.hook("UserPromptSubmit");
+    f.push_change("readme only is due");
+    let pushed = f.head();
+    f.writes(json!({f.root.join("README.md").to_str().unwrap(): "readme v2"}));
+    assert_eq!(f.hook("Stop"), None);
+    // 期限前の architecture はプロンプト・許可パス・編集対象の記録のどこにも出ない。
+    let prompt = f.prompt_text();
+    assert!(prompt.contains("README.md"), "{prompt}");
+    assert!(
+        !prompt.contains("architecture") && !prompt.contains("ARCHITECTURE"),
+        "{prompt}"
+    );
+    let rules = f.allowed_rules();
+    assert!(
+        rules.contains(&"Edit(./README.md)".to_string()),
+        "{rules:?}"
+    );
+    assert!(
+        !rules.iter().any(|r| r.contains("ARCHITECTURE")),
+        "{rules:?}"
+    );
+    assert!(f.state()["before"].get("docs/ARCHITECTURE.md").is_none());
+    assert_eq!(
+        f.git(&["show", "--format=", "--name-only", "HEAD"]),
+        "README.md\n"
+    );
+    // 成功したので、今回対象になった種類（readme）だけ最終完了を記録する。
+    let runs = f.kind_runs();
+    assert_eq!(runs.keys().collect::<Vec<_>>(), ["readme"]);
+    assert_eq!(runs["readme"].last_commit, pushed);
+    // 処理済み位置は従来どおりリポジトリに 1 つ（push の位置）。
+    assert_eq!(f.cursor().unwrap().1, pushed);
+}
+
+#[test]
+fn min_interval_takes_effect_on_the_next_push_after_it_elapses() {
+    let config = kinds_config(|c| arch(c).timing = timing(config::When::Push, &[], Some(1)));
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("docs/ARCHITECTURE.md", "# 構成");
+    f.hook("UserPromptSubmit");
+    // 1 回目: 記録が無いので両方が対象。
+    f.push_change("first");
+    assert_eq!(f.hook("Stop"), None);
+    assert!(f.prompt_text().contains("docs/ARCHITECTURE.md"));
+    assert_eq!(f.kind_run_ids(), ["architecture", "readme"]);
+    let first = f.kind_runs()["architecture"].clone();
+    // 2 回目: 間隔内なので architecture は対象外（README だけ）。記録も更新しない。
+    f.push_change("second");
+    assert_eq!(f.hook("Stop"), None);
+    assert!(!f.prompt_text().contains("ARCHITECTURE"));
+    assert_eq!(f.kind_runs()["architecture"], first);
+    // 時間が過ぎただけでは実行しない（評価は push 検知時だけ）。前回完了を 2 時間前にしても、
+    // 新しい push が無ければ worker は起動しない。
+    let two_hours_ago = scriptura::timing::now_secs() - 7200.0;
+    Connection::open(state_db_path())
+        .unwrap()
+        .execute(
+            "UPDATE kind_runs SET last_done_at=?1 WHERE kind='architecture'",
+            [two_hours_ago],
+        )
+        .unwrap();
+    fs::remove_file(f.base.join("prompt.json")).unwrap();
+    assert_eq!(f.hook("Stop"), None);
+    assert!(!f.base.join("prompt.json").exists());
+    // 間隔が過ぎた後の次の push で実行する。
+    f.push_change("third");
+    assert_eq!(f.hook("Stop"), None);
+    assert!(f.prompt_text().contains("docs/ARCHITECTURE.md"));
+    assert!(f.kind_runs()["architecture"].last_done_at > two_hours_ago);
+}
+
+#[test]
+fn unfinished_publication_resumes_with_every_kind_when_some_kind_is_due() {
+    // 未完了の保守（ready の記録）から再開するときは種類を絞らない。絞ると保守後検査が期限前の種類
+    // （ここでは architecture）の上限超過を見落として commit してしまう。再開では kind_runs も記録しない。
+    let config = kinds_config(|c| {
+        let k = arch(c);
+        k.timing = timing(config::When::Push, &["src/**"], None);
+        k.max_chars = Some(10);
+    });
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("docs/ARCHITECTURE.md", "short");
+    f.hook("UserPromptSubmit");
+    f.push_change("readme only is due");
+    let mut state = f.checkpoint("ready");
+    state["before"]["docs/ARCHITECTURE.md"] =
+        json!(document_hash(&f.root, "docs/ARCHITECTURE.md").unwrap());
+    fs::write(f.root.join("docs/ARCHITECTURE.md"), "x".repeat(20)).unwrap();
+    state["after"] = state["before"].clone();
+    state["after"]["docs/ARCHITECTURE.md"] =
+        json!(document_hash(&f.root, "docs/ARCHITECTURE.md").unwrap());
+    f.save(&mut state);
+    let head = f.head();
+    let message = f.hook("Stop").expect("上限超過で止まるはず");
+    assert!(
+        message.contains("上限") && message.contains("docs/ARCHITECTURE.md"),
+        "{message}"
+    );
+    assert_eq!(f.head(), head);
+    assert_eq!(f.state()["phase"], "ready");
+    assert!(f.kind_runs().is_empty());
+}
+
+#[test]
+fn failed_maintenance_does_not_record_kind_runs() {
+    let config = kinds_config(|c| arch(c).max_chars = Some(10));
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("docs/ARCHITECTURE.md", "short");
+    f.hook("UserPromptSubmit");
+    f.push_change("limit");
+    f.writes(json!({f.arch_path(): "x".repeat(20)}));
+    assert!(f.hook("Stop").is_some());
+    assert_eq!(f.state()["phase"], "ready");
+    assert!(f.kind_runs().is_empty());
+}
+
+#[test]
+fn release_kind_is_due_when_a_reachable_tag_has_no_changelog_section() {
+    let mut config = Config::legacy_all_push();
+    config.defaults.documents = vec![Document::Readme, Document::Changelog];
+    set_timing(
+        &mut config,
+        "changelog",
+        timing(config::When::Release, &[], None),
+    );
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("CHANGELOG.md", "# Changelog\n\n## [Unreleased]\n");
+    f.hook("UserPromptSubmit");
+    // タグが無い: CHANGELOG は対象外。
+    f.push_change("no release yet");
+    assert_eq!(f.hook("Stop"), None);
+    assert!(
+        !f.prompt_text().contains("CHANGELOG"),
+        "{}",
+        f.prompt_text()
+    );
+    // 合わないタグ（v* 以外）では対象外のまま。
+    f.git(&["tag", "nightly"]);
+    f.push_change("nightly tag only");
+    assert_eq!(f.hook("Stop"), None);
+    assert!(!f.prompt_text().contains("CHANGELOG"));
+    // v1.0.0 が到達でき、CHANGELOG（push された内容）に節が無い: 対象。
+    f.git(&["tag", "v1.0.0"]);
+    f.push_change("after release tag");
+    assert_eq!(f.hook("Stop"), None);
+    assert!(
+        f.prompt_text().contains("CHANGELOG 対象"),
+        "{}",
+        f.prompt_text()
+    );
+    // 節が入った後は対象外に戻る（状態を持たず、リポジトリの内容だけで判定）。
+    f.commit_push_file(
+        "CHANGELOG.md",
+        "# Changelog\n\n## [Unreleased]\n\n## [1.0.0] - 2026-11-14\n- 初版\n",
+    );
+    f.push_change("section added");
+    assert_eq!(f.hook("Stop"), None);
+    assert!(!f.prompt_text().contains("CHANGELOG"));
+}
+
+#[test]
+fn run_now_processes_every_kind_including_manual_and_records_them() {
+    let config = kinds_config(|c| {
+        arch(c).timing = timing(config::When::Manual, &[], None);
+        set_timing(
+            c,
+            "readme",
+            timing(config::When::Push, &["src/**"], Some(24)),
+        );
+    });
+    let f = Fixture::with_config(Some(config.clone()));
+    f.commit_push_file("docs/ARCHITECTURE.md", "# 構成");
+    f.hook("UserPromptSubmit");
+    f.push_change("manual only");
+    assert_eq!(f.hook("Stop"), None);
+    assert!(!f.base.join("prompt.json").exists());
+    // run-now は呼び出し側が渡した種類をタイミングに関係なくすべて処理する。
+    let options = MaintenanceOptions {
+        documents: config.defaults.documents.clone(),
+        exclude: config::effective_exclude(&[]),
+        worker: config.worker.clone(),
+        kinds: scriptura::kinds::resolve_kinds(&config, &config.defaults.documents),
+    };
+    assert_eq!(run_now(&f.root, options).unwrap(), None);
+    let prompt = f.prompt_text();
+    assert!(prompt.contains("README.md") && prompt.contains("docs/ARCHITECTURE.md"));
+    assert_eq!(f.kind_run_ids(), ["architecture", "readme"]);
+}
+
+#[test]
+fn kind_runs_table_keeps_the_state_schema_version_and_legacy_detection() {
+    // 旧 DB（版なし user_version=0・kind_runs 表なし・poll_cursors に行あり）は従来どおり旧利用者として移行される。
+    let f = Fixture::new();
+    let path = state_db_path();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    {
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TABLE poll_cursors(repo_root TEXT NOT NULL,upstream TEXT NOT NULL,destination TEXT NOT NULL,fingerprint TEXT NOT NULL,updated_at REAL NOT NULL,error TEXT,PRIMARY KEY(repo_root,upstream,destination)); INSERT INTO poll_cursors VALUES ('x','y','z','f',0,NULL);").unwrap();
+    }
+    // 表が無い DB の読み取りは空（作成も書き込みもしない）。
+    assert!(f.kind_runs().is_empty());
+    fs::remove_file(f.config_path()).unwrap();
+    let message = f.hook("UserPromptSubmit").unwrap();
+    assert!(message.contains("引き継"), "{message}");
+    let db = Connection::open(&path).unwrap();
+    let version: i64 = db
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 1);
+    assert_eq!(STATE_SCHEMA_VERSION, 1);
+    let tables: i64 = db
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='kind_runs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 1);
+    // 新版が開いた DB（user_version=1）は kind_runs があっても旧利用者ではない（既存契約）。
+    drop(db);
+    fs::remove_file(f.config_path()).unwrap();
+    f.push_change("after migration");
+    assert_eq!(f.hook("Stop"), None);
+    assert!(!f.config_path().exists());
+}
+
+// ---------------------------------------------------------------------------
+// P4: CHANGELOG 固有の処理（不変検査・履歴の資料・promote・遡り）と期限判定の回帰
+// ---------------------------------------------------------------------------
+
+#[test]
+fn absent_custom_kind_never_makes_a_push_due_by_itself() {
+    // README は src/** の変更があったときだけ。architecture はファイルが無く作成も許されない
+    // （create_if_missing=false）が、タイミングは毎 push。存在しない種類だけが「期限到来」になって
+    // worker が起動したり、その種類の最終完了が記録されたりしてはならない。
+    let config = kinds_config(|c| {
+        set_timing(c, "readme", timing(config::When::Push, &["src/**"], None));
+    });
+    let f = Fixture::with_config(Some(config));
+    f.hook("UserPromptSubmit");
+    let before = f.cursor().unwrap();
+    f.push_change("no source change");
+    let pushed = f.head();
+    assert_eq!(f.hook("Stop"), None);
+    assert!(
+        !f.base.join("prompt.json").exists(),
+        "worker を起動してはならない"
+    );
+    let after = f.cursor().unwrap();
+    assert_ne!(after, before);
+    assert_eq!(after.1, pushed);
+    assert!(f.kind_runs().is_empty(), "{:?}", f.kind_run_ids());
+}
+
+/// Keep a Changelog 形式（フッター付き）の既存 CHANGELOG。
+const KAC_CHANGELOG: &str = "# Changelog\n\n## [Unreleased]\n\n- 新機能 A\n\n## [1.0.0] - 2026-01-01\n\n- 初版\n\n[Unreleased]: https://example.invalid/compare/v1.0.0...HEAD\n[1.0.0]: https://example.invalid/releases/v1.0.0\n";
+
+fn changelog_config(permission: Permission, documents: Vec<Document>) -> Config {
+    let mut config = Config::legacy_all_push();
+    config.worker.permission = permission;
+    config.defaults.documents = documents;
+    config
+}
+impl Fixture {
+    fn changelog_path(&self) -> String {
+        self.root.join("CHANGELOG.md").to_str().unwrap().to_owned()
+    }
+}
+
+#[test]
+fn released_changelog_entries_are_protected_in_every_permission_mode() {
+    for permission in [Permission::Bypass, Permission::Restricted] {
+        let f = Fixture::with_config(Some(changelog_config(
+            permission,
+            vec![Document::Changelog],
+        )));
+        f.commit_push_file("CHANGELOG.md", KAC_CHANGELOG);
+        f.hook("UserPromptSubmit");
+        f.push_change("rewrite released");
+        let head = f.head();
+        let remote = f.git(&["rev-parse", "origin/main"]);
+        f.writes(
+            json!({f.changelog_path(): KAC_CHANGELOG.replace("- 初版", "- 初版（書き換え）")}),
+        );
+        let message = f.hook("Stop").expect("不変検査の違反で止まるはず");
+        assert!(
+            // 違反した節は見出しの文字列ではなく番号で示す（[1.0.0] は 2 番目の節）。
+            message.contains("リリース済み") && message.contains("2 番目の版の節"),
+            "{permission:?}: {message}"
+        );
+        // 上限超過と同じ扱い: commit せず phase は ready のまま。
+        assert_eq!(f.head(), head);
+        assert_eq!(f.git(&["rev-parse", "origin/main"]), remote);
+        assert_eq!(f.state()["phase"], "ready");
+        assert!(f.kind_runs().is_empty());
+        // 範囲内のタグに対応しない版の節の追加も同じ扱い（タグが 1 つも無い）。
+        drop(f);
+        let f = Fixture::with_config(Some(changelog_config(
+            permission,
+            vec![Document::Changelog],
+        )));
+        f.commit_push_file("CHANGELOG.md", KAC_CHANGELOG);
+        f.hook("UserPromptSubmit");
+        f.push_change("add out of range version");
+        let head = f.head();
+        f.writes(json!({f.changelog_path(): KAC_CHANGELOG.replace(
+            "## [Unreleased]\n\n- 新機能 A\n\n",
+            "## [Unreleased]\n\n## [9.9.9] - 2026-02-01\n\n- 新機能 A\n\n",
+        )}));
+        let message = f.hook("Stop").expect("範囲外の版で止まるはず");
+        assert!(message.contains("範囲内のタグに対応しない"), "{message}");
+        assert_eq!(f.head(), head);
+        assert_eq!(f.state()["phase"], "ready");
+    }
+}
+
+#[test]
+fn changelog_prompt_carries_rules_and_history_and_promote_is_committed() {
+    let f = Fixture::with_config(Some(changelog_config(
+        Permission::Restricted,
+        vec![Document::Readme, Document::Changelog],
+    )));
+    f.commit_push_file("CHANGELOG.md", KAC_CHANGELOG);
+    f.hook("UserPromptSubmit");
+    f.push_change("機能 B を足す");
+    f.git(&["tag", "v1.1.0"]);
+    f.push_change("リリース後の修正");
+    let promoted = KAC_CHANGELOG.replace(
+        "## [Unreleased]\n\n- 新機能 A\n\n",
+        "## [Unreleased]\n\n- リリース後の修正\n\n## [1.1.0] - 2026-02-01\n\n- 新機能 A\n- 機能 B\n\n",
+    ) + "[1.1.0]: https://example.invalid/releases/v1.1.0\n";
+    f.writes(json!({f.changelog_path(): promoted}));
+    assert_eq!(f.hook("Stop"), None);
+    let prompt = f.prompt_text();
+    // Rust が決めた規則（Unreleased だけ・promote・バージョン表記の整合）。
+    for needle in [
+        "CHANGELOG の保守規則",
+        "pending_releases に挙がったタグ",
+        "バージョン記述は manifest・CHANGELOG の版と揃えて",
+    ] {
+        assert!(prompt.contains(needle), "{needle}: {prompt}");
+    }
+    // 未信頼の資料（JSON）は末尾の別枠。タグ名・件名はこの枠の中にだけ出る。
+    let open = prompt
+        .find(scriptura::changelog::MATERIAL_OPEN)
+        .expect("資料の枠");
+    let close = prompt
+        .find(scriptura::changelog::MATERIAL_CLOSE)
+        .expect("資料の枠の終わり");
+    assert!(open < close);
+    let material = &prompt[open..close];
+    assert!(material.contains("\"pending_releases\":[{"), "{material}");
+    assert!(material.contains("\"tag\":\"v1.1.0\""), "{material}");
+    assert!(
+        material.contains("機能 B を足す") && material.contains("リリース後の修正"),
+        "{material}"
+    );
+    assert!(
+        !prompt[..open].contains("v1.1.0"),
+        "指示文にタグ名を入れない"
+    );
+    // 既存の CHANGELOG（format=existing）には組み込みテンプレートを載せない。
+    assert!(!prompt.contains("<<<テンプレート>>>"), "{prompt}");
+    // promote（範囲内のタグの版の節の追加）は検査を通って commit・push される。
+    assert_eq!(
+        f.git(&["show", "--format=%s", "--name-only", "HEAD"]),
+        "リポジトリ文書を保守する\n\nCHANGELOG.md\n"
+    );
+    assert_eq!(f.head(), f.git(&["rev-parse", "origin/main"]).trim());
+    assert_eq!(f.state()["phase"], "complete");
+}
+
+#[test]
+fn new_changelog_is_backfilled_from_tags_with_the_builtin_template() {
+    let f = Fixture::with_config(Some(changelog_config(
+        Permission::Bypass,
+        vec![Document::Changelog],
+    )));
+    f.hook("UserPromptSubmit");
+    f.push_change("初版の機能");
+    f.git(&["tag", "v0.1.0"]);
+    f.push_change("次の機能");
+    let created =
+        "# Changelog\n\n## [Unreleased]\n\n- 次の機能\n\n## [0.1.0] - 2026-01-01\n\n- 初版の機能\n";
+    f.writes(json!({f.changelog_path(): created}));
+    assert_eq!(f.hook("Stop"), None);
+    let prompt = f.prompt_text();
+    assert!(
+        prompt.contains("CHANGELOG の対象（`CHANGELOG.md`）がありません"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("資料の releases の各タグについて新しい順に版の節を作り"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("<<<テンプレート>>>\n# Changelog"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("\"releases\":[{\"tag\":\"v0.1.0\""),
+        "{prompt}"
+    );
+    // 新規作成は不変検査の対象外（上限と必須見出しだけ）。作成した文書が commit される。
+    assert_eq!(
+        f.git(&["show", "--format=", "--name-only", "HEAD"]),
+        "CHANGELOG.md\n"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// レビュー指摘の回帰（push モード）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_active_kind_never_starts_a_worker_even_when_every_push_is_due_or_forced() {
+    // CHANGELOG だけが対象で、CHANGELOG.md が無く作成も許されない（有効な種類が 1 つも無い）。
+    // 毎 push の構成（always_due）と run-now（force）は早期 return していたため、非アクティブな種類の
+    // 除外を通らず、許可パスが空のまま worker が起動し、最終完了も記録されていた。
+    let mut config = changelog_config(Permission::Restricted, vec![Document::Changelog]);
+    config
+        .kinds
+        .entry("changelog".into())
+        .or_default()
+        .create_if_missing = Some(false);
+    let f = Fixture::with_config(Some(config.clone()));
+    f.hook("UserPromptSubmit");
+    let before = f.cursor().unwrap();
+    f.push_change("nothing to maintain");
+    let pushed = f.head();
+    assert_eq!(f.hook("Stop"), None);
+    assert!(
+        !f.base.join("prompt.json").exists(),
+        "worker を起動してはならない"
+    );
+    let after = f.cursor().unwrap();
+    assert_ne!(after, before);
+    assert_eq!(after.1, pushed);
+    assert!(f.kind_runs().is_empty(), "{:?}", f.kind_run_ids());
+    // run-now（force）でも同じ。
+    let options = MaintenanceOptions {
+        documents: config.defaults.documents.clone(),
+        exclude: config::effective_exclude(&[]),
+        worker: config.worker.clone(),
+        kinds: scriptura::kinds::resolve_kinds(&config, &config.defaults.documents),
+    };
+    assert_eq!(run_now(&f.root, options).unwrap(), None);
+    assert!(!f.base.join("prompt.json").exists());
+    assert!(f.kind_runs().is_empty());
+    assert_eq!(f.head(), pushed);
+}
+
+#[test]
+fn no_document_to_maintain_advances_without_a_worker_or_kind_runs() {
+    // 従来 3 種でも、対象が存在せず作成も許されない構成では処理する文書が無い。worker を起動せず位置だけ進め、
+    // 最終完了は更新しない。
+    let mut config = Config::legacy_all_push();
+    config.defaults.documents = vec![Document::Design];
+    config
+        .kinds
+        .entry("design".into())
+        .or_default()
+        .create_if_missing = Some(false);
+    let f = Fixture::with_config(Some(config));
+    f.hook("UserPromptSubmit");
+    // DESIGN.md を削除する push は「削除された対象」の復元を許すので worker が動く。
+    fs::remove_file(f.root.join("DESIGN.md")).unwrap();
+    f.git(&["add", "-A"]);
+    f.git(&["commit", "-m", "remove design"]);
+    f.git(&["push"]);
+    let removed = f.head();
+    f.writes(json!({}));
+    assert_eq!(f.hook("Stop"), None);
+    assert!(f.base.join("prompt.json").exists());
+    assert_eq!(f.kind_runs()["design"].last_commit, removed);
+    fs::remove_file(f.base.join("prompt.json")).unwrap();
+    // 次の push では DESIGN.md が無く、作成も許されない: 処理する文書が無い。
+    f.push_change("no design anywhere");
+    let pushed = f.head();
+    assert_eq!(f.hook("Stop"), None);
+    assert!(
+        !f.base.join("prompt.json").exists(),
+        "worker を起動してはならない"
+    );
+    assert_eq!(f.cursor().unwrap().1, pushed);
+    assert_eq!(
+        f.kind_runs()["design"].last_commit,
+        removed,
+        "記録を更新しない"
+    );
+}
+
+#[test]
+fn resumed_publication_uses_the_recorded_kinds_for_the_prompt_and_records_them() {
+    let config = kinds_config(|c| arch(c).timing = timing(config::When::Push, &["src/**"], None));
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("docs/ARCHITECTURE.md", "# 構成");
+    f.hook("UserPromptSubmit");
+    // 新しい保守では、絞った種類 id が publication 状態に記録される。
+    f.push_change("readme only is due");
+    f.writes(json!({}));
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.state()["kinds"], json!(["readme"]));
+    // README だけに絞った保守が worker の失敗で止まった記録（編集対象も README だけ）。
+    f.commit_push_file("src/lib.rs", "fn main() {}");
+    let mut state = f.checkpoint("worker_failed");
+    for name in ["AGENTS.md", "DESIGN.md"] {
+        state["before"].as_object_mut().unwrap().remove(name);
+    }
+    state["after"] = state["before"].clone();
+    state["kinds"] = json!(["readme"]);
+    f.save(&mut state);
+    fs::remove_file(f.base.join("prompt.json")).unwrap();
+    let pushed = f.head();
+    f.writes(json!({f.root.join("README.md").to_str().unwrap(): "readme v2"}));
+    // この push では architecture も期限が来ているが、再開は記録した種類（readme）で行う。
+    assert_eq!(f.hook("Stop"), None);
+    let prompt = f.prompt_text();
+    assert!(prompt.contains("README.md"), "{prompt}");
+    assert!(
+        !prompt.contains("architecture") && !prompt.contains("ARCHITECTURE"),
+        "修正前はプロンプトだけ全種類分になっていた: {prompt}"
+    );
+    assert_eq!(
+        f.git(&["show", "--format=", "--name-only", "HEAD"]),
+        "README.md\n"
+    );
+    // 成功したので記録した種類の最終完了を記録する（修正前は再開では記録しなかった）。
+    assert_eq!(f.kind_runs()["readme"].last_commit, pushed);
+    assert!(!f.kind_runs().contains_key("architecture"));
+}
+
+#[test]
+fn ignored_changelog_holds_before_starting_the_worker() {
+    // CHANGELOG.md が作業ツリーにあるが .gitignore で無視されている（HEAD に無い）。worker を動かしても
+    // 保守後の不変検査で必ず失敗するので、起動前に Hold と同じく見送る（位置も進めない）。
+    let f = Fixture::with_config(Some(changelog_config(
+        Permission::Restricted,
+        vec![Document::Readme, Document::Changelog],
+    )));
+    f.commit_push_file(".gitignore", "CHANGELOG.md\n");
+    fs::write(f.root.join("CHANGELOG.md"), KAC_CHANGELOG).unwrap();
+    f.hook("UserPromptSubmit");
+    let before = f.cursor().unwrap();
+    f.push_change("ignored changelog");
+    let head = f.head();
+    let message = f.hook("Stop").expect("見送りの理由が返る");
+    assert!(
+        message.contains("CHANGELOG.md") && message.contains("追跡されていない"),
+        "{message}"
+    );
+    assert!(
+        !f.base.join("prompt.json").exists(),
+        "worker を起動してはならない"
+    );
+    assert_eq!(f.cursor().unwrap(), before, "位置を進めない");
+    assert_eq!(f.head(), head);
+    assert!(f.kind_runs().is_empty());
+    // CHANGELOG を commit すれば次の push で保守される。
+    f.commit_push_file(".gitignore", "");
+    f.commit_push_file("CHANGELOG.md", KAC_CHANGELOG);
+    f.writes(json!({}));
+    assert_eq!(f.hook("Stop"), None);
+    assert!(f.base.join("prompt.json").exists());
+}
+
+#[test]
+fn interrupted_resume_keeps_the_recorded_kinds() {
+    // 中断からの復旧（interrupted_recovered）は publication 状態を作り直す。再開時は保守後検査用に全種類の
+    // オプションが渡るが、記録した種類（readme）を引き継ぎ、全種類に広げない。
+    let config = kinds_config(|c| arch(c).timing = timing(config::When::Push, &["src/**"], None));
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("docs/ARCHITECTURE.md", "# 構成");
+    f.hook("UserPromptSubmit");
+    f.commit_push_file("src/lib.rs", "fn main() {}");
+    let mut state = f.checkpoint("interrupted_recovered");
+    for name in ["AGENTS.md", "DESIGN.md"] {
+        state["before"].as_object_mut().unwrap().remove(name);
+    }
+    state["after"] = state["before"].clone();
+    state["kinds"] = json!(["readme"]);
+    f.save(&mut state);
+    f.writes(json!({f.root.join("README.md").to_str().unwrap(): "readme v3"}));
+    assert_eq!(f.hook("Stop"), None);
+    let prompt = f.prompt_text();
+    assert!(
+        prompt.contains("README.md") && !prompt.contains("ARCHITECTURE"),
+        "{prompt}"
+    );
+    assert_eq!(f.state()["kinds"], json!(["readme"]));
+    assert!(f.state()["before"].get("docs/ARCHITECTURE.md").is_none());
+    assert!(!f.kind_runs().contains_key("architecture"));
+}
+
+#[test]
+fn changelog_created_by_an_unfinished_run_is_committed_on_resume() {
+    // worker が新規作成した CHANGELOG（記録上は編集前に無い）は HEAD に無いが、再開で見送ってはならない。
+    let f = Fixture::with_config(Some(changelog_config(
+        Permission::Restricted,
+        vec![Document::Readme, Document::Changelog],
+    )));
+    f.hook("UserPromptSubmit");
+    f.push_change("create changelog");
+    let mut state = f.checkpoint("ready");
+    fs::write(
+        f.root.join("CHANGELOG.md"),
+        "# Changelog\n\n## [Unreleased]\n",
+    )
+    .unwrap();
+    state["before"]["CHANGELOG.md"] = Value::Null;
+    state["after"] = state["before"].clone();
+    state["after"]["CHANGELOG.md"] = json!(document_hash(&f.root, "CHANGELOG.md").unwrap());
+    state["kinds"] = json!(["readme", "changelog"]);
+    f.save(&mut state);
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(
+        f.git(&["show", "--format=", "--name-only", "HEAD"]),
+        "CHANGELOG.md\n"
+    );
+    assert_eq!(f.state()["phase"], "complete");
+}
+
+#[test]
+fn untracked_but_not_ignored_changelog_does_not_hold_other_kinds() {
+    // 無視されていない未追跡の CHANGELOG は編集対象に入らない（不変検査も走らない）ので、見送らずに
+    // 他の種類（README）の保守を続ける。
+    let f = Fixture::with_config(Some(changelog_config(
+        Permission::Restricted,
+        vec![Document::Readme, Document::Changelog],
+    )));
+    f.hook("UserPromptSubmit");
+    fs::write(f.root.join("CHANGELOG.md"), KAC_CHANGELOG).unwrap();
+    f.push_change("untracked changelog");
+    f.writes(json!({f.root.join("README.md").to_str().unwrap(): "readme v2"}));
+    let message = f.hook("Stop");
+    assert!(
+        message
+            .as_deref()
+            .is_none_or(|m| !m.contains("追跡されていない")),
+        "{message:?}"
+    );
+    assert!(f.base.join("prompt.json").exists(), "{message:?}");
 }

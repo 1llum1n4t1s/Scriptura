@@ -1,0 +1,11 @@
+-p
+--model
+claude-sonnet-5-5
+--effort
+high
+--dangerously-skip-permissions
+--no-session-persistence
+--max-budget-usd
+1.5
+--output-format
+text

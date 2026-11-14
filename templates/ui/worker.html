@@ -1,0 +1,22 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<div class="heading"><h1>worker 設定</h1></div>
+<section class="panel">
+  <form method="post" action="/settings/worker" class="stack">
+    <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}">
+    <div class="row">
+      <label>モデル<input name="model" value="{{ model }}" required></label>
+      <label>effort<input name="effort" value="{{ effort }}" required></label>
+    </div>
+    <div class="row">
+      <label>期限（秒、{{ timeout_min }}〜{{ timeout_max }}）<input name="timeout_secs" inputmode="numeric" value="{{ timeout_secs }}"></label>
+      <label>費用上限（USD、0 = 上限なし）<input name="max_budget_usd" inputmode="decimal" value="{{ max_budget_usd }}"></label>
+    </div>
+    <label>権限<select name="permission">{% for c in permission %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+    <label>claude の場所（絶対パス。空なら PATH から探す）<input name="claude_path" value="{{ claude_path }}"></label>
+    <p class="note">{{ claude_state }}</p>
+    <div class="actions"><button class="primary" type="submit">保存する</button></div>
+  </form>
+  <p class="note">bypass への変更・費用上限を 0 にする変更は確認画面を挟みます。</p>
+</section>
+{% endblock %}

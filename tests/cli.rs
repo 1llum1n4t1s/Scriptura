@@ -391,15 +391,61 @@ fn enable_keeps_other_registrations_and_settings_and_leaves_no_temp_files() {
         .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
-    // 未対応の文書名は拒否する。
-    let out = fx.enable(&["--documents", "CHANGELOG.md"]);
-    assert_eq!(out.code, 1);
-    assert!(
-        out.json()["error"]
-            .as_str()
-            .unwrap()
-            .contains("CHANGELOG.md")
+    // 未対応の文書名・設定に定義の無いカスタム種類は拒否する（設定は書き換えない）。
+    let before = fs::read_to_string(&fx.config_path()).unwrap();
+    for name in ["FOO.md", "architecture"] {
+        let out = fx.enable(&["--documents", name]);
+        assert_eq!(out.code, 1, "{name}");
+        assert!(
+            out.json()["error"].as_str().unwrap().contains(name),
+            "{name}"
+        );
+    }
+    assert_eq!(fs::read_to_string(&fx.config_path()).unwrap(), before);
+    // CHANGELOG.md は組み込みの種類として受け付ける（大文字小文字は区別しない）。使うと schema 2 で保存される。
+    let out = fx.enable(&["--documents", "readme.md,Changelog.md"]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert_eq!(
+        out.json()["documents"],
+        json!(["README.md", "CHANGELOG.md"])
     );
+    assert_eq!(
+        fx.config().repository[1].documents,
+        Some(vec![config::Document::Readme, config::Document::Changelog])
+    );
+    assert!(
+        fs::read_to_string(&fx.config_path())
+            .unwrap()
+            .contains("schema = 2")
+    );
+}
+
+#[test]
+fn enable_keeps_a_consent_recorded_in_the_ui_and_records_history() {
+    // 管理画面（ui）で記録した同意は、CLI の enable で上書きしない（出所・時刻とも保つ）。
+    let fx = Fx::new();
+    let mut seed = Config::default();
+    seed.consent = Some(config::Consent {
+        version: CURRENT_CONSENT_VERSION,
+        accepted_at: "2026-02-02T00:00:00Z".into(),
+        source: ConsentSource::Ui,
+    });
+    config::save_to(&fx.config_path(), &seed).unwrap();
+    let before = fs::read(fx.config_path()).unwrap();
+    let out = fx.enable(&[]);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert_eq!(out.json()["created"], false);
+    let consent = fx.config().consent.unwrap();
+    assert_eq!(consent.source, ConsentSource::Ui);
+    assert_eq!(consent.accepted_at, "2026-02-02T00:00:00Z");
+    // CLI の変更も設定ロックと変更履歴を通る（状態フォルダーに直前の内容が退避される）。
+    let history = fx.base.join("state").join("config-history");
+    let saved: Vec<_> = fs::read_dir(&history)
+        .unwrap()
+        .flatten()
+        .map(|e| fs::read(e.path()).unwrap())
+        .collect();
+    assert_eq!(saved, vec![before]);
 }
 
 #[test]
@@ -1146,4 +1192,438 @@ fn discard_removes_a_proposal_and_unknown_selectors_are_refused() {
     assert_eq!(out.code, 1);
     assert_eq!(out.json()["ok"], false);
     assert_eq!(fx.run(&["status", "--bogus"]).code, 1);
+}
+
+// ---------------------------------------------------------------------------
+// docs list / docs show・run-now --documents・Rejected・doctor の kinds（P5）
+// ---------------------------------------------------------------------------
+
+/// 設定（無ければ既定）へ種類の定義を書き足して保存する（保存は schema 2 になる）。
+fn define_kinds(fx: &Fx, edit: impl FnOnce(&mut Config)) {
+    let mut config = match config::load_from(&fx.config_path()) {
+        Loaded::Ok(c) => c,
+        Loaded::Missing => Config::default(),
+        other => panic!("設定を読めません: {other:?}"),
+    };
+    edit(&mut config);
+    config::save_to(&fx.config_path(), &config).unwrap();
+}
+
+/// カスタム種類 `architecture`（テンプレート・上限・タイミング・追加指示つき）の定義。
+fn architecture_kind() -> config::KindSettings {
+    config::KindSettings {
+        paths: vec!["docs/ARCHITECTURE.md".into()],
+        guidance: Some("システム構成と責務を書く".into()),
+        template: Some("templates/architecture.md".into()),
+        max_chars: Some(15000),
+        instructions: Some("日本語で簡潔に".into()),
+        timing: Some(config::Timing {
+            when: Some(config::When::Push),
+            paths: vec!["src/**".into()],
+            min_interval_hours: Some(24),
+        }),
+        ..Default::default()
+    }
+}
+
+fn write_architecture_template(fx: &Fx) {
+    fs::create_dir_all(fx.base.join("templates")).unwrap();
+    fs::write(
+        fx.base.join("templates").join("architecture.md"),
+        "# 構成\n\n## 責務\n",
+    )
+    .unwrap();
+}
+
+fn kind_of<'a>(v: &'a Value, id: &str) -> &'a Value {
+    v["kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["id"] == id)
+        .unwrap_or_else(|| panic!("種類 {id} がありません: {v}"))
+}
+
+#[test]
+fn docs_list_and_show_report_resolved_kinds_read_only() {
+    let fx = Fx::new();
+    write_architecture_template(&fx);
+    define_kinds(&fx, |c| {
+        c.kinds.insert("architecture".into(), architecture_kind());
+        c.kinds.insert(
+            "readme".into(),
+            config::KindSettings {
+                max_chars: Some(8000),
+                language: Some("ja".into()),
+                required_headings: vec!["## 概要".into()],
+                ..Default::default()
+            },
+        );
+    });
+    assert_eq!(
+        fx.enable(&["--documents", "README.md,architecture"]).code,
+        0
+    );
+    let before = fs::read(fx.config_path()).unwrap();
+
+    let out = fx.exec(&["docs", "list", "--json"], &[], None, Some(&fx.repo));
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    let v = out.json();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["registered"], true);
+    assert_eq!(v["mode"], "propose");
+    let ids: Vec<&str> = v["kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        ["agents", "design", "readme", "changelog", "architecture"]
+    );
+    let readme = kind_of(&v, "readme");
+    assert_eq!(readme["enabled"], true);
+    assert_eq!(readme["builtin"], true);
+    assert_eq!(readme["maxChars"], 8000);
+    assert_eq!(readme["maxBytes"], Value::Null);
+    assert_eq!(
+        readme["paths"],
+        json!([{"path": "README.md", "exists": true}])
+    );
+    assert_eq!(readme["lastDoneAt"], Value::Null);
+    assert_eq!(kind_of(&v, "changelog")["enabled"], false);
+    assert_eq!(kind_of(&v, "changelog")["template"]["state"], "builtin");
+    assert_eq!(kind_of(&v, "agents")["template"]["state"], "none");
+    let arch = kind_of(&v, "architecture");
+    assert_eq!(arch["enabled"], true);
+    assert_eq!(arch["builtin"], false);
+    assert_eq!(
+        arch["paths"],
+        json!([{"path": "docs/ARCHITECTURE.md", "exists": false}])
+    );
+    assert_eq!(arch["template"]["spec"], "templates/architecture.md");
+    assert_eq!(arch["template"]["state"], "ok");
+    assert_eq!(arch["maxChars"], 15000);
+    assert_eq!(
+        arch["timing"],
+        json!({"when": "push", "paths": ["src/**"], "minIntervalHours": 24})
+    );
+    assert_eq!(arch["hasInstructions"], true);
+    // list には追加指示の本文や指針を出さない（show だけ）。
+    assert!(arch.get("instructions").is_none() && arch.get("guidance").is_none());
+
+    // show: 詳細（指針・追加指示・必須見出し・言語）。組み込みは文書名でも大文字小文字違いでも引ける。
+    let v = fx
+        .exec(
+            &["docs", "show", "architecture", "--json"],
+            &[],
+            None,
+            Some(&fx.repo),
+        )
+        .json();
+    let k = &v["kind"];
+    assert_eq!(k["guidance"], "システム構成と責務を書く");
+    assert_eq!(k["instructions"], "日本語で簡潔に");
+    assert_eq!(k["changelog"], Value::Null);
+    let v = fx
+        .exec(
+            &["docs", "show", "readme.MD", "--json"],
+            &[],
+            None,
+            Some(&fx.repo),
+        )
+        .json();
+    assert_eq!(v["kind"]["id"], "readme");
+    assert_eq!(v["kind"]["language"], "ja");
+    assert_eq!(v["kind"]["requiredHeadings"], json!(["## 概要"]));
+    assert_eq!(v["kind"]["paths"][0]["chars"], 6); // "readme"
+    assert_eq!(v["kind"]["paths"][0]["bytes"], 6);
+    let v = fx
+        .exec(
+            &["docs", "show", "changelog", "--json"],
+            &[],
+            None,
+            Some(&fx.repo),
+        )
+        .json();
+    assert_eq!(v["kind"]["changelog"]["onRelease"], "promote");
+    assert_eq!(v["kind"]["changelog"]["releaseTag"], "v*");
+    assert_eq!(v["kind"]["changelog"]["backfillMaxReleases"], 20);
+    // 人が読む形式。
+    let out = fx.exec(&["docs", "list"], &[], None, Some(&fx.repo));
+    assert_eq!(out.code, 0);
+    assert!(
+        out.stdout.contains("- architecture [有効]"),
+        "{}",
+        out.stdout
+    );
+    let out = fx.exec(&["docs", "show", "architecture"], &[], None, Some(&fx.repo));
+    assert!(
+        out.stdout.contains("指針: システム構成と責務を書く"),
+        "{}",
+        out.stdout
+    );
+
+    // テンプレートが無くなると state=error と理由が出る（保守が見送られる原因）。
+    fs::remove_file(fx.base.join("templates").join("architecture.md")).unwrap();
+    let v = fx
+        .exec(&["docs", "list", "--json"], &[], None, Some(&fx.repo))
+        .json();
+    let t = &kind_of(&v, "architecture")["template"];
+    assert_eq!(t["state"], "error");
+    assert!(t["error"].as_str().unwrap().contains("architecture"));
+
+    // 未定義の id・使い方の誤りは拒否。読み取り専用なので設定は変わらない。
+    for args in [
+        vec!["docs", "show", "nosuch", "--json"],
+        vec!["docs", "show", "--json"],
+        vec!["docs", "--json"],
+        vec!["docs", "list", "extra", "--json"],
+    ] {
+        let out = fx.exec(&args, &[], None, Some(&fx.repo));
+        assert_eq!(out.code, 1, "{args:?}");
+        assert_eq!(out.json()["ok"], false);
+    }
+    assert_eq!(fs::read(fx.config_path()).unwrap(), before);
+}
+
+#[test]
+fn docs_list_works_for_unregistered_repos_and_refuses_broken_config() {
+    let fx = Fx::new();
+    // 設定なし: 組み込み既定だけで、どれも無効。
+    let v = fx
+        .exec(&["docs", "list", "--json"], &[], None, Some(&fx.repo))
+        .json();
+    assert_eq!(v["configPresent"], false);
+    assert_eq!(v["registered"], false);
+    assert!(
+        v["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|k| k["enabled"] == false)
+    );
+    assert_eq!(v["kinds"].as_array().unwrap().len(), 4);
+    // 壊れた設定は書き換えず、理由を返して失敗する。
+    fs::write(fx.config_path(), "schema = [").unwrap();
+    let out = fx.exec(&["docs", "list", "--json"], &[], None, Some(&fx.repo));
+    assert_eq!(out.code, 1);
+    assert!(out.json()["error"].as_str().unwrap().contains("読めません"));
+    assert_eq!(fs::read_to_string(fx.config_path()).unwrap(), "schema = [");
+}
+
+#[test]
+fn run_now_documents_narrows_the_kinds_and_refuses_unknown_or_disabled_ones() {
+    let fx = Fx::new();
+    assert_eq!(fx.enable(&["--documents", "README.md,DESIGN.md"]).code, 0);
+    fx.push_change("narrowing");
+    let prompt = fx.base.join("prompt.json");
+    let run = |args: &[&str]| fx.exec(args, &[], None, Some(&fx.repo));
+
+    // 拒否: 未定義のカスタム id・構文の誤り・このリポジトリで有効でない種類。worker は起動しない。
+    let out = run(&["run-now", "--documents", "nosuch", "--json"]);
+    assert_eq!(out.code, 1);
+    assert!(
+        out.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("定義されていません")
+    );
+    let out = run(&["run-now", "--documents", "FOO.md", "--json"]);
+    assert_eq!(out.code, 1);
+    assert!(out.json()["error"].as_str().unwrap().contains("未対応"));
+    let out = run(&["run-now", "--documents", "CHANGELOG.md", "--json"]);
+    assert_eq!(out.code, 1);
+    assert!(
+        out.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("有効ではない")
+    );
+    assert!(!prompt.exists(), "拒否では worker を起動しない");
+
+    // README だけに絞る。DESIGN.md は有効だが今回は処理しない。
+    let writes = json!({"README.md": "narrowed readme\n"}).to_string();
+    let out = fx.exec(
+        &["run-now", "--documents", "readme", "--json"],
+        &[("HOOK_STUB_WRITES", &writes)],
+        None,
+        Some(&fx.repo),
+    );
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    let v = out.json();
+    assert_eq!(v["outcome"], "created");
+    assert_eq!(v["documents"], json!(["README.md"]));
+    let sent = fs::read_to_string(&prompt).unwrap();
+    assert!(sent.contains("README.md"));
+    assert!(
+        !sent.contains("DESIGN"),
+        "絞り込んだ種類だけを worker へ渡す"
+    );
+
+    // 対照: 絞らなければ DESIGN.md も対象になる（別の環境で同じ手順）。
+    let control = Fx::new();
+    assert_eq!(
+        control.enable(&["--documents", "README.md,DESIGN.md"]).code,
+        0
+    );
+    control.push_change("narrowing");
+    let out = control.exec(
+        &["run-now", "--json"],
+        &[("HOOK_STUB_WRITES", &writes)],
+        None,
+        Some(&control.repo),
+    );
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(
+        fs::read_to_string(control.base.join("prompt.json"))
+            .unwrap()
+            .contains("DESIGN")
+    );
+
+    // 完了した種類の最終完了時刻が docs list に出る（絞った README だけ）。
+    let v = fx
+        .exec(&["docs", "list", "--json"], &[], None, Some(&fx.repo))
+        .json();
+    assert!(kind_of(&v, "readme")["lastDoneAt"].is_string());
+    assert_eq!(kind_of(&v, "design")["lastDoneAt"], Value::Null);
+}
+
+#[test]
+fn run_now_reports_a_rejected_proposal_as_its_own_outcome() {
+    let fx = Fx::new();
+    // README の上限を 5 文字にする。worker が長い README を書くと保守後の検査に違反する。
+    define_kinds(&fx, |c| {
+        c.kinds.insert(
+            "readme".into(),
+            config::KindSettings {
+                max_chars: Some(5),
+                ..Default::default()
+            },
+        );
+    });
+    assert_eq!(fx.enable(&["--documents", "README.md"]).code, 0);
+    fx.push_change("rejected change");
+    let writes = json!({"README.md": "this readme is far too long\n"}).to_string();
+    let out = fx.exec(
+        &["run-now", "--json"],
+        &[("HOOK_STUB_WRITES", &writes)],
+        None,
+        Some(&fx.repo),
+    );
+    // 失敗ではない（終了コード 0）。専用の outcome と理由を返し、更新案は作られない。
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    let v = out.json();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["outcome"], "rejected");
+    assert!(v["reason"].as_str().unwrap().contains("README.md"), "{v}");
+    assert!(v["reason"].as_str().unwrap().contains("上限"), "{v}");
+    assert!(v.get("error").is_none() && v.get("patchPath").is_none());
+    assert_eq!(
+        fx.run(&["status", "--json"]).json()["proposals"]["pending"],
+        0
+    );
+    // 人が読む形式でも理由が出る。同じ push の run-now は棄却を無視して作り直すので、もう一度棄却される。
+    let out = fx.exec(
+        &["run-now"],
+        &[("HOOK_STUB_WRITES", &writes)],
+        None,
+        Some(&fx.repo),
+    );
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    assert!(
+        out.stdout.contains("更新案を作成しませんでした"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("上限"), "{}", out.stdout);
+}
+
+#[test]
+fn doctor_reports_kinds_templates_limits_and_changelog_notes() {
+    let fx = Fx::new();
+    // 既定の設定（種類の定義なし）: kinds 項目は ok で、カスタム 0 種。
+    assert_eq!(fx.enable(&[]).code, 0);
+    let v = fx.run(&["doctor", "--json"]).json();
+    assert_eq!(item(&v, "kinds")["status"], "ok");
+    assert!(
+        item(&v, "kinds")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("カスタム 0 種")
+    );
+
+    // カスタム種類＋テンプレートが読める＋上限超過の既存文書。
+    write_architecture_template(&fx);
+    define_kinds(&fx, |c| {
+        c.kinds.insert("architecture".into(), architecture_kind());
+        c.kinds.insert(
+            "readme".into(),
+            config::KindSettings {
+                max_chars: Some(3), // 既存の README（6 文字）より小さい
+                ..Default::default()
+            },
+        );
+        c.repository[0].documents = Some(vec![
+            config::Document::Readme,
+            config::Document::Changelog,
+            config::Document::Custom("architecture".into()),
+        ]);
+    });
+    let v = fx.run(&["doctor", "--json"]).json();
+    let kinds = item(&v, "kinds");
+    assert_eq!(kinds["status"], "ok");
+    assert!(
+        kinds["detail"]
+            .as_str()
+            .unwrap()
+            .contains("カスタム 1 種（architecture）")
+    );
+    assert!(
+        kinds["detail"]
+            .as_str()
+            .unwrap()
+            .contains("読めるもの 1 件")
+    );
+    assert_eq!(item(&v, "kindsLimits")["status"], "info");
+    assert!(
+        item(&v, "kindsLimits")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("README.md")
+    );
+    // propose モードなので CHANGELOG の競合注意は出ない。
+    assert!(
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["id"] != "kindsChangelog")
+    );
+
+    // テンプレートが無い種類が有効なら fail（保守が見送られ続ける）。
+    fs::remove_file(fx.base.join("templates").join("architecture.md")).unwrap();
+    let out = fx.run(&["doctor", "--json"]);
+    assert_eq!(out.code, 1);
+    let v = out.json();
+    assert_eq!(item(&v, "kinds")["status"], "fail");
+    assert!(
+        item(&v, "kinds")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("architecture")
+    );
+
+    // どの登録でも有効でなければ warn。push モードで CHANGELOG を保守する登録があれば注意（info）。
+    define_kinds(&fx, |c| {
+        c.repository[0].documents = Some(vec![config::Document::Changelog]);
+        c.repository[0].mode = Some(Mode::Push);
+    });
+    let out = fx.run(&["doctor", "--json"]);
+    let v = out.json();
+    assert_eq!(item(&v, "kinds")["status"], "warn");
+    assert_eq!(item(&v, "kindsChangelog")["status"], "info");
+    // 診断はテンプレートの中身などを出力しない。
+    assert!(!out.stdout.contains("責務"));
 }

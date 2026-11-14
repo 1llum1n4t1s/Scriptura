@@ -46,6 +46,9 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e),
         },
+        // 管理画面。常駐はせず、Ctrl+C・画面の「終了」・60 分無操作で終わる。
+        // cli::run は「処理してから出力をまとめて返す」形なので、待ち続けるサーバーはここで直接起動する。
+        Some("ui") => ui_command(&args[1..]),
         Some("--version") | Some("-V") => {
             println!("scriptura {}", app::VERSION);
             ExitCode::SUCCESS
@@ -63,7 +66,11 @@ fn main() -> ExitCode {
   resume [--repo <path>]            再開する\n\
   status                            設定・登録・更新案の件数を表示する\n\
   doctor [--verify]                 環境と設定を診断する\n\
-  run-now [--repo <path>]           いま 1 回保守を実行する\n\
+  run-now [--repo <path>] [--documents a,b]\n\
+                                    いま 1 回保守を実行する（--documents で処理する種類を絞る）\n\
+  docs list [--repo <path>]         文書の種類（組み込み・カスタム）の設定と状態を一覧する\n\
+  docs show <id> [--repo <path>]    文書の種類 1 件の設定を詳しく表示する\n\
+  ui [--port <n>] [--no-open]       管理画面をブラウザーで開く（127.0.0.1 のみ。既定のポートは 7468）\n\
 \n\
 更新案（propose モード）:\n\
   review [sha|latest] [--repo <path>]   更新案を確認する\n\
@@ -82,6 +89,19 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+/// `scriptura ui`。feature "ui" を外したビルドでは、管理画面が含まれないことを伝えて終了 1。
+#[cfg(feature = "ui")]
+fn ui_command(args: &[String]) -> ExitCode {
+    ExitCode::from(scriptura::ui::run(args).clamp(0, 255) as u8)
+}
+
+#[cfg(not(feature = "ui"))]
+fn ui_command(_args: &[String]) -> ExitCode {
+    fail(
+        "この版の Scriptura には管理画面（ui）が含まれていません（feature \"ui\" を有効にしてビルドしてください）",
+    )
 }
 
 fn fail(message: &str) -> ExitCode {

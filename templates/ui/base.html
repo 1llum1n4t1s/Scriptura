@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="same-origin">{% block head %}{% endblock %}<title>{{ layout.title }} - Scriptura</title><link rel="stylesheet" href="/assets/app.css"><script src="/assets/app.js" defer></script></head>
+<body>
+<a class="skip" href="#main">本文へ移動</a>
+<header class="topbar">
+  <a class="brand" href="/">Scriptura<span>文書保守の管理画面</span></a>
+  <nav aria-label="メイン">
+    <a href="/" aria-current="{% if layout.nav == "overview" %}page{% else %}false{% endif %}">概要</a>
+    <a href="/repos" aria-current="{% if layout.nav == "repos" %}page{% else %}false{% endif %}">リポジトリ</a>
+    <a href="/kinds" aria-current="{% if layout.nav == "kinds" %}page{% else %}false{% endif %}">文書の種類</a>
+    <a href="/proposals" aria-current="{% if layout.nav == "proposals" %}page{% else %}false{% endif %}">更新案</a>
+    <a href="/settings/worker" aria-current="{% if layout.nav == "worker" %}page{% else %}false{% endif %}">worker</a>
+    <a href="/settings/general" aria-current="{% if layout.nav == "general" %}page{% else %}false{% endif %}">全般</a>
+    <a href="/consent" aria-current="{% if layout.nav == "consent" %}page{% else %}false{% endif %}">同意</a>
+    <a href="/history" aria-current="{% if layout.nav == "history" %}page{% else %}false{% endif %}">履歴</a>
+    <a href="/doctor" aria-current="{% if layout.nav == "doctor" %}page{% else %}false{% endif %}">診断</a>
+  </nav>
+  <form method="post" action="/shutdown" class="inline"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><button class="small destructive" type="submit">終了</button></form>
+</header>
+<main id="main">
+{% if let Some(text) = layout.flash %}<p class="notice" role="status">{{ text }}</p>{% endif %}
+{% if let Some(reason) = layout.broken %}<p class="notice warning" role="alert">設定ファイルが壊れているため、変更はできません（壊れた設定は書き換えません）: {{ reason }}</p>{% endif %}
+{% block content %}{% endblock %}
+</main>
+<footer>Scriptura · 127.0.0.1 だけで動く管理画面（60 分操作が無いと終了します）</footer>
+</body></html>

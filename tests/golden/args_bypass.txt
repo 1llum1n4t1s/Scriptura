@@ -1,0 +1,9 @@
+-p
+--model
+claude-sonnet-5-5
+--effort
+high
+--dangerously-skip-permissions
+--no-session-persistence
+--output-format
+text

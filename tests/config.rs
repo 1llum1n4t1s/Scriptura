@@ -82,9 +82,18 @@ fn rejects_unknown_keys_and_bad_values() {
         Loaded::Invalid(_)
     ));
     assert!(matches!(parse("this is = not toml ["), Loaded::Invalid(_)));
-    // CHANGELOG.md は未対応。
+    // CHANGELOG.md は組み込みの種類として受け付ける（schema 2 の機能。省略時の schema でも読める）。
     assert!(matches!(
         parse("[defaults]\ndocuments = [\"CHANGELOG.md\"]"),
+        Loaded::Ok(_)
+    ));
+    // 定義の無いカスタム id と、文書名の形をした未知の名前は拒否する。
+    assert!(matches!(
+        parse("[defaults]\ndocuments = [\"architecture\"]"),
+        Loaded::Invalid(_)
+    ));
+    assert!(matches!(
+        parse("[defaults]\ndocuments = [\"FOO.md\"]"),
         Loaded::Invalid(_)
     ));
     assert!(matches!(
@@ -113,10 +122,75 @@ fn documents_subset_accepted() {
 
 #[test]
 fn newer_schema_is_invalid_even_with_unknown_keys() {
-    let r = invalid("schema = 2\nfuture_key = true\n");
+    // schema 2 は現行。未知キーは（schema が同じでも）Invalid だが、理由は schema ではなくキー。
+    assert!(matches!(
+        parse("schema = 2\nfuture_key = true\n"),
+        Loaded::Invalid(_)
+    ));
+    // schema 3 以上は「新しい schema」として未知キーの有無に関わらず断る。
+    let r = invalid("schema = 3\nfuture_key = true\n");
     assert!(r.contains("schema"));
+    assert!(invalid("schema = 3\n").contains("schema"));
     assert!(matches!(parse("schema = \"1\""), Loaded::Invalid(_)));
+    assert!(matches!(parse("schema = 0"), Loaded::Invalid(_)));
     assert!(matches!(ok("schema = 1"), Config { .. }));
+    assert!(matches!(ok("schema = 2"), Config { .. }));
+}
+
+#[test]
+fn schema_two_round_trips_and_schema_one_stays_one() {
+    let dir = tmp("schema-roundtrip");
+    // 新機能を使わない設定は、読み込み後に保存し直しても schema 1 のまま（旧版でも読める）。
+    let file = dir.join("v1.toml");
+    save_to(&file, &ok("schema = 1\n")).unwrap();
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("schema = 1")
+    );
+    // schema = 2 と書いただけで機能を使っていない設定も、保存すると必要最小の 1 になる。
+    let plain = ok("schema = 2\n");
+    assert_eq!(plain.required_schema(), 1);
+    save_to(&file, &plain).unwrap();
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("schema = 1")
+    );
+    // 新機能（kinds・CHANGELOG・追加指示・UI での同意）を使うと 2 で書き、往復で同じ内容に戻る。
+    for extra in [
+        "[kinds.agents]\nmax_bytes = 20000\n",
+        "[defaults]\ninstructions = \"日本語で書く\"\n",
+        "[defaults]\ndocuments = [\"README.md\", \"CHANGELOG.md\"]\n",
+        "[kinds.architecture]\nguidance = \"構成\"\npaths = [\"docs/ARCHITECTURE.md\"]\n[defaults]\ndocuments = [\"architecture\"]\n",
+    ] {
+        let c = ok(&format!("schema = 2\n{extra}"));
+        assert_eq!(c.required_schema(), 2, "{extra}");
+        let file = dir.join("v2.toml");
+        save_to(&file, &c).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("schema = 2"), "{text}");
+        let Loaded::Ok(back) = load_from(&file) else {
+            panic!("読み戻せません: {text}")
+        };
+        assert_eq!(back, Config { schema: 2, ..c });
+    }
+    // 旧設定のメモリ上の値が 1 のままでも、機能を足して保存すれば 2 で書かれる。
+    let mut c = ok("schema = 1\n");
+    c.defaults.documents.push(Document::Changelog);
+    save_to(&file, &c).unwrap();
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("schema = 2")
+    );
+    let mut ui = ok("schema = 1\n");
+    ui.consent = Some(Consent {
+        version: 1,
+        accepted_at: "2026-01-01T00:00:00Z".into(),
+        source: ConsentSource::Ui,
+    });
+    assert_eq!(ui.required_schema(), 2);
 }
 
 #[test]

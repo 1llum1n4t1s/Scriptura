@@ -13,6 +13,7 @@
 // - 判定（`resolve`）は I/O を持たない純粋関数。git の push URL とブランチは呼び出し側が
 //   取得して渡す。
 use std::{
+    collections::BTreeMap,
     fs,
     io::{self, Write},
     path::{Path, PathBuf},
@@ -20,10 +21,14 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::kinds::{self, ResolvedKind};
 use crate::paths;
 
 /// 現行の schema 版。これより新しい schema は解釈せず off に倒す。
-pub const CURRENT_SCHEMA: u32 = 1;
+/// 2 は文書種類の設定（`[kinds.*]`）・追加指示・CHANGELOG・カスタム種類・管理画面での同意を使う設定。
+pub const CURRENT_SCHEMA: u32 = 2;
+/// 読み込める最小の schema 版（新機能を使わない設定の版。キー省略時もこの値）。
+pub const MIN_SCHEMA: u32 = 1;
 /// 現行の同意文書の版。consent.version がこれ未満なら再同意が必要（常に skip）。
 pub const CURRENT_CONSENT_VERSION: u32 = 1;
 /// worker timeout の許容範囲（秒）。上限は Stop hook の timeout（プラグインの hooks.json は 1800 秒）より
@@ -54,26 +59,110 @@ pub enum Mode {
     Push,
 }
 
-/// 保守対象の文書。CHANGELOG.md は未対応のため列挙しない（設定に書くと Invalid になる）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// 保守対象の文書の種類。組み込み 4 種（AGENTS / DESIGN / README / CHANGELOG）と、
+/// 利用者が `[kinds.<id>]` で定義するカスタム種類。
+///
+/// 設定ファイル上は文字列で表す。組み込みは文書名（"AGENTS.md" など。id の "agents" も読める）、
+/// カスタムは id（`^[a-z][a-z0-9-]{0,31}$`）。書き出しは組み込み=文書名、カスタム=id なので、
+/// schema 1 の設定の文面はそのまま往復する。
+/// カスタム id が `[kinds.<id>]` で定義されているかは `Config::validate` が検査する。
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum Document {
-    #[serde(rename = "AGENTS.md")]
     Agents,
-    #[serde(rename = "DESIGN.md")]
     Design,
-    #[serde(rename = "README.md")]
     Readme,
+    Changelog,
+    Custom(String),
 }
 
 impl Document {
+    /// 旧既定の 3 種。意味を変えない（既定の対象・旧利用者の移行設定はこの 3 種のまま）。
+    /// CHANGELOG はオプトインなので含めない。
     pub const ALL: [Document; 3] = [Document::Agents, Document::Design, Document::Readme];
+    /// 組み込みの 4 種（CHANGELOG を含む）。
+    pub const BUILTIN: [Document; 4] = [
+        Document::Agents,
+        Document::Design,
+        Document::Readme,
+        Document::Changelog,
+    ];
 
-    pub fn file_name(self) -> &'static str {
+    /// 種類の id（`[kinds.<id>]` のキー）。組み込みは小文字の固定名、カスタムは定義した id。
+    pub fn id(&self) -> &str {
+        match self {
+            Document::Agents => "agents",
+            Document::Design => "design",
+            Document::Readme => "readme",
+            Document::Changelog => "changelog",
+            Document::Custom(id) => id,
+        }
+    }
+
+    /// 表示・設定ファイル上の名前。組み込みは文書名（"AGENTS.md" など）、カスタムは id。
+    pub fn name(&self) -> &str {
         match self {
             Document::Agents => "AGENTS.md",
             Document::Design => "DESIGN.md",
             Document::Readme => "README.md",
+            Document::Changelog => "CHANGELOG.md",
+            Document::Custom(id) => id,
         }
+    }
+
+    /// 従来の呼び名（`name` と同じ）。
+    pub fn file_name(&self) -> &str {
+        self.name()
+    }
+
+    pub fn is_builtin(&self) -> bool {
+        !matches!(self, Document::Custom(_))
+    }
+
+    /// 組み込みの文書名または id（大文字小文字は区別しない）から組み込みの種類を引く。
+    /// CLI の `--documents` が使う。カスタムは対象外。
+    pub fn builtin_from_text(text: &str) -> Option<Document> {
+        Document::BUILTIN
+            .into_iter()
+            .find(|d| d.name().eq_ignore_ascii_case(text) || d.id().eq_ignore_ascii_case(text))
+    }
+}
+
+/// 種類の id として使えない予約語。管理画面の経路（`/kinds/new` は新規作成画面）と衝突するため、
+/// その id の種類を作れても詳細画面・保存が新規作成の経路に吸われて開けなくなる。
+/// 設定検証・CLI・画面がすべて `is_valid_kind_id` を通るので、ここで拒否すれば全経路に効く。
+pub const RESERVED_KIND_IDS: &[&str] = &["new"];
+
+/// カスタム id の形式（組み込み id と同じ字種・先頭は英小文字・32 文字まで・予約語以外）。
+pub fn is_valid_kind_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    !RESERVED_KIND_IDS.contains(&id)
+        && id.len() <= 32
+        && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+impl TryFrom<String> for Document {
+    type Error = String;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        // 設定ファイルでは組み込みの文書名と id だけを読む（大文字小文字も厳密）。
+        match text.as_str() {
+            "AGENTS.md" | "agents" => Ok(Document::Agents),
+            "DESIGN.md" | "design" => Ok(Document::Design),
+            "README.md" | "readme" => Ok(Document::Readme),
+            "CHANGELOG.md" | "changelog" => Ok(Document::Changelog),
+            _ if is_valid_kind_id(&text) => Ok(Document::Custom(text)),
+            _ => Err(format!(
+                "文書の種類として解釈できません: {text}（AGENTS.md / DESIGN.md / README.md / CHANGELOG.md か、英小文字・数字・ハイフンの id）"
+            )),
+        }
+    }
+}
+
+impl From<Document> for String {
+    fn from(d: Document) -> String {
+        d.name().to_string()
     }
 }
 
@@ -82,6 +171,116 @@ impl Document {
 pub enum ConsentSource {
     Cli,
     LegacyMigration,
+    /// 管理画面（scriptura ui）での同意。この出所を使った設定は schema 2。
+    Ui,
+}
+
+/// 種類のタイミング（`when`）。push=push のたび、release=リリース（タグ）が出たとき、
+/// manual=run-now のときだけ。評価は P3 以降（P1 は値の保持と検証のみ）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum When {
+    Push,
+    Release,
+    Manual,
+}
+
+/// `[kinds.<id>.timing]`。全項目省略可。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Timing {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub when: Option<When>,
+    /// 今回の push 範囲の変更パスのどれかに一致したときだけ対象（glob）。省略時は条件なし。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// 前回完了からの最小間隔（時間、0..=720）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_interval_hours: Option<u32>,
+}
+
+/// CHANGELOG の形式。existing=既存の形式を踏襲、keep-a-changelog=新規作成時に標準形式を使う。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChangelogFormat {
+    Existing,
+    KeepAChangelog,
+}
+
+/// リリース時の扱い。promote=Unreleased の内容を版の節へ移す、ignore=何もしない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnRelease {
+    Promote,
+    Ignore,
+}
+
+/// 新規作成時に過去へ遡るか。`Tags`=タグ単位で遡る、`Off`（設定値 "none"）=遡らない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Backfill {
+    #[serde(rename = "tags")]
+    Tags,
+    #[serde(rename = "none")]
+    Off,
+}
+
+/// `[kinds.changelog.changelog]`（changelog 専用）。全項目省略可。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ChangelogSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<ChangelogFormat>,
+    /// リリースとみなすタグの glob（既定 "v*"）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_release: Option<OnRelease>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfill: Option<Backfill>,
+    /// 1..=50（既定 20）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfill_max_releases: Option<u32>,
+    /// 1..=1000（既定 300）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfill_max_commits: Option<u32>,
+}
+
+/// `[kinds.<id>]`。文書の種類ごとの設定。全項目省略可（組み込みは `kinds.rs` の既定で補う）。
+/// 規則（組み込みに paths/guidance は書けない・カスタムは必須など）は `Config::validate` が検査する。
+/// 設定は利用者の config.toml だけから読む（リポジトリ内ファイルは読まない）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct KindSettings {
+    /// カスタム種類の対象パス（1〜10 件）。組み込みには書けない。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// 何を書く文書か（カスタムは必須・1000 字以内）。組み込みには書けない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
+    /// 対象が無いとき新規作成してよいか（組み込み true／カスタム false）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_if_missing: Option<bool>,
+    /// "builtin" / "none" / "templates/<名前>.md"（設定フォルダー配下）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+    /// 追加の編集指示（2000 字以内）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    /// 文書の言語（"ja" など）。省略時は既存文書に従う。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// 保守後に存在を検査する見出し（20 件以内）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub required_headings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<Timing>,
+    /// changelog 専用の表。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changelog: Option<ChangelogSettings>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +312,9 @@ pub struct Defaults {
     pub mode: Mode,
     pub documents: Vec<Document>,
     pub exclude: Vec<String>,
+    /// 全種類共通の追加編集指示（2000 字以内）。使うと schema 2。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub instructions: String,
 }
 
 impl Default for Defaults {
@@ -121,6 +323,7 @@ impl Default for Defaults {
             mode: Mode::Propose,
             documents: Document::ALL.to_vec(),
             exclude: Vec::new(),
+            instructions: String::new(),
         }
     }
 }
@@ -202,22 +405,28 @@ pub struct Config {
     pub worker: Worker,
     #[serde(default)]
     pub enrollment: Enrollment,
+    /// 文書の種類ごとの設定（`[kinds.<id>]`）。キーは組み込み id かカスタム id。使うと schema 2。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub kinds: BTreeMap<String, KindSettings>,
     #[serde(default, rename = "repository", skip_serializing_if = "Vec::is_empty")]
     pub repository: Vec<Repository>,
 }
 
+/// schema キーを省略したときの版。新機能を使わない設定は schema 1 として扱う
+/// （`Config::default()` と省略時の読み込み結果を一致させる）。
 fn default_schema() -> u32 {
-    CURRENT_SCHEMA
+    MIN_SCHEMA
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            schema: CURRENT_SCHEMA,
+            schema: MIN_SCHEMA,
             consent: None,
             defaults: Defaults::default(),
             worker: Worker::default(),
             enrollment: Enrollment::default(),
+            kinds: BTreeMap::new(),
             repository: Vec::new(),
         }
     }
@@ -237,6 +446,7 @@ impl Config {
                 mode: Mode::Push,
                 documents: Document::ALL.to_vec(),
                 exclude: Vec::new(),
+                instructions: String::new(),
             },
             worker: Worker {
                 permission: Permission::Bypass,
@@ -250,15 +460,39 @@ impl Config {
         }
     }
 
+    /// この設定を保存するのに必要な schema 版。schema 2 の機能（`[kinds.*]`・追加指示・CHANGELOG・
+    /// カスタム種類・管理画面での同意）を 1 つも使っていなければ 1。旧版の Scriptura でも読めるよう、
+    /// 保存は必要最小の版で書く（`save_to`）。新機能を使った設定を旧版が読むと Invalid で何もしない（安全側）。
+    pub fn required_schema(&self) -> u32 {
+        let v2_document = |docs: &[Document]| {
+            docs.iter()
+                .any(|d| matches!(d, Document::Changelog | Document::Custom(_)))
+        };
+        let uses_v2 = !self.kinds.is_empty()
+            || !self.defaults.instructions.is_empty()
+            || v2_document(&self.defaults.documents)
+            || self
+                .repository
+                .iter()
+                .any(|r| r.documents.as_deref().is_some_and(v2_document))
+            || self
+                .consent
+                .as_ref()
+                .is_some_and(|c| c.source == ConsentSource::Ui);
+        if uses_v2 { 2 } else { MIN_SCHEMA }
+    }
+
     /// 値の範囲検証。読み込み時と保存前の両方で使う。
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema != CURRENT_SCHEMA {
+        if !(MIN_SCHEMA..=CURRENT_SCHEMA).contains(&self.schema) {
             return Err(format!("未対応の schema です: {}", self.schema));
         }
         if self.defaults.documents.is_empty() {
             return Err("defaults.documents が空です".into());
         }
         check_globs("defaults.exclude", &self.defaults.exclude)?;
+        kinds::validate_instructions("defaults.instructions", &self.defaults.instructions)?;
+        kinds::validate_kinds(self)?;
         let w = &self.worker;
         if w.model.trim().is_empty() {
             return Err("worker.model が空です".into());
@@ -303,11 +537,31 @@ impl Config {
             }
             check_globs(&format!("{at}.exclude"), &repo.exclude)?;
         }
+        // 対象に挙げたカスタム種類は `[kinds.<id>]` の定義が必須（定義が無いと何を書く文書か不明）。
+        let documents =
+            std::iter::once(("defaults.documents".to_string(), &self.defaults.documents)).chain(
+                self.repository.iter().enumerate().filter_map(|(i, r)| {
+                    r.documents
+                        .as_ref()
+                        .map(|d| (format!("repository[{i}].documents"), d))
+                }),
+            );
+        for (field, docs) in documents {
+            for doc in docs {
+                if let Document::Custom(id) = doc
+                    && !self.kinds.contains_key(id)
+                {
+                    return Err(format!(
+                        "{field} のカスタム種類 {id} は [kinds.{id}] の定義が必要です"
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }
 
-fn check_globs(field: &str, globs: &[String]) -> Result<(), String> {
+pub(crate) fn check_globs(field: &str, globs: &[String]) -> Result<(), String> {
     for g in globs {
         if g.trim().is_empty() {
             return Err(format!("{field} に空のパターンがあります"));
@@ -344,7 +598,8 @@ pub fn parse(text: &str) -> Loaded {
     // 新しい版は未知キーを含むはずなので、厳密な型検証より先に schema だけ見て分かりやすく断る。
     match table.get("schema") {
         None => {}
-        Some(toml::Value::Integer(n)) if *n == i64::from(CURRENT_SCHEMA) => {}
+        Some(toml::Value::Integer(n))
+            if (i64::from(MIN_SCHEMA)..=i64::from(CURRENT_SCHEMA)).contains(n) => {}
         Some(toml::Value::Integer(n)) if *n > i64::from(CURRENT_SCHEMA) => {
             return Loaded::Invalid(format!(
                 "この版より新しい schema です: {n}（Scriptura を更新してください）"
@@ -382,11 +637,29 @@ pub fn load() -> Loaded {
 /// アトミックに保存する（同じフォルダーの一時ファイルへ書いて rename）。
 /// 検証に通らない設定は書かない。失敗時は既存ファイルを変更しない。
 pub fn save_to(path: &Path, config: &Config) -> io::Result<()> {
+    write_config(path, config).map(|_| ())
+}
+
+/// `save_to` の本体。書いたバイト列を返す（`update_in` が保存後の版を、ファイルを読み直さずに
+/// 求めるため）。読み直すと、ロックを取らない書き手（旧利用者の自動移行）と競ったときに
+/// 「自分が書いた内容」と違う版を返しうる。
+fn write_config(path: &Path, config: &Config) -> io::Result<Vec<u8>> {
+    // schema は「新機能を使っていれば 2、使っていなければ 1」で書く（メモリ上の値には依存しない）。
+    // 旧設定は書き直しても schema 1 のままなので、旧版の Scriptura でも読める。
+    let mut config = config.clone();
+    config.schema = config.required_schema();
     config
         .validate()
         .map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))?;
-    let text = toml::to_string_pretty(config)
+    let text = toml::to_string_pretty(&config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    write_atomic(path, text.as_bytes())?;
+    Ok(text.into_bytes())
+}
+
+/// 同じフォルダーの一時ファイルへ書いて rename する。設定本体と変更履歴の退避の両方で使う。
+/// 失敗時は一時ファイルだけを片付け、既存のファイルには触れない。
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -413,7 +686,7 @@ pub fn save_to(path: &Path, config: &Config) -> io::Result<()> {
             .write(true)
             .create_new(true)
             .open(&tmp)?;
-        file.write_all(text.as_bytes())?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp, path)
@@ -428,6 +701,503 @@ pub fn save_to(path: &Path, config: &Config) -> io::Result<()> {
 /// 利用者の設定ファイル（paths::config_file）へ保存する。
 pub fn save(config: &Config) -> io::Result<()> {
     save_to(&paths::config_file(), config)
+}
+
+// ---------------------------------------------------------------------------
+// 設定の版・楽観的排他つきの更新・変更履歴（CLI・管理画面・自動移行で共通の書き込み経路）
+//
+// 設計（設計書 9.3）:
+// ① 状態フォルダーの `config-lock.sqlite3` で `BEGIN IMMEDIATE`（書き手同士の排他）
+// ② ロック内でファイルを読み直し、期待する版（Revision）と照合（画面は必須、CLI は省略可）
+// ③ 変更を適用して `validate`
+// ④ 直前の版を `<状態フォルダー>/config-history/<UTC 時刻>-<版の先頭 12 桁>.toml` へ退避（50 件保持）
+// ⑤ `save_to` と同じアトミック書き込みで保存
+//
+// 注意点:
+// - 変更履歴は設定フォルダーではなく状態フォルダーに置く（設定フォルダーには config.toml だけを残す契約）。
+// - 壊れた設定（Invalid）は、版が一致していても書き換えない（AGENTS.md の契約）。
+// - 変更が無ければ（保存内容が同じなら）退避も保存もしない。pause の繰り返しなどで履歴を増やさない。
+// - 退避するのはディスク上の生のバイト列そのもの（再シリアライズしない）。復元は「履歴を読む→検証→
+//   update（期待する版=現在の版）」で行うので、復元前の内容も履歴に残る。
+// - `save` / `save_to` は従来どおりロックを取らない（`update_in` の中から呼ぶため。ロックを取ると
+//   別接続の BEGIN IMMEDIATE で自分自身を待ってしまう）。
+// ---------------------------------------------------------------------------
+
+/// 変更履歴の保持件数。これを超えた古い退避は、命名規則に合うものだけを古い順に消す。
+pub const HISTORY_LIMIT: usize = 50;
+/// 設定ロックの待ち時間。CLI の pause などが画面の保存と重なっても少し待てば通る長さで、
+/// 固まったプロセスがあっても無限には待たない。
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// 設定ファイルの版。ファイルのバイト列の SHA-256（小文字 16 進 64 桁）、ファイルが無ければ `missing`。
+/// 画面は表示時の版をフォームに埋め込み、保存時に照合して「他で変更された」ことを検出する（楽観的排他）。
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Revision(String);
+
+impl Revision {
+    /// ファイルが無いときの版の表記。
+    pub const MISSING: &'static str = "missing";
+
+    pub fn missing() -> Self {
+        Self(Self::MISSING.into())
+    }
+
+    /// バイト列（無ければ None）から版を求める。
+    pub fn of(bytes: Option<&[u8]>) -> Self {
+        use sha2::{Digest, Sha256};
+        match bytes {
+            Some(b) => Self(format!("{:x}", Sha256::digest(b))),
+            None => Self::missing(),
+        }
+    }
+
+    /// 外部（フォームの値など）から受け取った文字列を版として解釈する。形式が違えば None。
+    pub fn parse(text: &str) -> Option<Self> {
+        let ok = text == Self::MISSING
+            || (text.len() == 64
+                && text
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        ok.then(|| Self(text.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_missing(&self) -> bool {
+        self.0 == Self::MISSING
+    }
+
+    /// 表示・履歴のファイル名に使う先頭 12 桁（missing はそのまま）。
+    pub fn short(&self) -> &str {
+        &self.0[..self.0.len().min(12)]
+    }
+}
+
+impl std::fmt::Display for Revision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for Revision {
+    type Error = String;
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        Self::parse(&text).ok_or_else(|| format!("設定の版として解釈できません: {text}"))
+    }
+}
+
+impl From<Revision> for String {
+    fn from(r: Revision) -> String {
+        r.0
+    }
+}
+
+/// 設定ファイルと、ロック・変更履歴を置く状態フォルダーの組。
+/// 本体は引数で場所を受け取る（テストが環境変数を触らずに済むよう）。CLI と画面は `Store::current()`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Store {
+    pub config_file: PathBuf,
+    pub state_dir: PathBuf,
+}
+
+impl Store {
+    pub fn new(config_file: impl Into<PathBuf>, state_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            config_file: config_file.into(),
+            state_dir: state_dir.into(),
+        }
+    }
+
+    /// 実行環境の場所。設定は `paths::config_file`、状態フォルダーは状態 DB（`SCRIPTURA_DB` →
+    /// `paths::state_dir()`）の親フォルダー。publications・更新案と同じ基点にすることで、
+    /// テストの隔離（`SCRIPTURA_DB`）がロックと履歴にもそのまま効く。
+    pub fn current() -> Self {
+        let state_dir = crate::maintenance::state_db_path()
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        Self::new(paths::config_file(), state_dir)
+    }
+
+    /// 設定ロックのファイル。
+    pub fn lock_path(&self) -> PathBuf {
+        self.state_dir.join("config-lock.sqlite3")
+    }
+
+    /// 変更履歴のフォルダー。
+    pub fn history_dir(&self) -> PathBuf {
+        self.state_dir.join("config-history")
+    }
+}
+
+/// ある時点の設定（版と読み込み結果）。同じバイト列から両方を求めるので、版と内容が食い違わない。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Snapshot {
+    pub revision: Revision,
+    pub loaded: Loaded,
+}
+
+/// 設定ファイルの生のバイト列（無ければ None）。読めない場合はその理由。
+fn read_raw(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("読み込めません: {e}")),
+    }
+}
+
+/// バイト列を `load_from` と同じ規則で解釈する。
+fn interpret(bytes: Option<&[u8]>) -> Loaded {
+    match bytes {
+        None => Loaded::Missing,
+        Some(b) => match std::str::from_utf8(b) {
+            Ok(text) => parse(text),
+            Err(_) => Loaded::Invalid("UTF-8 ではありません".into()),
+        },
+    }
+}
+
+/// 指定ファイルの現在の版と内容。ロックは取らない（表示用）。
+pub fn read_at(path: &Path) -> Snapshot {
+    match read_raw(path) {
+        Ok(bytes) => Snapshot {
+            revision: Revision::of(bytes.as_deref()),
+            loaded: interpret(bytes.as_deref()),
+        },
+        // 読めないファイルは版を求められない。ファイルが在ることは確かなので missing とは区別し、
+        // 空のバイト列の版を返す（どの期待値とも照合が合わず、書き込みは Broken で止まる）。
+        Err(reason) => Snapshot {
+            revision: Revision::of(Some(&[])),
+            loaded: Loaded::Invalid(reason),
+        },
+    }
+}
+
+/// 利用者の設定ファイルの現在の版と内容。
+pub fn read() -> Snapshot {
+    read_at(&paths::config_file())
+}
+
+/// `update_in` などの設定操作の失敗。画面は種類ごとに応答を変える（Conflict は 409 など）。
+/// `Display` は CLI がそのまま出すエラー文（従来の文言を保つ）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpdateError {
+    /// 期待した版と現在の版が違う（他で変更された）。何も書いていない。
+    Conflict {
+        expected: Revision,
+        actual: Revision,
+    },
+    /// ディスク上の設定が壊れている（Invalid）。壊れた設定は書き換えない。
+    Broken { path: PathBuf, reason: String },
+    /// 操作が受け付けられない（未登録・同意なし・Git でないなど）。文言をそのまま出す。
+    Rejected(String),
+    /// 変更後の設定が検証に通らない。理由をそのまま出す。
+    Invalid(String),
+    /// 設定ロックを待ち時間内に取れなかった。
+    Busy,
+    /// 入出力の失敗（保存・退避・起点の記録など）。文言は作った側が決める。
+    Io(String),
+}
+
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdateError::Conflict { .. } => f.write_str(
+                "設定ファイルが他で変更されたため保存しませんでした。読み込み直してから操作してください",
+            ),
+            // TOML パーサーの説明には設定ファイルの該当行の抜粋が続くため、先頭行だけを使い、
+            // 設定ファイルの内容を出力へ写さない（cli::one_line と同じ扱い）。
+            UpdateError::Broken { path, reason } => write!(
+                f,
+                "設定ファイルが壊れているため変更しません（{}）: {}",
+                path.display(),
+                reason.lines().next().unwrap_or("").trim()
+            ),
+            UpdateError::Rejected(m) | UpdateError::Invalid(m) | UpdateError::Io(m) => {
+                f.write_str(m)
+            }
+            UpdateError::Busy => f.write_str(
+                "別の設定変更が実行中です。しばらくしてから再実行してください",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UpdateError {}
+
+/// `update_in` の結果。
+#[derive(Clone, Debug, PartialEq)]
+pub struct Updated<T> {
+    /// 変更関数の戻り値。
+    pub value: T,
+    /// 適用後の設定（保存しなかった場合は現在の設定）。
+    pub config: Config,
+    /// 設定ファイルが無い状態から作ったか。
+    pub created: bool,
+    /// 実際に保存したか（内容が同じなら保存も退避もしない）。
+    pub saved: bool,
+    /// 変更前の版。
+    pub previous: Revision,
+    /// 変更後（保存しなかった場合は現在）の版。
+    pub revision: Revision,
+    /// 変更前の内容を退避した履歴ファイル（新規作成・保存なしのときは None）。
+    pub backup: Option<PathBuf>,
+}
+
+/// 設定ロックを取る。戻り値の接続を drop するとロックが外れる（トランザクションは書き込まずに破棄）。
+/// 状態フォルダーが無ければ作る。
+fn acquire_config_lock(store: &Store) -> Result<rusqlite::Connection, UpdateError> {
+    let io = |e: &dyn std::fmt::Display| UpdateError::Io(format!("設定ロックを取れません: {e}"));
+    fs::create_dir_all(&store.state_dir).map_err(|e| io(&e))?;
+    let conn = rusqlite::Connection::open(store.lock_path()).map_err(|e| io(&e))?;
+    conn.busy_timeout(LOCK_WAIT).map_err(|e| io(&e))?;
+    match conn.execute_batch("BEGIN IMMEDIATE") {
+        Ok(()) => Ok(conn),
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if matches!(
+                e.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            ) =>
+        {
+            Err(UpdateError::Busy)
+        }
+        Err(e) => Err(io(&e)),
+    }
+}
+
+/// 設定を楽観的排他つきで変更する（場所を指定する本体）。
+///
+/// - `expected` が Some なら、ロック内で読んだ現在の版と一致しないと `Conflict`（何も書かない）。
+/// - `f` には現在の設定（ファイルが無ければ `Config::default()`）と「ファイルが在ったか」を渡す。
+///   `f` は純粋・短時間にすること（Git・poll ロック・ネットワークを使わない）。設定ロックを持ったまま
+///   呼ぶので、時間がかかると他の書き手を待たせる。`f` の Err は `Rejected` になり何も書かない。
+/// - 変更後は `validate` し、通らなければ `Invalid`。内容が同じ（ファイルが在り schema を正規化して等しい）
+///   なら保存も退避もせず `saved=false`。
+pub fn update_in<T>(
+    store: &Store,
+    expected: Option<&Revision>,
+    f: impl FnOnce(&mut Config, bool) -> Result<T, String>,
+) -> Result<Updated<T>, UpdateError> {
+    let lock = acquire_config_lock(store)?;
+    let broken = |reason: String| UpdateError::Broken {
+        path: store.config_file.clone(),
+        reason,
+    };
+    // ② ロック内で読み直す。版と内容は同じバイト列から求める。
+    let bytes = read_raw(&store.config_file).map_err(broken)?;
+    let previous = Revision::of(bytes.as_deref());
+    if let Some(expected) = expected
+        && *expected != previous
+    {
+        return Err(UpdateError::Conflict {
+            expected: expected.clone(),
+            actual: previous,
+        });
+    }
+    let (original, existed) = match interpret(bytes.as_deref()) {
+        Loaded::Ok(c) => (c, true),
+        Loaded::Missing => (Config::default(), false),
+        Loaded::Invalid(reason) => return Err(broken(reason)),
+    };
+    // ③ 変更と検証。
+    let mut config = original.clone();
+    let value = f(&mut config, existed).map_err(UpdateError::Rejected)?;
+    config.validate().map_err(UpdateError::Invalid)?;
+    let normalized = |c: &Config| {
+        let mut c = c.clone();
+        c.schema = c.required_schema();
+        c
+    };
+    if existed && normalized(&config) == normalized(&original) {
+        drop(lock);
+        return Ok(Updated {
+            value,
+            config: original,
+            created: false,
+            saved: false,
+            revision: previous.clone(),
+            previous,
+            backup: None,
+        });
+    }
+    // ④ 直前の版の退避。退避に失敗したら保存しない（復元できない変更を作らない）。
+    let backup =
+        match &bytes {
+            Some(b) => Some(backup_history(store, &previous, b).map_err(|e| {
+                UpdateError::Io(format!("設定の変更履歴を保存できませんでした: {e}"))
+            })?),
+            None => None,
+        };
+    // ⑤ アトミック保存。
+    let written = write_config(&store.config_file, &config)
+        .map_err(|e| UpdateError::Io(format!("設定を保存できませんでした: {e}")))?;
+    drop(lock);
+    // 保存した内容の schema は正規化されているので、返す設定も合わせる。
+    config.schema = config.required_schema();
+    Ok(Updated {
+        value,
+        config,
+        created: !existed,
+        saved: true,
+        previous,
+        revision: Revision::of(Some(&written)),
+        backup,
+    })
+}
+
+/// 利用者の設定（`Store::current()`）を楽観的排他つきで変更する。
+pub fn update<T>(
+    expected: Option<&Revision>,
+    f: impl FnOnce(&mut Config, bool) -> Result<T, String>,
+) -> Result<Updated<T>, UpdateError> {
+    update_in(&Store::current(), expected, f)
+}
+
+/// 変更履歴 1 件。`id` はファイル名（`<UTC 時刻>-<版の先頭 12 桁>.toml`）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub id: String,
+    /// 退避した時刻（RFC 3339、UTC）。
+    pub saved_at: String,
+    /// 退避した内容の版の先頭 12 桁。
+    pub revision_prefix: String,
+    pub path: PathBuf,
+    pub size: u64,
+}
+
+/// 履歴のファイル名に使う時刻の書式（固定幅・`:` を含まない・名前順＝時系列）。
+const HISTORY_TIME_FORMAT: &str = "%Y%m%dT%H%M%S%.6fZ";
+/// 時刻部分の長さ（例 `20261115T123456.123456Z`）。
+const HISTORY_TIME_LEN: usize = 23;
+
+/// 変更履歴の id（ファイル名）として正しいか。形式に厳密一致したものだけを受け付ける。
+/// 画面は URL から id を受け取るので、区切り文字や `..` を含むものは必ずここで弾く（パストラバーサル対策）。
+pub fn is_history_id(id: &str) -> bool {
+    parse_history_id(id).is_some()
+}
+
+/// id を（時刻, 版の先頭 12 桁）に分ける。形式外は None。
+fn parse_history_id(id: &str) -> Option<(chrono::NaiveDateTime, &str)> {
+    let stem = id.strip_suffix(".toml")?;
+    if !stem.is_ascii() || stem.len() != HISTORY_TIME_LEN + 1 + 12 {
+        return None;
+    }
+    let (time, rest) = stem.split_at(HISTORY_TIME_LEN);
+    let rev = rest.strip_prefix('-')?;
+    let digits_ok = |s: &str, at: &[usize]| {
+        s.bytes().enumerate().all(|(i, b)| {
+            if at.contains(&i) {
+                true
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+    };
+    // 書式の固定位置（T・.・Z）以外は数字だけ。chrono の解釈より先に字種を絞る。
+    let tb = time.as_bytes();
+    if tb[8] != b'T' || tb[15] != b'.' || tb[22] != b'Z' || !digits_ok(time, &[8, 15, 22]) {
+        return None;
+    }
+    if !rev
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    let at = chrono::NaiveDateTime::parse_from_str(time, HISTORY_TIME_FORMAT).ok()?;
+    Some((at, rev))
+}
+
+/// 履歴フォルダー内の、命名規則に合うファイル名（古い順）。フォルダーが無ければ空。
+fn history_names(dir: &Path) -> io::Result<Vec<String>> {
+    let read = match fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut names: Vec<String> = read
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| is_history_id(n))
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// 直前の版を退避し、保持件数を超えた古い退避を消す。退避先のパスを返す。
+fn backup_history(store: &Store, revision: &Revision, bytes: &[u8]) -> io::Result<PathBuf> {
+    let dir = store.history_dir();
+    fs::create_dir_all(&dir)?;
+    let existing = history_names(&dir)?;
+    // 名前順＝時系列を保つため、時計が戻った・同じマイクロ秒に重なった場合は最後の退避の直後の時刻にする。
+    let mut at = chrono::Utc::now().naive_utc();
+    if let Some((last, _)) = existing.last().and_then(|n| parse_history_id(n))
+        && at <= last
+    {
+        at = last + chrono::Duration::microseconds(1);
+    }
+    let id = format!(
+        "{}-{}.toml",
+        at.format(HISTORY_TIME_FORMAT),
+        revision.short()
+    );
+    debug_assert!(is_history_id(&id), "{id}");
+    let path = dir.join(&id);
+    write_atomic(&path, bytes)?;
+    // 刈り込みは命名規則に合うファイルだけ（利用者が置いた別のファイルには触れない）。
+    let mut names = existing;
+    names.push(id);
+    if names.len() > HISTORY_LIMIT {
+        for old in &names[..names.len() - HISTORY_LIMIT] {
+            // 消せなくても退避と保存は成功しているので、次回の刈り込みに任せる。
+            let _ = fs::remove_file(dir.join(old));
+        }
+    }
+    Ok(path)
+}
+
+/// 変更履歴の一覧（新しい順）。
+pub fn history_in(store: &Store) -> io::Result<Vec<HistoryEntry>> {
+    let dir = store.history_dir();
+    let mut out = Vec::new();
+    for id in history_names(&dir)?.into_iter().rev() {
+        let Some((at, rev)) = parse_history_id(&id) else {
+            continue;
+        };
+        let path = dir.join(&id);
+        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        out.push(HistoryEntry {
+            saved_at: at
+                .and_utc()
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            revision_prefix: rev.to_string(),
+            id: id.clone(),
+            path,
+            size,
+        });
+    }
+    Ok(out)
+}
+
+/// 変更履歴 1 件の生のバイト列と解釈結果。id が形式外・見つからないときは Err（理由）。
+/// 解釈結果が Invalid でも返す（画面は内容と理由を表示できる。復元は Ok のときだけ許す）。
+pub fn history_read_in(store: &Store, id: &str) -> Result<(Vec<u8>, Loaded), String> {
+    if !is_history_id(id) {
+        return Err(format!("変更履歴の id が不正です: {id}"));
+    }
+    let path = store.history_dir().join(id);
+    match read_raw(&path)? {
+        Some(bytes) => {
+            let loaded = interpret(Some(&bytes));
+            Ok((bytes, loaded))
+        }
+        None => Err(format!("変更履歴が見つかりません: {id}")),
+    }
 }
 
 /// remote URL を `host/owner/repo` に統一する。
@@ -547,6 +1317,8 @@ pub struct Decision {
     /// 既定の機密パターン + defaults.exclude + repository.exclude（重複除去済み）。
     pub exclude: Vec<String>,
     pub worker: Worker,
+    /// `documents` の各種類を「組み込み既定 → `[kinds.<id>]`」の順で解決した実効値（`documents` と同順）。
+    pub kinds: Vec<ResolvedKind>,
     pub skip_reason: Option<SkipReason>,
 }
 
@@ -597,6 +1369,7 @@ pub fn resolve_for_os(
             registered.map(|r| r.exclude.as_slice()).unwrap_or(&[]),
         ]),
         worker: config.worker.clone(),
+        kinds: kinds::resolve_kinds(config, &config.defaults.documents),
         skip_reason: Some(reason),
     };
 
@@ -653,11 +1426,13 @@ pub fn resolve_for_os(
         return skip(SkipReason::BranchNotAllowed);
     }
 
+    let documents = registered
+        .and_then(|r| r.documents.clone())
+        .unwrap_or_else(|| config.defaults.documents.clone());
     Decision {
         mode,
-        documents: registered
-            .and_then(|r| r.documents.clone())
-            .unwrap_or_else(|| config.defaults.documents.clone()),
+        kinds: kinds::resolve_kinds(config, &documents),
+        documents,
         exclude: effective_exclude(&[
             &config.defaults.exclude,
             registered.map(|r| r.exclude.as_slice()).unwrap_or(&[]),

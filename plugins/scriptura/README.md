@@ -1,10 +1,10 @@
 # Scriptura プラグイン
 
-push 後に AGENTS.md / DESIGN.md / README.md を保守する Scriptura を Claude Code から使うためのプラグインです。
+push 後に AGENTS.md / DESIGN.md / README.md（と、オプトインで CHANGELOG.md や利用者定義のカスタム文書）を保守する Scriptura を Claude Code から使うためのプラグインです。
 
 ## 構成
 
-- `skills/` : CLI（`scriptura <cmd> --json`）の JSON 出力を要約する薄いスキル（setup / status / doctor / review / apply / run-now / pause / resume）。判断はすべて CLI 側にあり、スキルは同意の確認と結果の要約だけを担う。
+- `skills/` : CLI（`scriptura <cmd> --json`）の JSON 出力を要約する薄いスキル（setup / status / doctor / docs / review / apply / run-now / pause / resume）。判断はすべて CLI 側にあり、スキルは同意の確認と結果の要約だけを担う。
 - `hooks/hooks.json` : Stop フックで `scriptura hook` を非同期に実行します。
 - `bin/scriptura` : POSIX sh ランチャー。macOS / Linux では `libexec/scriptura-<target>` を、Windows の Git Bash 経由（`uname -s` が `MINGW*` / `MSYS*` / `CYGWIN*`）では同じディレクトリの `scriptura.exe` を選んで exec し、対応外・本体不在では exit 0 で何もしません。
 - 生成物（git 管理外）: `bin/scriptura.exe`、`libexec/scriptura-*`、`SHA256SUMS`。リリースビルドで配置します。

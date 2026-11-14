@@ -55,6 +55,7 @@ pub fn run(verify: bool) -> Value {
         items.push(gh_auth());
     }
     items.extend(config_items(&loaded));
+    items.extend(kinds_items(valid));
     items.push(state_dir());
     items.extend(settings_items());
     if verify {
@@ -223,6 +224,149 @@ fn config_items(loaded: &Loaded) -> Vec<Value> {
             ]
         }
     }
+}
+
+/// 文書の種類（`[kinds.<id>]`）の診断。設定が読めているときだけ出す（読めない設定は `config` 項目が fail にする。
+/// 種類の設定の検証は設定の読み込み時に行われるので、ここでは「読めた設定」の実行時の状態を見る）。
+/// - `kinds`: 種類の数と、`templates/` のテンプレートが読めるか。読めない種類が登録リポジトリで有効なら fail
+///   （保守が見送られ続ける）、どこでも有効でなければ warn。
+/// - `kindsLimits`（info）: 上限が既存文書の現在の大きさより小さい（次の保守は棄却されうる）。
+/// - `kindsChangelog`（info）: push モードで CHANGELOG を保守するリポジトリがある（リリース作業との競合の注意）。
+/// 出力はパス・数・定型の語だけ（設定ファイルや文書の内容は載せない）。読み取りだけで何も書かない。
+fn kinds_items(config: Option<&config::Config>) -> Vec<Value> {
+    use config::Document;
+    let Some(config) = config else {
+        return Vec::new();
+    };
+    let settings_dir = config::config_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let documents_of = |repo: &config::Repository| -> Vec<Document> {
+        repo.documents
+            .clone()
+            .unwrap_or_else(|| config.defaults.documents.clone())
+    };
+    let custom: Vec<&str> = config
+        .kinds
+        .keys()
+        .map(String::as_str)
+        .filter(|id| !crate::kinds::is_builtin_id(id))
+        .collect();
+
+    // テンプレート: 種類ごとに実行時と同じ検査をする。リポジトリ内のファイルでないことの確認には、
+    // 登録リポジトリの各ルートを使う（登録が無ければ存在しない場所を使う）。
+    let mut roots: Vec<PathBuf> = config
+        .repository
+        .iter()
+        .map(|r| PathBuf::from(&r.root))
+        .collect();
+    if roots.is_empty() {
+        roots.push(std::env::temp_dir().join("scriptura-doctor-no-repository"));
+    }
+    let mut problems: Vec<String> = Vec::new();
+    let mut blocking = false;
+    let mut readable = 0usize;
+    let defined = Document::BUILTIN
+        .iter()
+        .cloned()
+        .chain(custom.iter().map(|id| Document::Custom((*id).to_string())));
+    for doc in defined {
+        let Some(kind) = crate::kinds::resolve_kind(config, &doc) else {
+            continue;
+        };
+        if !matches!(kind.template, crate::kinds::TemplateSpec::File(_)) {
+            continue;
+        }
+        let failure = roots.iter().find_map(|root| {
+            crate::kinds::load_templates(std::slice::from_ref(&kind), &settings_dir, root).err()
+        });
+        match failure {
+            None => readable += 1,
+            Some(message) => {
+                let enabled_somewhere = config
+                    .repository
+                    .iter()
+                    .any(|r| documents_of(r).contains(&doc));
+                blocking |= enabled_somewhere;
+                problems.push(crate::cli::one_line(&message));
+            }
+        }
+    }
+    let summary = format!(
+        "組み込み 4 種・カスタム {} 種{}。テンプレートが読めるもの {readable} 件",
+        custom.len(),
+        if custom.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", custom.join(", "))
+        }
+    );
+    let mut items = vec![if problems.is_empty() {
+        item("kinds", "ok", summary)
+    } else {
+        item(
+            "kinds",
+            if blocking { "fail" } else { "warn" },
+            format!("{summary}。{}", problems.join(" / ")),
+        )
+    }];
+
+    // 上限と現在の大きさ、CHANGELOG と push モードの併用。
+    let mut over: Vec<String> = Vec::new();
+    let mut push_changelog: Vec<&str> = Vec::new();
+    for repo in &config.repository {
+        let mode = repo.mode.unwrap_or(config.defaults.mode);
+        let docs = documents_of(repo);
+        if mode == Mode::Push && docs.contains(&Document::Changelog) {
+            push_changelog.push(&repo.root);
+        }
+        for kind in crate::kinds::resolve_kinds(config, &docs) {
+            if kind.max_chars.is_none() && kind.max_bytes.is_none() {
+                continue;
+            }
+            for rel in crate::kinds::default_paths(&kind) {
+                let path = Path::new(&repo.root).join(&rel);
+                let Ok(meta) = fs::metadata(&path) else {
+                    continue;
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+                let bytes = meta.len();
+                let chars = (kind.max_chars.is_some() && bytes <= 4 * 1024 * 1024)
+                    .then(|| fs::read(&path).ok())
+                    .flatten()
+                    .map(|b| String::from_utf8_lossy(&b).chars().count() as u64);
+                let too_many_chars = matches!((kind.max_chars, chars), (Some(m), Some(c)) if c > m);
+                let too_many_bytes = kind.max_bytes.is_some_and(|m| bytes > m);
+                if too_many_chars || too_many_bytes {
+                    over.push(format!("{}（{}・{}）", rel, kind.id(), repo.root));
+                }
+            }
+        }
+    }
+    if !over.is_empty() {
+        items.push(item(
+            "kindsLimits",
+            "info",
+            format!(
+                "既存の文書が設定した上限を超えています: {}。次の保守では、上限内に収まらない更新案は作られません（棄却されます）",
+                over.join(", ")
+            ),
+        ));
+    }
+    if !push_changelog.is_empty() {
+        items.push(item(
+            "kindsChangelog",
+            "info",
+            format!(
+                "push モードで CHANGELOG.md を保守するリポジトリがあります（{}）。リリース手順（vava など）が同じ CHANGELOG.md を更新する場合、保守の commit と競合することがあります。版の節が既にあれば Scriptura は何もしません",
+                push_changelog.join(", ")
+            ),
+        ));
+    }
+    items
 }
 
 /// 状態フォルダーへ書き込めるか。未作成なら作らず、最寄りの既存の親で試す。

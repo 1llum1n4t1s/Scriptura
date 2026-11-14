@@ -84,7 +84,7 @@ fn plugin_version_matches_cargo() {
 #[test]
 fn skills_have_frontmatter_and_invocation_policy() {
     const SIDE_EFFECT: [&str; 5] = ["setup", "apply", "run-now", "pause", "resume"];
-    const READ_ONLY: [&str; 3] = ["status", "doctor", "review"];
+    const READ_ONLY: [&str; 4] = ["status", "doctor", "review", "docs"];
     for name in SIDE_EFFECT.iter().chain(READ_ONLY.iter()) {
         let path = plugin_dir().join("skills").join(name).join("SKILL.md");
         let fm = frontmatter(&path);
@@ -180,7 +180,7 @@ fn claude_plugin_validate_passes_when_claude_exists() {
 fn skills_preapprove_only_their_own_subcommands() {
     // スキル名 → 事前承認してよいサブコマンドの集合。
     // apply は同意の前に review で対象を確認する手順を持つため、読み取り専用の review も含む。
-    let expected: [(&str, &[&str]); 8] = [
+    let expected: [(&str, &[&str]); 9] = [
         ("setup", &["enable"]),
         ("apply", &["apply", "review"]),
         ("run-now", &["run-now"]),
@@ -189,6 +189,7 @@ fn skills_preapprove_only_their_own_subcommands() {
         ("status", &["status"]),
         ("doctor", &["doctor"]),
         ("review", &["review"]),
+        ("docs", &["docs"]),
     ];
     for (name, subs) in expected {
         let fm = frontmatter(&plugin_dir().join("skills").join(name).join("SKILL.md"));

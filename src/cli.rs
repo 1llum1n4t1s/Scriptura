@@ -1,24 +1,24 @@
 // 利用者向けの CLI コマンド（enable / disable / pause / resume / status / doctor / run-now /
-// review / apply / discard）。プラグインのスキルは `scriptura <cmd> --json` でこれらを呼ぶ薄い層で、
+// review / apply / discard / docs）。プラグインのスキルは `scriptura <cmd> --json` でこれらを呼ぶ薄い層で、
 // 判断はすべてここ（と config / proposal / maintenance）に置く。
 //
 // 設計上の要点:
 // - すべてのコマンドで `--json`。JSON は常に 1 つのオブジェクトで、成功は `{"ok":true,...}`、
 //   利用者の誤り・拒否は `{"ok":false,"error":"..."}`（終了コード 1）。`--json` 無しは短い日本語。
-// - 設定の変更は `config::save`（アトミック）だけで行い、壊れた設定（Invalid）は書き換えずに失敗する。
+// - 操作の本体は `crate::ops`（管理画面と共通）。ここは引数の解析と出力の組み立てだけを持つ。
+// - 設定の変更は `ops` 経由で `config::update_in`（設定ロック・変更履歴・アトミック保存）だけを通り、
+//   壊れた設定（Invalid）は書き換えずに失敗する。CLI は期待する版を渡さない（None）。
 //   リポジトリ内のファイルから有効化・設定を読むことはしない（config.rs の契約）。
 // - 既定は安全側: mode は propose、push は `--mode push` を明示したときだけ。同意は
 //   `--accept-consent <現行の版>` が無ければ拒否し、送信データと費用の説明を出して再実行を案内する。
-// - enable は有効化前の push を処理しないよう、登録を保存する前に `maintenance::baseline` で起点を記録する。
+// - enable は有効化前の push を処理しないよう、登録を保存する前に `maintenance::baseline` で起点を記録する
+//   （`ops::enable`）。
 // - 出力に秘密値を入れない（パス・設定の要約・件数だけ）。
 use crate::{
     app,
-    config::{
-        self, CURRENT_CONSENT_VERSION, Config, Consent, ConsentSource, Document, Loaded, Mode,
-        Repository, SkipReason, normalize_remote, normalize_root,
-    },
+    config::{self, CURRENT_CONSENT_VERSION, Config, ConsentSource, Document, Loaded, Mode, Store},
     doctor,
-    maintenance::{self, PollOptions, PollPlan},
+    ops::{self, EnableRequest, RunNow},
     proposal,
 };
 use serde_json::{Value, json};
@@ -30,7 +30,7 @@ use std::{
 /// この CLI が扱うコマンド名。bin 側の分岐が使う。
 pub const COMMANDS: &[&str] = &[
     "enable", "disable", "pause", "resume", "status", "doctor", "run-now", "review", "apply",
-    "discard",
+    "discard", "docs",
 ];
 
 pub fn is_command(name: &str) -> bool {
@@ -74,7 +74,10 @@ fn spec(command: &str) -> (&'static [&'static str], &'static [&'static str], usi
             &[],
             0,
         ),
-        "disable" | "pause" | "resume" | "run-now" => (&["repo"], &[], 0),
+        "disable" | "pause" | "resume" => (&["repo"], &[], 0),
+        "run-now" => (&["repo", "documents"], &[], 0),
+        // docs <list|show> [<id>]
+        "docs" => (&["repo"], &[], 2),
         "doctor" => (&[], &["verify"], 0),
         "review" | "apply" | "discard" => (&["repo"], &[], 1),
         _ => (&[], &[], 0),
@@ -147,6 +150,7 @@ pub fn run(command: &str, args: &[String]) -> Reply {
             "review" => review(&p),
             "apply" => apply(&p),
             "discard" => discard(&p),
+            "docs" => docs(&p),
             other => Err(format!("不明なコマンドです: {other}")),
         }?;
         Ok((p.json, value))
@@ -191,17 +195,7 @@ fn pretty(value: &Value) -> String {
 // Git・設定の補助
 // ---------------------------------------------------------------------------
 
-fn git_text(root: &std::path::Path, args: &[&str]) -> Option<String> {
-    let out = maintenance::run_git(root, args)?;
-    let text = String::from_utf8(out).ok()?.trim().to_string();
-    (!text.is_empty()).then_some(text)
-}
-
-/// 指定パスを含む Git リポジトリのルート（正規化済み）。Git リポジトリでなければエラー。
-fn git_root(raw: &str) -> Result<PathBuf, String> {
-    maintenance::resolve_repo_root(raw)
-        .ok_or_else(|| format!("Git リポジトリではありません: {raw}"))
-}
+use ops::git_root;
 
 /// `--repo`（省略時は cwd）をリポジトリのルートへ解決する。
 fn repo_root(p: &Parsed) -> Result<PathBuf, String> {
@@ -214,29 +208,9 @@ fn repo_root(p: &Parsed) -> Result<PathBuf, String> {
     }
 }
 
-fn windows() -> bool {
-    cfg!(windows)
-}
-
-fn find_repo(config: &Config, root: &str) -> Option<usize> {
-    let wanted = normalize_root(root, windows());
-    config
-        .repository
-        .iter()
-        .position(|r| normalize_root(&r.root, windows()) == wanted)
-}
-
-/// 設定を読む。Invalid は書き換えずに失敗させるため、書き込み系はこの関数を使う。
-fn load_existing() -> Result<Option<Config>, String> {
-    match config::load() {
-        Loaded::Ok(c) => Ok(Some(c)),
-        Loaded::Missing => Ok(None),
-        Loaded::Invalid(reason) => Err(format!(
-            "設定ファイルが壊れているため変更しません（{}）: {}",
-            config::config_path().display(),
-            one_line(&reason)
-        )),
-    }
+/// CLI が使う設定の場所（実行環境の設定ファイルと状態フォルダー）。
+fn store() -> Store {
+    Store::current()
 }
 
 fn mode_str(mode: Mode) -> &'static str {
@@ -252,7 +226,7 @@ fn documents_json(docs: &[Document]) -> Value {
 }
 
 /// 登録 1 件の要約（有効な値。未指定は defaults で補う）。
-fn repo_json(config: &Config, repo: &Repository) -> Value {
+fn repo_json(config: &Config, repo: &config::Repository) -> Value {
     json!({
         "root": repo.root,
         "mode": mode_str(repo.mode.unwrap_or(config.defaults.mode)),
@@ -270,15 +244,21 @@ fn split_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// `--documents` の解釈。組み込み 4 種（AGENTS.md / DESIGN.md / README.md / CHANGELOG.md。大文字小文字は
+/// 区別しない）と、カスタム種類の id を受け付ける。カスタム id が設定に定義済みかは、設定を組み立てた後の
+/// `Config::validate`（未定義なら id を示して拒否）が検査する。
 fn parse_documents(raw: &str) -> Result<Vec<Document>, String> {
     let mut out = Vec::new();
     for name in split_list(raw) {
-        let doc = Document::ALL
-            .into_iter()
-            .find(|d| d.file_name().eq_ignore_ascii_case(&name))
-            .ok_or_else(|| {
-                format!("--documents に未対応の文書があります: {name}（AGENTS.md / DESIGN.md / README.md）")
-            })?;
+        let doc = match Document::builtin_from_text(&name) {
+            Some(d) => d,
+            None if config::is_valid_kind_id(&name) => Document::Custom(name.clone()),
+            None => {
+                return Err(format!(
+                    "--documents に未対応の文書があります: {name}（AGENTS.md / DESIGN.md / README.md / CHANGELOG.md、または設定に定義したカスタム種類の id）"
+                ));
+            }
+        };
         if !out.contains(&doc) {
             out.push(doc);
         }
@@ -333,104 +313,21 @@ fn enable(p: &Parsed) -> R {
         .map(|raw| parse_documents(raw))
         .transpose()?;
 
-    // 2. Git の状態（現在のブランチ・upstream の remote・push 先 URL）。
-    let branch = git_text(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
-    let remotes: Vec<String> = git_text(&root, &["remote"])
-        .map(|t| t.lines().map(|l| l.trim().to_string()).collect())
-        .unwrap_or_default();
-    let upstream_remote = branch
-        .as_ref()
-        .and_then(|b| git_text(&root, &["config", "--get", &format!("branch.{b}.remote")]))
-        .filter(|r| r != ".");
-    if mode == Mode::Push {
-        // push モードは文書を実際に push するので、送信先が定まらないものは受け付けない。
-        if remotes.is_empty() {
-            return Err(
-                "push モードにはリモート（remote）が必要です。remote が無いので登録しません".into(),
-            );
-        }
-        // --branches を明示しても、現在のブランチの upstream は必須（push 先が定まらない登録を作らない）。
-        if branch.is_none() {
-            return Err("detached HEAD のため push モードでは登録できません".into());
-        }
-        if upstream_remote.is_none() {
-            return Err("現在のブランチに upstream（追跡先）がありません。push モードには upstream が必要です".into());
-        }
-    }
-    let branches = match (&branches_arg, mode) {
-        (Some(list), _) => list.clone(),
-        // push は「いま居るブランチ」だけを既定にする（意図しないブランチでの push を避ける）。
-        (None, Mode::Push) => vec![branch.clone().unwrap_or_default()],
-        // propose / off はパッチを作るだけなのでブランチ制限なし。
-        (None, _) => Vec::new(),
+    // 2. 本体（Git の状態の確認 → 設定の事前確認 → 起点の記録 → 設定ロック内で保存）は ops に任せる。
+    //    CLI での同意は出所 cli で記録する。既存の明示の同意（cli・ui）は上書きしない。
+    let request = EnableRequest {
+        repo: root.to_string_lossy().into_owned(),
+        mode,
+        branches: branches_arg,
+        documents: documents_arg,
+        consent_version: CURRENT_CONSENT_VERSION,
+        consent_source: ConsentSource::Cli,
     };
-    // 期待する push 先。upstream の remote、無ければ origin、無ければ最初の remote。
-    let remote_name = upstream_remote
-        .clone()
-        .or_else(|| remotes.iter().find(|r| *r == "origin").cloned())
-        .or_else(|| remotes.first().cloned());
-    let remote = remote_name
-        .and_then(|name| git_text(&root, &["remote", "get-url", "--push", "--all", &name]))
-        .and_then(|urls| urls.lines().find_map(normalize_remote));
+    let enabled = ops::enable(&store(), &request, None).map_err(|e| e.to_string())?;
 
-    // 3. 設定を組み立てる（既存の登録・設定は保つ）。
-    let existing = load_existing()?;
-    let created = existing.is_none();
-    let mut config = existing.unwrap_or_default();
-    let keep_consent = matches!(
-        &config.consent,
-        Some(c) if c.version >= CURRENT_CONSENT_VERSION && c.source == ConsentSource::Cli
-    );
-    if !keep_consent {
-        config.consent = Some(Consent {
-            version: CURRENT_CONSENT_VERSION,
-            accepted_at: chrono::Utc::now().to_rfc3339(),
-            source: ConsentSource::Cli,
-        });
-    }
-    let root_text = root.to_string_lossy().into_owned();
-    let index = match find_repo(&config, &root_text) {
-        Some(i) => i,
-        None => {
-            config.repository.push(Repository {
-                root: root_text.clone(),
-                remote: None,
-                mode: None,
-                branches: Vec::new(),
-                documents: None,
-                exclude: Vec::new(),
-                paused: false,
-            });
-            config.repository.len() - 1
-        }
-    };
-    {
-        let repo = &mut config.repository[index];
-        repo.root = root_text;
-        repo.mode = Some(mode);
-        repo.branches = branches;
-        repo.remote = remote;
-        if let Some(docs) = documents_arg {
-            repo.documents = Some(docs);
-        }
-        // 有効化し直したら再開扱い。
-        repo.paused = false;
-    }
-    config.validate()?;
-
-    // 4. 起点を記録してから保存する。保存後に失敗して「登録済みなのに起点が無い」状態を作らないよう、
-    //    起点 → 設定の順にする（起点だけ残っても、登録が無ければ何も処理されない）。
-    //    起点の記録は状態 DB を新版として開く（user_version=1）ので、保存に失敗して設定が無いまま
-    //    起点だけ残っても、hook の旧利用者判定（user_version=0 の旧 DB だけが対象）には当たらず、
-    //    「全リポジトリ・push・権限バイパス」の移行設定が意図せず作られることはない。
-    //    残件: `config::save` は poll ロックの外にあるため、真の旧利用者の移行と `enable` が
-    //    同時に走ると後勝ちで上書きし合う余地がある（新規利用者は移行されないので実害は旧利用者に限る）。
-    maintenance::baseline(&root).map_err(|e| format!("起点の記録に失敗しました: {e}"))?;
-    config::save(&config).map_err(|e| format!("設定を保存できませんでした: {e}"))?;
-
-    let mut out = repo_json(&config, &config.repository[index]);
+    let mut out = repo_json(&enabled.config, enabled.repository());
     out["ok"] = json!(true);
-    out["created"] = json!(created);
+    out["created"] = json!(enabled.created);
     out["baseline"] = json!(true);
     out["configPath"] = json!(config::config_path());
     out["consentVersion"] = json!(CURRENT_CONSENT_VERSION);
@@ -442,55 +339,36 @@ fn disable(p: &Parsed) -> R {
     if !p.values.contains_key("repo") {
         return Err("--repo <リポジトリのパス> が必要です".into());
     }
-    let (mut config, index, root) = registered(p)?;
-    config.repository.remove(index);
-    config::save(&config).map_err(|e| format!("設定を保存できませんでした: {e}"))?;
+    let root = target_root(p)?;
+    let done = ops::disable(&store(), &root, None).map_err(|e| e.to_string())?;
     Ok(json!({
         "ok": true, "repo": root, "removed": true,
-        "remaining": config.repository.len(),
+        "remaining": done.remaining,
         "configPath": config::config_path(),
     }))
 }
 
 fn set_paused(p: &Parsed, paused: bool) -> R {
-    let (mut config, index, root) = registered(p)?;
-    let changed = config.repository[index].paused != paused;
-    config.repository[index].paused = paused;
-    if changed {
-        config::save(&config).map_err(|e| format!("設定を保存できませんでした: {e}"))?;
-    }
+    let root = target_root(p)?;
+    let done = ops::set_paused(&store(), &root, paused, None).map_err(|e| e.to_string())?;
     Ok(json!({
-        "ok": true, "repo": root, "paused": paused, "changed": changed,
+        "ok": true, "repo": root, "paused": paused, "changed": done.changed,
         "configPath": config::config_path(),
     }))
 }
 
-/// 登録済みリポジトリを探す（設定を読み、見つかった位置と root を返す）。未登録は拒否。
+/// 登録の照合に使う root（`--repo`、省略時は cwd）。
 /// 作業ツリーが消えていても解除できるよう、Git ルートを解決できなければ指定パスのまま照合する。
-fn registered(p: &Parsed) -> Result<(Config, usize, String), String> {
-    let root = match repo_root(p) {
-        Ok(r) => r.to_string_lossy().into_owned(),
+fn target_root(p: &Parsed) -> Result<String, String> {
+    match repo_root(p) {
+        Ok(r) => Ok(r.to_string_lossy().into_owned()),
         Err(e) => match p.values.get("repo") {
             Some(raw) => std::path::absolute(raw)
                 .map(|a| a.to_string_lossy().into_owned())
-                .map_err(|_| e)?,
-            None => return Err(e),
+                .map_err(|_| e),
+            None => Err(e),
         },
-    };
-    let config = match config::load() {
-        Loaded::Ok(c) => c,
-        Loaded::Missing => return Err("設定ファイルがありません（未登録です）".into()),
-        Loaded::Invalid(reason) => {
-            return Err(format!(
-                "設定ファイルが壊れているため変更しません（{}）: {}",
-                config::config_path().display(),
-                one_line(&reason)
-            ));
-        }
-    };
-    let index = find_repo(&config, &root)
-        .ok_or_else(|| format!("登録されていないリポジトリです: {root}"))?;
-    Ok((config, index, root))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -566,89 +444,177 @@ fn status() -> Value {
 // run-now
 // ---------------------------------------------------------------------------
 
-fn skip_message(reason: SkipReason) -> &'static str {
-    match reason {
-        SkipReason::NoConsent => {
-            "同意が記録されていないか版が古いため実行しません（scriptura enable で同意してください）"
-        }
-        SkipReason::NotEnrolled => {
-            "このリポジトリは登録されていません（scriptura enable --repo <パス> で登録してください）"
-        }
-        SkipReason::Off => "モードが off のため実行しません",
-        SkipReason::Paused => "一時停止中のため実行しません（scriptura resume で再開してください）",
-        SkipReason::RemoteMismatch => {
-            "登録された remote と現在の push 先が一致しないため実行しません"
-        }
-        SkipReason::BranchNotAllowed => "現在のブランチは許可ブランチではないため実行しません",
+fn run_now(p: &Parsed) -> R {
+    let root = repo_root(p)?;
+    let repo = root.to_string_lossy().into_owned();
+    // `--documents a,b` で処理する種類を絞る（未定義・このリポジトリで無効な種類の拒否は ops）。
+    let documents = p
+        .values
+        .get("documents")
+        .map(|raw| parse_documents(raw))
+        .transpose()?;
+    // 本体（設定の読み込み・判定・poll ロック・保守）は ops。ここは結果を従来の JSON にするだけ。
+    match ops::run_now_for(&store(), &root, documents.as_deref())? {
+        // 保守後の検査に違反して更新案を作らなかった。失敗ではないので ok:true で、理由を別に返す。
+        RunNow::Rejected { reason } => Ok(json!({
+            "ok": true, "repo": repo, "mode": "propose", "outcome": "rejected",
+            "reason": reason,
+            "message": "更新案は作成しませんでした（保守後の検査に違反したため）。この push は処理済みとして位置を進めました。設定の上限などを見直してから、もう一度 run-now を実行できます",
+        })),
+        RunNow::Created(x) => Ok(json!({
+            "ok": true, "repo": repo, "mode": "propose", "outcome": "created",
+            "sha": x.sha, "patchPath": x.patch_path,
+            "diffstat": x.diffstat, "documents": x.documents,
+        })),
+        RunNow::Unchanged => Ok(json!({
+            "ok": true, "repo": repo, "mode": "propose", "outcome": "unchanged",
+            "message": "更新案は作成されませんでした（文書に変更が無い・同じコミットの更新案が既にある・未 push のコミットがある、のいずれかです）",
+        })),
+        RunNow::Completed => Ok(json!({
+            "ok": true, "repo": repo, "mode": "push", "outcome": "completed",
+            "message": "保守を実行しました（文書に変更があれば commit と push 済みです）",
+        })),
     }
 }
 
-fn run_now(p: &Parsed) -> R {
-    let root = repo_root(p)?;
-    let config = match config::load() {
-        Loaded::Ok(c) => c,
-        Loaded::Missing => {
-            return Err("設定ファイルがありません。scriptura enable で有効化してください".into());
+// ---------------------------------------------------------------------------
+// docs list / docs show（読み取り専用。設定・状態・リポジトリは書き換えない）
+// ---------------------------------------------------------------------------
+
+fn when_str(when: config::When) -> &'static str {
+    match when {
+        config::When::Push => "push",
+        config::When::Release => "release",
+        config::When::Manual => "manual",
+    }
+}
+
+fn unix_to_rfc3339(secs: f64) -> Value {
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|t| json!(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)))
+        .unwrap_or(Value::Null)
+}
+
+/// 種類 1 件の JSON。`detail` が true（docs show）のときだけ、指針・追加指示の本文・必須見出し・
+/// CHANGELOG 設定・ファイルのサイズを足す。ファイルの内容そのものは出さない（パス・サイズ・設定値だけ）。
+fn kind_json(v: &ops::KindView, detail: bool) -> Value {
+    let k = &v.kind;
+    let template = match &v.template {
+        ops::TemplateState::None => json!({"spec": v.template_spec, "state": "none"}),
+        ops::TemplateState::Builtin => json!({"spec": v.template_spec, "state": "builtin"}),
+        ops::TemplateState::Ok { bytes } => {
+            json!({"spec": v.template_spec, "state": "ok", "bytes": bytes})
         }
-        Loaded::Invalid(reason) => {
-            return Err(format!(
-                "設定ファイルを読めないため実行しません（{}）: {}",
-                config::config_path().display(),
-                one_line(&reason)
-            ));
+        ops::TemplateState::Error(e) => {
+            json!({"spec": v.template_spec, "state": "error", "error": e})
         }
     };
-    let (branch, urls) = maintenance::push_target(&root)
-        .ok_or("現在のブランチに upstream が無い（または detached HEAD）ため実行できません")?;
-    let decision = config::resolve(&config, &root, &urls, &branch);
-    if let Some(reason) = decision.skip_reason {
-        return Err(skip_message(reason).into());
-    }
-    let options = maintenance::MaintenanceOptions::from(&decision);
-    let repo = root.to_string_lossy().into_owned();
-    match decision.mode {
-        Mode::Propose => {
-            let before: HashSet<String> =
-                proposal::list(&root).into_iter().map(|x| x.sha).collect();
-            // フックと同じ poll ロックを取り、同時実行を避ける。
-            let lock = maintenance::acquire_poll_lock()?
-                .ok_or("別の文書保守が実行中です。しばらくしてから再実行してください")?;
-            let message = maintenance::poll_repository_with(
-                &root,
-                PollOptions {
-                    force: true,
-                    ..PollOptions::default()
-                },
-                None,
-                &PollPlan::Propose(options),
-            )?;
-            drop(lock);
-            let created = proposal::list(&root)
-                .into_iter()
-                .find(|x| !before.contains(&x.sha));
-            match (created, message) {
-                (Some(x), _) => Ok(json!({
-                    "ok": true, "repo": repo, "mode": "propose", "outcome": "created",
-                    "sha": x.sha, "patchPath": x.patch_path,
-                    "diffstat": x.diffstat, "documents": x.documents,
-                })),
-                (None, Some(message)) => Err(message),
-                (None, None) => Ok(json!({
-                    "ok": true, "repo": repo, "mode": "propose", "outcome": "unchanged",
-                    "message": "更新案は作成されませんでした（文書に変更が無い・同じコミットの更新案が既にある・未 push のコミットがある、のいずれかです）",
-                })),
-            }
-        }
-        Mode::Push => match maintenance::run_now(&root, options)? {
-            // Some は失敗や実行中の通知（成功時は None）。
-            Some(message) => Err(message),
-            None => Ok(json!({
-                "ok": true, "repo": repo, "mode": "push", "outcome": "completed",
-                "message": "保守を実行しました（文書に変更があれば commit と push 済みです）",
-            })),
+    let mut out = json!({
+        "id": k.id(),
+        "name": k.document.name(),
+        "builtin": k.document.is_builtin(),
+        "enabled": v.enabled,
+        "paths": v.files.iter().map(|f| json!({"path": f.path, "exists": f.exists})).collect::<Vec<_>>(),
+        "createIfMissing": k.create_if_missing,
+        "template": template,
+        "maxChars": k.max_chars,
+        "maxBytes": k.max_bytes,
+        "timing": {
+            "when": when_str(k.timing.when),
+            "paths": k.timing.paths,
+            "minIntervalHours": k.timing.min_interval_hours,
         },
-        Mode::Off => Err(skip_message(SkipReason::Off).into()),
+        "lastDoneAt": v.last_done.as_ref().map_or(Value::Null, |r| unix_to_rfc3339(r.last_done_at)),
+        "hasInstructions": !k.instructions.is_empty() || !k.common_instructions.is_empty(),
+    });
+    if !detail {
+        return out;
     }
+    out["guidance"] = json!(k.guidance);
+    out["language"] = json!(k.language);
+    out["requiredHeadings"] = json!(k.required_headings);
+    // 追加指示は利用者本人の設定（各 2000 字以内）。本文をそのまま返す。
+    out["instructions"] = json!(k.instructions);
+    out["commonInstructions"] = json!(k.common_instructions);
+    out["lastCommit"] = json!(v.last_done.as_ref().map(|r| short(&r.last_commit)));
+    for (entry, file) in out["paths"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .zip(&v.files)
+    {
+        entry["chars"] = json!(file.chars);
+        entry["bytes"] = json!(file.bytes);
+    }
+    out["changelog"] = match &k.changelog {
+        Some(c) => json!({
+            "format": match c.format {
+                config::ChangelogFormat::Existing => "existing",
+                config::ChangelogFormat::KeepAChangelog => "keep-a-changelog",
+            },
+            "releaseTag": c.release_tag,
+            "onRelease": match c.on_release {
+                config::OnRelease::Promote => "promote",
+                config::OnRelease::Ignore => "ignore",
+            },
+            "backfill": match c.backfill {
+                config::Backfill::Tags => "tags",
+                config::Backfill::Off => "none",
+            },
+            "backfillMaxReleases": c.backfill_max_releases,
+            "backfillMaxCommits": c.backfill_max_commits,
+        }),
+        None => Value::Null,
+    };
+    out
+}
+
+fn docs(p: &Parsed) -> R {
+    let action = p.positional.first().map(String::as_str);
+    let root = repo_root(p)?;
+    let repo = root.to_string_lossy().into_owned();
+    let view = match action {
+        Some("list") if p.positional.len() == 1 => None,
+        Some("list") => return Err(format!("docs list に余分な引数です: {}", p.positional[1])),
+        Some("show") => Some(p.positional.get(1).ok_or(
+            "docs show には文書の種類の id が必要です（scriptura docs list で確認できます）",
+        )?),
+        _ => return Err("使い方: scriptura docs list | scriptura docs show <id>".into()),
+    };
+    let overview = ops::docs_overview(&store(), &root)?;
+    let mut out = json!({
+        "ok": true, "repo": repo,
+        "registered": overview.registered,
+        "mode": overview.mode.map(mode_str),
+        "configPresent": overview.config_present,
+    });
+    match view {
+        None => {
+            out["kinds"] = json!(
+                overview
+                    .kinds
+                    .iter()
+                    .map(|v| kind_json(v, false))
+                    .collect::<Vec<_>>()
+            );
+        }
+        Some(id) => {
+            // 組み込みは文書名・id とも大文字小文字を区別しない。カスタムは id の完全一致。
+            let found = overview.kinds.iter().find(|v| {
+                v.kind.id() == id.as_str()
+                    || Document::builtin_from_text(id).is_some_and(|d| d == v.kind.document)
+            });
+            let found = found.ok_or_else(|| {
+                let ids: Vec<&str> = overview.kinds.iter().map(|v| v.kind.id()).collect();
+                format!(
+                    "文書の種類が見つかりません: {id}（定義済み: {}）",
+                    ids.join(", ")
+                )
+            })?;
+            out["kind"] = kind_json(found, true);
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -723,6 +689,151 @@ fn list(v: &Value) -> String {
 
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
+}
+
+/// 上限の表示（文字数・バイト数のどちらか、または両方。無ければ「なし」）。
+fn limits_text(k: &Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(n) = k["maxChars"].as_u64() {
+        parts.push(format!("{n} 文字"));
+    }
+    if let Some(n) = k["maxBytes"].as_u64() {
+        parts.push(format!("{n} バイト"));
+    }
+    if parts.is_empty() {
+        "なし".into()
+    } else {
+        parts.join(" / ")
+    }
+}
+
+fn timing_text(k: &Value) -> String {
+    let t = &k["timing"];
+    let mut s = text(t, "when").to_string();
+    if !t["paths"].as_array().is_some_and(|a| a.is_empty()) {
+        s.push_str(&format!("・パス: {}", list(&t["paths"])));
+    }
+    if let Some(h) = t["minIntervalHours"].as_u64().filter(|h| *h > 0) {
+        s.push_str(&format!("・最小間隔 {h} 時間"));
+    }
+    s
+}
+
+fn template_text(k: &Value) -> String {
+    let t = &k["template"];
+    match text(t, "state") {
+        "builtin" => "組み込み".into(),
+        "ok" => format!("{}（読み込み可・{} バイト）", text(t, "spec"), t["bytes"]),
+        "error" => format!("{}（使えません: {}）", text(t, "spec"), text(t, "error")),
+        _ => "なし".into(),
+    }
+}
+
+fn paths_text(k: &Value) -> String {
+    k["paths"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            format!(
+                "{}{}",
+                text(p, "path"),
+                if p["exists"] == json!(true) {
+                    ""
+                } else {
+                    "（なし）"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_docs(v: &Value) -> String {
+    let mut lines = vec![format!(
+        "{}（{}）",
+        text(v, "repo"),
+        if v["registered"] == json!(true) {
+            format!("登録済み・{}", text(v, "mode"))
+        } else {
+            "未登録".into()
+        }
+    )];
+    if let Some(k) = v.get("kind") {
+        lines.push(format!(
+            "{}（id: {}・{}・{}）",
+            text(k, "name"),
+            text(k, "id"),
+            if k["builtin"] == json!(true) {
+                "組み込み"
+            } else {
+                "カスタム"
+            },
+            if k["enabled"] == json!(true) {
+                "有効"
+            } else {
+                "無効"
+            }
+        ));
+        lines.push(format!("対象: {}", paths_text(k)));
+        if !text(k, "guidance").is_empty() {
+            lines.push(format!("指針: {}", text(k, "guidance")));
+        }
+        lines.push(format!("テンプレート: {}", template_text(k)));
+        lines.push(format!("上限: {}", limits_text(k)));
+        lines.push(format!("タイミング: {}", timing_text(k)));
+        if let Some(lang) = k["language"].as_str() {
+            lines.push(format!("言語: {lang}"));
+        }
+        if !k["requiredHeadings"]
+            .as_array()
+            .is_some_and(|a| a.is_empty())
+        {
+            lines.push(format!("必須見出し: {}", list(&k["requiredHeadings"])));
+        }
+        for (label, key) in [
+            ("共通の追加指示", "commonInstructions"),
+            ("追加指示", "instructions"),
+        ] {
+            if !text(k, key).is_empty() {
+                lines.push(format!("{label}: {}", text(k, key)));
+            }
+        }
+        if k["changelog"].is_object() {
+            let c = &k["changelog"];
+            lines.push(format!(
+                "CHANGELOG: 形式 {} / リリースタグ {} / リリース時 {} / 遡り {}（最大 {} 版・{} コミット）",
+                text(c, "format"),
+                text(c, "releaseTag"),
+                text(c, "onRelease"),
+                text(c, "backfill"),
+                c["backfillMaxReleases"],
+                c["backfillMaxCommits"]
+            ));
+        }
+        lines.push(format!(
+            "最終完了: {}",
+            k["lastDoneAt"].as_str().unwrap_or("まだありません")
+        ));
+        return lines.join("\n");
+    }
+    for k in v["kinds"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "- {} [{}] 対象: {} / テンプレート: {} / 上限: {} / タイミング: {} / 最終完了: {}",
+            text(k, "id"),
+            if k["enabled"] == json!(true) {
+                "有効"
+            } else {
+                "無効"
+            },
+            paths_text(k),
+            template_text(k),
+            limits_text(k),
+            timing_text(k),
+            k["lastDoneAt"].as_str().unwrap_or("なし"),
+        ));
+    }
+    lines.join("\n")
 }
 
 fn render(command: &str, v: &Value) -> String {
@@ -825,8 +936,14 @@ fn render(command: &str, v: &Value) -> String {
                 short(text(v, "sha")),
                 text(v, "patchPath")
             ),
+            "rejected" => format!(
+                "更新案を作成しませんでした: {}\n{}",
+                text(v, "reason"),
+                text(v, "message")
+            ),
             _ => text(v, "message").to_string(),
         },
+        "docs" => render_docs(v),
         "review" => {
             if v.get("sha").is_none() {
                 return text(v, "message").to_string();

@@ -1,2 +1,4 @@
 # sh ランチャーは CRLF で取得されると動かないため、常に LF で扱う。
 plugins/scriptura/bin/scriptura text eol=lf
+# golden ファイルはバイト単位で比較するため、改行変換をしない。
+tests/golden/* -text

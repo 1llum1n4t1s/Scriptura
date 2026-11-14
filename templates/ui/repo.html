@@ -1,0 +1,83 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<a class="back" href="/repos">← リポジトリ一覧</a>
+<div class="heading"><h1><code>{{ repo.root }}</code></h1></div>
+<div class="grid">
+<section class="panel">
+  <h2>状態</h2>
+  <dl class="facts">
+    <dt>モード</dt><dd><span class="badge{% if repo.push %} warning{% endif %}">{{ repo.mode }}</span>{% if repo.paused %} <span class="badge">一時停止中</span>{% endif %}</dd>
+    <dt>対象の文書</dt><dd>{{ repo.documents }}</dd>
+    <dt>許可ブランチ</dt><dd>{{ repo.branches }}</dd>
+    <dt>push 先</dt><dd>{% if repo.remote.is_empty() %}照合しない{% else %}<code>{{ repo.remote }}</code>{% endif %}</dd>
+    <dt>更新案</dt><dd>未適用 {{ repo.pending }}・適用済み {{ repo.applied }}（<a href="/proposals">更新案</a>）</dd>
+  </dl>
+  <div class="actions wrap">
+    {% if repo.paused %}
+    <form method="post" action="/repos/resume"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ repo.root }}"><button type="submit">再開する</button></form>
+    {% else %}
+    <form method="post" action="/repos/pause"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ repo.root }}"><button type="submit">一時停止する</button></form>
+    {% endif %}
+    <form method="post" action="/repos/run-now"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ repo.root }}"><button class="primary" type="submit">いま 1 回保守する（run-now）</button></form>
+    <form method="post" action="/repos/disable"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ repo.root }}"><button class="destructive" type="submit">登録を解除する</button></form>
+  </div>
+</section>
+<section class="panel">
+  <h2>モード</h2>
+  <form method="post" action="/repos/mode" class="stack">
+    <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ repo.root }}">
+    <label>モード<select name="mode">{% for m in mode_choices %}<option value="{{ m.value }}"{% if m.selected %} selected{% endif %}>{{ m.label }}</option>{% endfor %}</select></label>
+    <div class="actions"><button type="submit">モードを保存</button></div>
+  </form>
+  <p class="note">push モードは remote・upstream の確認が必要なため、下の「push モードで有効化し直す」から登録し直します。</p>
+  <form method="post" action="/repos/enable" class="stack">
+    <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="repo" value="{{ repo.root }}"><input type="hidden" name="mode" value="push">
+    <label>許可ブランチ（カンマ区切り。空なら現在のブランチだけ）<input name="branches"></label>
+    {% if needs_consent %}<p>{{ consent_text }}</p><input type="hidden" name="consent_version" value="{{ consent_version }}"><label class="checkbox"><input type="checkbox" name="consent" value="1">同意します（版 {{ consent_version }}）</label>{% endif %}
+    <div class="actions"><button class="destructive" type="submit">push モードで有効化し直す</button></div>
+  </form>
+</section>
+</div>
+<section class="panel">
+  <h2>対象の文書</h2>
+  <form method="post" action="/repos/documents" class="stack">
+    <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ repo.root }}">
+    <label class="checkbox"><input type="checkbox" name="use_default" value="1"{% if uses_default_documents %} checked{% endif %}>既定（全般設定の対象の文書）に従う</label>
+    <fieldset class="choices"><legend>このリポジトリで保守する種類（既定に従わない場合）</legend>
+      {% for d in documents %}<label class="checkbox"><input type="checkbox" name="documents" value="{{ d.value }}"{% if d.selected %} checked{% endif %}>{{ d.label }}</label>
+      {% endfor %}
+    </fieldset>
+    <div class="actions"><button type="submit">対象の文書を保存</button></div>
+  </form>
+</section>
+<section class="panel">
+  <h2>文書の種類の状態</h2>
+  {% if !kinds_error.is_empty() %}<p class="error-text">{{ kinds_error }}</p>{% endif %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>種類</th><th>有効</th><th>対象ファイル</th><th>テンプレート</th><th>最終完了</th></tr></thead>
+    <tbody>
+    {% for k in kinds %}<tr><td><a href="/kinds/{{ k.id }}">{{ k.name }}</a></td><td>{% if k.enabled %}有効{% else %}-{% endif %}</td><td>{% for f in k.files %}<div class="path">{{ f }}</div>{% endfor %}</td><td>{{ k.template }}</td><td>{{ k.last_done }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+<section class="panel">
+  <h2>処理済み位置</h2>
+  {% if cursors.is_empty() %}<p class="note">記録はまだありません。</p>{% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>追跡先</th><th>更新</th><th>処理済みの push</th><th>エラー</th></tr></thead>
+    <tbody>{% for c in cursors %}<tr><td><code>{{ c.upstream }}</code></td><td>{{ c.updated_at }}</td><td><code>{{ c.pushed_commit }}</code></td><td>{% if !c.error.is_empty() %}<span class="error-text">{{ c.error }}</span>{% endif %}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+</section>
+<section class="panel">
+  <h2>push モードの進行（publication）</h2>
+  {% if let Some(p) = publication %}
+  <p>現在: <strong>{{ p.phase }}</strong>（{{ p.at }}）{% if !p.error.is_empty() %} <span class="error-text">{{ p.error }}</span>{% endif %}{% if !p.warning.is_empty() %} <span class="badge warning">{{ p.warning }}</span>{% endif %}</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>時刻</th><th>段階</th><th>エラー・警告</th></tr></thead>
+    <tbody>{% for e in events %}<tr><td>{{ e.at }}</td><td>{{ e.phase }}</td><td>{% if !e.error.is_empty() %}<span class="error-text">{{ e.error }}</span>{% endif %}{% if !e.warning.is_empty() %}<span class="badge warning">{{ e.warning }}</span>{% endif %}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  {% else %}<p class="note">記録はありません（propose モードでは作られません）。</p>{% endif %}
+</section>
+{% endblock %}

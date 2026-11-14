@@ -1,0 +1,29 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<div class="heading"><h1>概要</h1></div>
+{% for w in warnings %}<p class="notice warning">{{ w }}</p>
+{% endfor %}
+<div class="grid">
+<section class="panel">
+  <h2>導入と設定</h2>
+  <dl class="facts">
+    <dt>版</dt><dd>{{ version }}{% if installed %}（導入済み）{% else %}（未導入: <code>scriptura install</code> で導入できます）{% endif %}</dd>
+    <dt>設定ファイル</dt><dd><code>{{ config_path }}</code></dd>
+    <dt>設定の状態</dt><dd>{{ config_state }}</dd>
+    <dt>同意</dt><dd>{% if let Some(c) = consent %}{{ c }}{% if !consent_current %}（古い版です）{% endif %}{% else %}未記録（<a href="/consent">同意</a>）{% endif %}</dd>
+    <dt>未適用の更新案</dt><dd>{{ pending }} 件（<a href="/proposals">更新案</a>）</dd>
+  </dl>
+  <p class="note">環境（Claude Code CLI・認証・hook の登録）の確認は <a href="/doctor">診断</a> で行えます。</p>
+</section>
+<section class="panel">
+  <h2>登録リポジトリ <span class="count">{{ repos.len() }}</span></h2>
+  {% if repos.is_empty() %}<p class="note">まだ登録がありません。<a href="/repos">リポジトリ</a> から有効化してください。</p>
+  {% else %}
+  <ul class="plain">
+  {% for r in repos %}<li><a href="/repos/{{ r.index }}"><code>{{ r.root }}</code></a> <span class="badge{% if r.push %} warning{% endif %}">{{ r.mode }}</span>{% if r.paused %} <span class="badge">一時停止中</span>{% endif %}{% if r.pending > 0 %} <span class="badge published">更新案 {{ r.pending }}</span>{% endif %}</li>
+  {% endfor %}
+  </ul>
+  {% endif %}
+</section>
+</div>
+{% endblock %}

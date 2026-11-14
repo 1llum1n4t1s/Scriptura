@@ -17,6 +17,10 @@
 //!   （push モードの「保守が完了した」と同じ意味。fingerprint を現在値にして error を消す）。
 //! - 失敗（clone・worker・対象外ファイルの変更など）: 位置を進めず error を記録する。
 //!   push モードの `save_error` と同じで、fingerprint は前回値のままなので次回の hook で再試行する。
+//! - 保守後検査（AGENTS のサイズ・種類ごとの上限・必須見出し・CHANGELOG のリリース済みエントリ不変）に
+//!   違反: 更新案は作らず `Rejected` として
+//!   メタに `status=rejected` と理由だけを残す。処理済み位置は進める（同じ push では worker を再実行しない）。
+//!   run-now（`propose_with` の `force`）のときだけ、棄却済みを無視して作り直す。
 //! push モードの publication 状態（commit / push の進行記録）には触れない。propose は commit も push も
 //! しないため、その状態機械と競合しない。
 //!
@@ -25,10 +29,11 @@
 //! 書込み順は json → patch で、patch の存在が「作成完了」の印になる（途中で止まっても二重作成しない）。
 //! 破棄したものは patch だけ消し、json に `status=discarded` を残して再作成を防ぐ。
 //! `<state>` は `SCRIPTURA_DB` の親フォルダー（publications と同じ基点）なので、テストの隔離がそのまま効く。
-use crate::config::{Document, Permission};
+use crate::config::Permission;
+use crate::kinds::LoadedTemplate;
 use crate::maintenance::{
-    MaintenanceOptions, build_maintenance_reason_for, maintenance_scope, normcase,
-    out_of_scope_changes, publication_paths, run_maintenance_worker_with, safe_relative,
+    MaintenanceOptions, agents_size_error, build_maintenance_reason_with, maintenance_scope_for,
+    normcase, out_of_scope_changes, publication_paths, run_maintenance_worker_with, safe_relative,
     state_db_path, worktree_snapshot,
 };
 use crate::process::{Output, capture, command};
@@ -90,8 +95,15 @@ pub enum ProposeOutcome {
     },
     /// worker が文書を変えなかった。何も保存しない。
     Unchanged,
-    /// 同じコミットの更新案が既にある（作成済み・適用済み・破棄済み）。
+    /// 同じコミットの更新案が既にある（作成済み・適用済み・破棄済み・棄却済み）。
     AlreadyDone,
+    /// worker の結果が保守後検査（AGENTS のサイズ・種類ごとの上限・必須見出し）に違反したため、
+    /// 更新案（パッチ）を作らなかった。メタ情報に `status=rejected` と理由だけを残す。
+    /// 呼び出し側は処理済み位置を進めて理由を知らせる（同じ push では worker を再実行しない）。
+    Rejected { reason: String },
+    /// 処理する文書が無かった（有効な種類が 1 つも無い）ため、worker を起動しなかった。何も保存しない。
+    /// 呼び出し側は処理済み位置だけ進め、種類別の最終完了（kind_runs）は記録しない。
+    NothingToDo,
 }
 
 // ---------------------------------------------------------------------------
@@ -442,19 +454,47 @@ fn permission_name(p: Permission) -> &'static str {
 ///
 /// 利用者の作業ツリー・`.git`・remote は変えない。同じコミットの更新案が既にあれば何もしない。
 /// 失敗は `Err`（クローンは消えており、何も保存されていない）。
+///
+/// 棄却済み（`status=rejected`）の同じコミットは `AlreadyDone`。作り直すのは `propose_with` の `force`
+/// （run-now）だけ。
 pub fn propose(
     root: &Path,
     pushed: &str,
     previous: &str,
     options: &MaintenanceOptions,
 ) -> Result<ProposeOutcome> {
+    propose_with(root, pushed, previous, options, false, None)
+}
+
+/// `propose` の本体。
+/// - `force`: run-now のとき true。棄却済み（rejected）の更新案を無視して作り直す。作成済み・適用済み・
+///   破棄済みの更新案は `force` でも `AlreadyDone`（作り直したいときは discard してから run-now）。
+/// - `templates`: 検査済みのテンプレート。None ならここで設定フォルダーから読み込む（失敗は Err）。
+///   hook 経路は呼び出し側が先に読み込んで見送り判定をするので Some を渡す。
+pub fn propose_with(
+    root: &Path,
+    pushed: &str,
+    previous: &str,
+    options: &MaintenanceOptions,
+    force: bool,
+    templates: Option<&[LoadedTemplate]>,
+) -> Result<ProposeOutcome> {
     if !is_commit_id(pushed) {
         return Err(format!("コミット ID が不正です: {pushed}"));
     }
     let dir = proposals_dir(root);
-    if patch_file(&dir, pushed).exists() || finished_meta(&dir, pushed) {
+    if patch_file(&dir, pushed).exists() || finished_meta(&dir, pushed, force) {
         return Ok(ProposeOutcome::AlreadyDone);
     }
+    let kinds = options.resolved_kinds();
+    let loaded;
+    let templates = match templates {
+        Some(t) => t,
+        None => {
+            loaded = crate::kinds::load_templates(&kinds, &crate::kinds::settings_dir(), root)?;
+            &loaded
+        }
+    };
     // 前回の異常終了で残ったクローンを、期限（worker の timeout + 余裕）を過ぎたものだけ片付ける。
     sweep_stale_clones(Duration::from_secs(options.worker.timeout_secs + 600));
 
@@ -463,7 +503,7 @@ pub fn propose(
 
     // 対象経路・ignore 判定・プロンプトはすべてクローン（push された内容）を基準にする。
     // 利用者の作業ツリー基準だと、未コミット・未追跡の状態が混ざってしまう。
-    let mut scope = maintenance_scope(&work, previous, pushed)
+    let scope = maintenance_scope_for(&work, previous, pushed, &kinds)
         .map_err(|e| format!("保守対象の AGENTS 経路を確認できません（{e}）"))?;
     let deleted: Vec<PathBuf> = if previous.is_empty() {
         Vec::new()
@@ -484,62 +524,29 @@ pub fn propose(
         .map(|raw| nul_list(&raw))
         .unwrap_or_default()
         .into_iter()
-        .filter(
-            |name| match Path::new(name).file_name().and_then(|n| n.to_str()) {
-                Some("AGENTS.md" | "AGENTS.override.md") => {
-                    options.documents.contains(&Document::Agents)
-                }
-                Some("DESIGN.md") => options.documents.contains(&Document::Design),
-                _ => false,
-            },
-        )
+        .filter(|name| crate::kinds::keeps_deleted(&kinds, name))
         .map(|name| work.join(name))
         .collect()
     };
-    let mut reason = build_maintenance_reason_for(
-        &work,
-        &scope,
-        &deleted,
-        previous,
-        pushed,
-        &options.documents,
-    );
+    let mut reason =
+        build_maintenance_reason_with(&work, &scope, &deleted, previous, pushed, &kinds, templates);
     reason.push_str(
         "なお今回は提案モードです。commit と push は行われず、作業ツリーに残した差分が利用者への更新案として保存されます。",
     );
 
-    // worker に許す変更パス（対象文書の種類ごと）。push モードの組み立てと同じ規則。
-    let mut docs: Vec<PathBuf> = Vec::new();
-    for (document, files, size_only, default) in [
-        (
-            Document::Agents,
-            std::mem::take(&mut scope.agents),
-            std::mem::take(&mut scope.size_only),
-            "AGENTS.md",
-        ),
-        (
-            Document::Design,
-            std::mem::take(&mut scope.design),
-            Vec::new(),
-            "DESIGN.md",
-        ),
-        (
-            Document::Readme,
-            std::mem::take(&mut scope.readme),
-            Vec::new(),
-            "README.md",
-        ),
-    ] {
-        if !options.documents.contains(&document) {
-            continue;
-        }
-        if files.is_empty() {
-            docs.push(work.join(default));
-        }
-        docs.extend(files);
-        docs.extend(size_only);
+    // worker に許す変更パス（対象文書の種類ごと）。push モードと共通の `plan_documents`。
+    let docs = crate::kinds::plan_documents(&work, &scope, &kinds, &deleted);
+    // 処理する文書が 1 つも無い（どの種類も対象が存在せず、新規作成も許されていない）なら worker を起動しない。
+    // 許可パスが空のまま worker を動かしても何も変えられず、費用だけが掛かる。呼び出し側は位置だけ進め、
+    // 種類別の最終完了（kind_runs）は記録しない（何も保守していないため）。
+    if docs.is_empty() {
+        return Ok(ProposeOutcome::NothingToDo);
     }
-    docs.extend(deleted);
+    // 更新案のメタ情報に残す、対象になった種類の id。
+    let active_ids: Vec<String> = crate::kinds::active_kinds(&work, &scope, &kinds)
+        .iter()
+        .map(|k| k.id().to_string())
+        .collect();
 
     // 許可パス = 対象文書 + 各階層の .gitignore（ignore 訂正のため）。相対・`/` 区切り。
     let mut allowed: BTreeSet<String> = BTreeSet::new();
@@ -589,6 +596,56 @@ pub fn propose(
             "無視されている文書は提案に含められません: {}",
             ignored.0
         ));
+    }
+
+    // 保守後検査（権限モードに関係なく通る位置）: AGENTS のサイズと、種類ごとの上限・必須見出し。
+    // push モードの `agents_size_error` と `limit_error` に対応する。違反した更新案はパッチを作らず、
+    // 棄却の記録だけを残す。`git add` より前に置くのは、違反した内容を index にも載せないため。
+    // AGENTS のサイズ検査は従来 propose に無かった欠落を塞ぐもの。
+    let mut agents_dirs: Vec<PathBuf> = Vec::new();
+    for p in docs
+        .iter()
+        .cloned()
+        .chain(changed.iter().map(|c| work.join(c)))
+    {
+        if matches!(
+            p.file_name().and_then(|n| n.to_str()),
+            Some("AGENTS.md" | "AGENTS.override.md")
+        ) && let Some(parent) = p.parent()
+        {
+            agents_dirs.push(parent.to_path_buf());
+        }
+    }
+    // CHANGELOG のリリース済みエントリ不変の検査も同じ扱い（編集前 = push されたコミットの CHANGELOG.md）。
+    // CHANGELOG の種類が無い・許可パスに無いときは git を呼ばない。
+    // 編集前の存在は worker 前のクローン（= push されたコミット）の作業ツリーで決める（`scope` は worker 前に
+    // 作ったもの）。Git 上の綴りが `Changelog.md` のように違っても、大文字小文字を区別しないファイルシステム
+    // では作業ツリーに見えるので「既存」として検査する。Git 上で実際の綴りを決められなければ検査不能として
+    // 拒否する（`check_released_entries` が fail-closed）。`None`（Git にあるかで決める）を渡すと、綴り違いで
+    // 新規作成扱いになり検査を素通りしていた。
+    let changelog_existed = !scope.files(&crate::config::Document::Changelog).is_empty();
+    let violation = agents_size_error(&work, &agents_dirs, true)
+        .or_else(|| crate::kinds::limit_error(&work, &kinds, &allowed))
+        .or_else(|| {
+            let kind = crate::changelog::changelog_kind(&kinds)?;
+            let rel = crate::changelog::find_changelog_path(&allowed)?;
+            crate::changelog::check_released_entries(
+                &work,
+                rel,
+                pushed,
+                Some(changelog_existed),
+                kind,
+            )
+        });
+    if let Some(reason) = violation {
+        let mut record = meta_record(pushed, &[], "", options, "rejected", &active_ids, templates);
+        record["reason"] = json!(reason);
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        write_atomic(
+            &meta_file(&dir, pushed),
+            &serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?,
+        )?;
+        return Ok(ProposeOutcome::Rejected { reason });
     }
 
     // 新規作成された文書は素の `git diff` に出ないため、クローン内でだけ stage して index との差分を取る。
@@ -676,25 +733,15 @@ pub fn propose(
 
     // 保存。json → patch の順で書き、patch の存在を完了の印にする。
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let now = chrono::Utc::now();
-    let meta = json!({
-        "schema": 1,
-        "commit": pushed,
-        "created_at": now.to_rfc3339(),
-        "created_unix": now.timestamp_millis() as f64 / 1000.0,
-        "documents": names,
-        "diffstat": diffstat,
-        // 秘密値は書かない。worker 設定は要約（claude_path などの環境依存値も含めない）。
-        "worker": {
-            "model": options.worker.model,
-            "effort": options.worker.effort,
-            "permission": permission_name(options.worker.permission),
-            "timeout_secs": options.worker.timeout_secs,
-            "max_budget_usd": options.worker.max_budget_usd,
-        },
-        "status": "pending",
-        "applied_at": Value::Null,
-    });
+    let meta = meta_record(
+        pushed,
+        &names,
+        &diffstat,
+        options,
+        "pending",
+        &active_ids,
+        templates,
+    );
     write_atomic(
         &meta_file(&dir, pushed),
         &serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?,
@@ -708,10 +755,55 @@ pub fn propose(
     })
 }
 
-/// json が適用済み・破棄済みで終わっているか（patch が無くても二重作成しない）。
-fn finished_meta(dir: &Path, sha: &str) -> bool {
-    read_meta(&meta_file(dir, sha))
-        .is_some_and(|m| matches!(m["status"].as_str(), Some("applied" | "discarded")))
+/// 更新案のメタ情報（json）を作る。`schema` は 1 のまま、`kinds`（対象になった種類の id）と
+/// `templates`（使ったテンプレートの種類 id と SHA-256。本文は記録しない）を持つ。
+/// 秘密値は書かない。worker 設定は要約（claude_path などの環境依存値も含めない）。
+/// `status` は `pending`（作成済み）か `rejected`（保守後検査に違反して作らなかった。呼び出し側が
+/// `reason` を足す）。
+fn meta_record(
+    pushed: &str,
+    names: &[String],
+    diffstat: &str,
+    options: &MaintenanceOptions,
+    status: &str,
+    kind_ids: &[String],
+    templates: &[LoadedTemplate],
+) -> Value {
+    let now = chrono::Utc::now();
+    let templates: Vec<Value> = templates
+        .iter()
+        .filter(|t| kind_ids.contains(&t.kind))
+        .map(|t| json!({"id": t.kind, "sha256": t.sha256}))
+        .collect();
+    json!({
+        "schema": 1,
+        "commit": pushed,
+        "created_at": now.to_rfc3339(),
+        "created_unix": now.timestamp_millis() as f64 / 1000.0,
+        "documents": names,
+        "diffstat": diffstat,
+        "kinds": kind_ids,
+        "templates": templates,
+        "worker": {
+            "model": options.worker.model,
+            "effort": options.worker.effort,
+            "permission": permission_name(options.worker.permission),
+            "timeout_secs": options.worker.timeout_secs,
+            "max_budget_usd": options.worker.max_budget_usd,
+        },
+        "status": status,
+        "applied_at": Value::Null,
+    })
+}
+
+/// json が適用済み・破棄済み・棄却済みで終わっているか（patch が無くても二重作成しない）。
+/// 棄却済みは `force`（run-now）のときだけ無視して作り直す。
+fn finished_meta(dir: &Path, sha: &str, force: bool) -> bool {
+    read_meta(&meta_file(dir, sha)).is_some_and(|m| match m["status"].as_str() {
+        Some("applied" | "discarded") => true,
+        Some("rejected") => !force,
+        _ => false,
+    })
 }
 
 fn read_meta(path: &Path) -> Option<Value> {

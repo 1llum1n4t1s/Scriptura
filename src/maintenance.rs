@@ -1,4 +1,5 @@
 use crate::config::{self, Config, Decision, Document, Mode, Permission, SkipReason, Worker};
+use crate::kinds::ResolvedKind;
 use crate::process::{Output, capture, command};
 use caseless::Caseless;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -26,6 +27,20 @@ pub struct MaintenanceOptions {
     pub documents: Vec<Document>,
     pub exclude: Vec<String>,
     pub worker: Worker,
+    /// 種類ごとの実効設定。空のときは「`documents` から組み込み既定を解決」の意味（従来どおり）。
+    pub kinds: Vec<ResolvedKind>,
+}
+
+impl MaintenanceOptions {
+    /// 実際に処理する種類。`kinds` が空なら `documents` から組み込み既定で解決する（従来の意味）。
+    /// プロンプト・許可パス・保守後検査はすべてこの 1 つの結果を見る。
+    pub fn resolved_kinds(&self) -> Vec<ResolvedKind> {
+        if self.kinds.is_empty() {
+            crate::kinds::resolve_builtin_kinds(&self.documents)
+        } else {
+            self.kinds.clone()
+        }
+    }
 }
 
 impl Default for MaintenanceOptions {
@@ -39,6 +54,7 @@ impl Default for MaintenanceOptions {
                 permission: Permission::Bypass,
                 ..Worker::default()
             },
+            kinds: Vec::new(),
         }
     }
 }
@@ -49,6 +65,7 @@ impl From<&Decision> for MaintenanceOptions {
             documents: d.documents.clone(),
             exclude: d.exclude.clone(),
             worker: d.worker.clone(),
+            kinds: d.kinds.clone(),
         }
     }
 }
@@ -408,7 +425,7 @@ pub(crate) fn safe_relative(root: &Path, path: &Path) -> Result<String> {
     }
     Ok(rel.to_string_lossy().replace('\\', "/"))
 }
-fn linked(meta: &fs::Metadata) -> bool {
+pub(crate) fn linked(meta: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
@@ -1006,6 +1023,10 @@ pub fn open_state_db() -> Result<Connection> {
         )
         .map_err(err)?;
     }
+    // 種類ごとの最終完了時刻（`crate::timing`）。表を足すだけで user_version は上げない
+    // （旧利用者判定 `legacy_state_present` と `state_db_is_newer` の契約を変えないため）。
+    db.execute_batch(crate::timing::KIND_RUNS_DDL)
+        .map_err(err)?;
     db.execute(
         "INSERT OR IGNORE INTO poll_metadata VALUES ('started_at',?1)",
         [now().to_string()],
@@ -1061,12 +1082,38 @@ pub fn push_snapshot(root: &Path) -> Option<Value> {
         json!({"repo_root":path_string(&fs::canonicalize(root).ok()?),"upstream":upstream,"destination":hash(url),"fingerprint":hash(&raw),"pushed":pushed,"pushed_at":pushed_at,"head":rt(root,&["rev-parse","HEAD"]).unwrap_or_default(),"tip":rt(root,&["rev-parse",&upstream]).unwrap_or_default()}),
     )
 }
+/// 保守対象の文書（現在存在するもの）。
+/// 従来 3 種は専用の欄、CHANGELOG・カスタム種類は `other`（種類 → 存在する対象ファイル）に入る。
+/// `other` は `maintenance_scope_for` が種類の定義から埋める（`Scope::default()` は空）。
 #[derive(Default)]
 pub struct Scope {
     pub agents: Vec<PathBuf>,
     pub design: Vec<PathBuf>,
     pub readme: Vec<PathBuf>,
     pub size_only: Vec<PathBuf>,
+    pub other: BTreeMap<Document, Vec<PathBuf>>,
+}
+impl Scope {
+    /// 種類の現在存在する対象ファイル（無ければ空）。
+    pub fn files(&self, document: &Document) -> &[PathBuf] {
+        match document {
+            Document::Agents => &self.agents,
+            Document::Design => &self.design,
+            Document::Readme => &self.readme,
+            other => self.other.get(other).map(Vec::as_slice).unwrap_or(&[]),
+        }
+    }
+}
+/// `maintenance_scope` に、CHANGELOG・カスタム種類の対象（`kinds::other_scope`）を足したもの。
+pub fn maintenance_scope_for(
+    root: &Path,
+    previous: &str,
+    pushed: &str,
+    kinds: &[ResolvedKind],
+) -> Result<Scope> {
+    let mut scope = maintenance_scope(root, previous, pushed)?;
+    scope.other = crate::kinds::other_scope(root, kinds);
+    Ok(scope)
 }
 pub fn maintenance_scope(root: &Path, previous: &str, pushed: &str) -> Result<Scope> {
     let mut agents: BTreeSet<_> = active_agents_files(root, root).into_iter().collect();
@@ -1123,6 +1170,7 @@ pub fn maintenance_scope(root: &Path, previous: &str, pushed: &str) -> Result<Sc
         design: design.into_iter().collect(),
         readme: root_readme_files(root),
         size_only: size_only.into_iter().collect(),
+        other: BTreeMap::new(),
     })
 }
 /// 3 文書すべてを対象にしたプロンプト（旧来の呼び出し口）。
@@ -1148,7 +1196,40 @@ pub fn build_maintenance_reason_for(
     pushed: &str,
     documents: &[Document],
 ) -> String {
-    let has = |d: Document| documents.contains(&d);
+    // 設定を持たない呼び出し口: 組み込み既定の種類（上限・追加指示なし）だけで組み立てる。
+    let kinds = crate::kinds::resolve_builtin_kinds(documents);
+    build_maintenance_reason_with(root, scope, deleted, previous, pushed, &kinds, &[])
+}
+
+/// 種類ごとの実効設定（`kinds`）に基づくプロンプトを作る。
+/// - 従来 3 種の文面は `build_maintenance_reason_for` と同一（P0 の基準テストで固定）。
+/// - CHANGELOG・カスタム種類は「〈名前〉対象: …。」と記載指針を、その種類が有効なときだけ足す。
+///   有効でない種類（対象が無く `create_if_missing = false`）はどこにも現れない。
+/// - 種類別の上限・言語・必須見出し・テンプレート・追加指示は、末尾の「利用者設定由来の追加指示」枠にだけ置く。
+/// - CHANGELOG が有効なときだけ、CHANGELOG の保守規則（`changelog::prompt_parts`）を記載指針の後ろに、
+///   Rust が集めた Git 履歴の未信頼の資料（JSON）をプロンプトの末尾に足す。
+pub fn build_maintenance_reason_with(
+    root: &Path,
+    scope: &Scope,
+    deleted: &[PathBuf],
+    previous: &str,
+    pushed: &str,
+    kinds: &[ResolvedKind],
+    templates: &[crate::kinds::LoadedTemplate],
+) -> String {
+    let active = crate::kinds::active_kinds(root, scope, kinds);
+    let has = |d: Document| active.iter().any(|k| k.document == d);
+    // 組み込み 3 種以外の有効な種類（CHANGELOG・カスタム）。
+    let others: Vec<&ResolvedKind> = active
+        .iter()
+        .copied()
+        .filter(|k| {
+            !matches!(
+                k.document,
+                Document::Agents | Document::Design | Document::Readme
+            )
+        })
+        .collect();
     let list = |paths: &[PathBuf]| {
         paths
             .iter()
@@ -1168,6 +1249,14 @@ pub fn build_maintenance_reason_for(
     }
     if has(Document::Readme) {
         reason.push_str(&format!("README 対象: {}。", list(&scope.readme)));
+    }
+    // CHANGELOG・カスタム種類の対象（存在するもの）。名前は CHANGELOG は文書名から拡張子を除いたもの、カスタムは id。
+    for kind in &others {
+        reason.push_str(&format!(
+            "{} 対象: {}。",
+            other_label(&kind.document),
+            list(scope.files(&kind.document))
+        ));
     }
     if has(Document::Agents) {
         reason.push_str(&format!(
@@ -1205,6 +1294,29 @@ pub fn build_maintenance_reason_for(
             }
         }
     }
+    // CHANGELOG・カスタム種類で、まだ存在しない対象（`create_if_missing` で新規作成してよいもの。固定パスごと）。
+    // 削除の判定は差分の削除一覧ではなく「前回存在したか」（`git cat-file -e previous:<path>`）。
+    for kind in &others {
+        let paths = crate::kinds::missing_paths(root, scope, kind);
+        if paths.is_empty() {
+            continue;
+        }
+        let label = other_label(&kind.document);
+        let existed = !previous.is_empty()
+            && paths
+                .iter()
+                .any(|p| run_git(root, &["cat-file", "-e", &format!("{previous}:{p}")]).is_some());
+        let shown = paths
+            .iter()
+            .map(|p| format!("`{p}`"))
+            .collect::<Vec<_>>()
+            .join("、");
+        if existed {
+            reason.push_str(&format!("前回存在した {label} の対象（{shown}）がありません。push 差分から削除意図を確認し、意図的なら再作成せず維持し、意図しない欠落だけ元の対象パスへ復元してください。"))
+        } else {
+            reason.push_str(&format!("{label} の対象（{shown}）がありません。現在の実装を確認した実用的な内容で、必要なものだけ新規作成してください。"))
+        }
+    }
     if !deleted.is_empty() {
         reason.push_str(&format!("検知した push で削除された対象は {} です。意図的な削除なら再作成や別名の代替文書を作成せず維持し、意図しない欠落を確認できた場合だけ元の対象パスへ復元してください。",list(deleted)))
     }
@@ -1219,11 +1331,41 @@ pub fn build_maintenance_reason_for(
     if has(Document::Readme) {
         guidance.push("README.md には利用者向けの取得・導入・利用方法を記載");
     }
+    if has(Document::Changelog) {
+        guidance.push("CHANGELOG.md には利用者に見える変更を新しい順の節で記載");
+    }
     if !guidance.is_empty() {
         reason.push_str(&format!("{}してください。", guidance.join("し、")));
     }
+    // カスタム種類の記載指針（利用者が設定で定めた「何を書く文書か」）。
+    for kind in &others {
+        if matches!(kind.document, Document::Custom(_)) {
+            reason.push_str(&format!(
+                "{} の記載指針: {}。",
+                other_label(&kind.document),
+                kind.guidance.trim().trim_end_matches('。')
+            ));
+        }
+    }
+    // CHANGELOG 固有の規則（Rust が決めた文面）と、Git 履歴の未信頼の資料（末尾に置く）。
+    // CHANGELOG の種類が有効なときだけ作るので、従来 3 種の構成では git 呼び出しも文面も増えない。
+    let changelog_frame = match active.iter().find(|k| k.document == Document::Changelog) {
+        Some(kind) => {
+            let (rules, frame) = crate::changelog::prompt_parts(
+                root,
+                scope,
+                kind,
+                pushed,
+                previous,
+                has(Document::Readme),
+            );
+            reason.push_str(&rules);
+            frame
+        }
+        None => String::new(),
+    };
     reason.push_str("manifest、CI、コード、設定、テスト、既存文書を正本として照合し、古い説明や重複を必要な範囲で整理してください。");
-    if documents.len() > 1 {
+    if active.len() > 1 {
         reason.push_str("対象文書間の必要な節の移動・再構成と参照リンクを整合させてください。");
     }
     reason.push_str(
@@ -1247,12 +1389,38 @@ pub fn build_maintenance_reason_for(
             list(&[p.clone()])
         ))
     }
-    let names: Vec<&str> = Document::ALL
+    // CHANGELOG・カスタム種類の既存の対象の ignore 判定（存在するものだけ。新規作成予定のものは対象外）。
+    for kind in &others {
+        for p in scope.files(&kind.document) {
+            let (status, detail) = git_ignore_status(root, p);
+            reason.push_str(&format!(
+                "{} の ignore 実効判定: {status}（{detail}）。",
+                list(&[p.clone()])
+            ))
+        }
+    }
+    // `Document` は `Copy` ではないので、定数の借用が文の途中で消えないよう一旦束縛する。
+    let all = Document::ALL;
+    let mut names: Vec<String> = all
         .iter()
-        .filter(|d| has(**d))
-        .map(|d| d.file_name())
+        .filter(|d| has((*d).clone()))
+        .map(|d| d.file_name().to_string())
         .collect();
-    let example = names.first().copied().unwrap_or("README.md");
+    // 従来 3 種の後ろに、有効な CHANGELOG・カスタム種類の名前を足す（カスタムは id とパスを併記）。
+    let mut example_names: Vec<String> = names.clone();
+    for kind in &others {
+        names.push(crate::kinds::display_name(kind));
+        example_names.push(
+            crate::kinds::default_paths(kind)
+                .first()
+                .cloned()
+                .unwrap_or_default(),
+        );
+    }
+    let example = example_names
+        .first()
+        .map(String::as_str)
+        .unwrap_or("README.md");
     reason.push_str(&format!(
         "通常の {} は共有対象です。ignored の場合、対象専用ルールは削除、広いルールは正しい階層の .gitignore へ対象だけの狭い否定例外（!/{example} 等）を追加し、必要な親だけ再包含してください。.git/info/exclude やグローバル excludes は変更せずリポジトリの .gitignore へ例外を追加してください。",
         names.join("、")
@@ -1261,7 +1429,20 @@ pub fn build_maintenance_reason_for(
         reason.push_str("AGENTS.override.md は個人用・一時上書きになり得るため、元依頼が共有を求めた場合以外は現在の ignore 状態を維持してください。");
     }
     reason.push_str("git check-ignore --no-index の終了コードと -v の根拠を照合し、通常文書が ignored ではないことと git status --short -- <対象path> .gitignore の追跡候補を検証してください。作成・編集時は最終回答に各文書の ignore 状態を1行で示してください。commit と push は呼び出し元のRustフックが対象限定で実行します。worker は unstaged に残し、既存の stage 済み差分に触れず git add、git commit、git push、git fetch、git pull は実行しません。対象差分とstatusで検証し、更新不要なら変更しないでください。");
+    // 種類別設定の枠（既定の構成では空で、文面は変わらない）。
+    reason.push_str(&crate::kinds::settings_frame(
+        root, scope, &active, templates,
+    ));
+    // 未信頼の資料は利用者設定の枠とは別枠で最後に置く（設計書 2.5・8 章）。
+    reason.push_str(&changelog_frame);
     reason
+}
+/// プロンプトでの CHANGELOG・カスタム種類の呼び名（CHANGELOG は拡張子なし、カスタムは id）。
+fn other_label(document: &Document) -> &str {
+    match document {
+        Document::Changelog => "CHANGELOG",
+        other => other.name(),
+    }
 }
 fn save_cursor(
     db: &Connection,
@@ -1407,19 +1588,75 @@ pub fn poll_repository_with(
         return Ok(None);
     }
     // ここまで来れば「処理対象の新しい push がある」。設定の判定結果に従って処理・見送りを分ける。
+    // 設定を解決できない種類（定義の無いカスタム種類など）を含む指定は、どの経路（hook・run-now）でも
+    // worker を起動せず、位置も進めない。
+    if let PollPlan::Process(run) | PollPlan::Propose(run) = plan
+        && let Some(message) = unresolved_kinds_hold(run)
+    {
+        return Ok(Some(message));
+    }
     let run = match plan {
         PollPlan::Process(run) => run,
         PollPlan::Propose(run) => {
             // push モードの publication 状態（commit / push の進行記録）には触れない。
             // 成功・変更なし・作成済みは位置を進め、失敗は push モードの save_error と同じ形
             // （前回の fingerprint のまま error を記録）にして次回の hook で再試行する。
-            return match crate::proposal::propose(root, &pushed, &prior_commit, run) {
+            // 期限が来た種類だけを処理する（設計書 3 章）。どの種類も期限前なら worker を起動せず、
+            // 処理済み位置をそのまま進める（propose は publication 状態を持たないので無条件）。
+            let repo_key = s(&snapshot, "repo_root");
+            let due = due_kinds_for(
+                &db,
+                &repo_key,
+                root,
+                &run.resolved_kinds(),
+                &pushed,
+                &prior_commit,
+                opts.force,
+                || push_range_paths(root, &prior_commit, &pushed),
+            )?;
+            if due.is_empty() {
+                save_cursor(&db, &snapshot, &fingerprint, None, &pushed)?;
+                return Ok(None);
+            }
+            let run = &crate::timing::narrow_options(run, &due);
+            // テンプレートの検査に失敗したら worker を起動せず、位置も進めずに見送る（Hold と同じ）。
+            let templates = match crate::kinds::load_templates(
+                &run.resolved_kinds(),
+                &crate::kinds::settings_dir(),
+                root,
+            ) {
+                Ok(t) => t,
+                Err(message) => return Ok(Some(message)),
+            };
+            return match crate::proposal::propose_with(
+                root,
+                &pushed,
+                &prior_commit,
+                run,
+                opts.force,
+                Some(&templates),
+            ) {
                 Ok(outcome) => {
                     save_cursor(&db, &snapshot, &fingerprint, None, &pushed)?;
+                    // 成功（作成・変更なし・作成済み）のときだけ、今回対象になった種類の最終完了を記録する。
+                    // 棄却（Rejected）は完了ではないので記録しない（次の push で期限が来ていれば再び対象になる）。
+                    // 処理する文書が無く worker を起動しなかった（NothingToDo）も、何も保守していないので記録しない。
+                    if !matches!(
+                        outcome,
+                        crate::proposal::ProposeOutcome::Rejected { .. }
+                            | crate::proposal::ProposeOutcome::NothingToDo
+                    ) {
+                        crate::timing::record_kind_runs(&db, &repo_key, &due, &pushed, now())?;
+                    }
                     Ok(match outcome {
                         crate::proposal::ProposeOutcome::Created { sha, .. } => Some(format!(
                             "文書の更新案を作成しました（{}）。作業ツリーは変更していません",
                             &sha[..sha.len().min(12)]
+                        )),
+                        // 上限・必須見出し・AGENTS サイズの検査に違反した更新案は作らない。位置は進めたので、
+                        // 同じ push では worker を再実行しない（run-now のときだけ作り直す）。
+                        crate::proposal::ProposeOutcome::Rejected { reason } => Some(format!(
+                            "文書の更新案を作成しませんでした（{reason}）。この push は処理済みとして位置を進めました"
                         )),
                         _ => None,
                     })
@@ -1547,8 +1784,14 @@ pub fn poll_repository_with(
             &prior_commit,
         );
     };
+    // 今回の push 範囲の変更パス。AGENTS サイズ検証の対象ディレクトリと、タイミングの `paths` 条件に使う。
+    let changed_paths: Vec<String> = text(diff)?
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
     let mut validation_dirs = Vec::new();
-    for name in text(diff)?.split('\0').filter(|s| !s.is_empty()) {
+    for name in &changed_paths {
         validation_dirs.push(root.join(name).parent().unwrap().to_path_buf());
     }
     if let Some(cwd) = cwd {
@@ -1603,7 +1846,59 @@ pub fn poll_repository_with(
         save_cursor(&db, &snapshot, &fingerprint, None, &pushed)?;
         return Ok(None);
     }
-    let mut scope = match maintenance_scope(root, &prior_commit, &pushed) {
+    // 期限が来た種類だけを処理する（設計書 3 章。判定は上の復旧処理の後なので、復旧は止めない）。
+    // - 未完了の保守が無い（phase が空か complete）: 期限の来た種類だけに絞る。どれも期限前なら worker を
+    //   起動せず、AdvanceOnly と同じく処理済み位置だけ進める。
+    // - 未完了の保守がある: 記録済みの編集対象（`before`）から再開する。保守後検査は全種類のまま（絞ると
+    //   一部の種類を見落とす）。プロンプトと編集対象の一覧は publication 状態に記録した種類（`kinds`）で作り、
+    //   成功したらその種類の最終完了を記録する（記録の無い旧状態は全種類で再開し、最終完了は記録しない）。
+    //   どれも期限前なら、AdvanceOnly と同じく位置を進めず worker も起動しない（次に期限が来た push、
+    //   または run-now で再開する）。
+    let repo_key = s(&snapshot, "repo_root");
+    let idle = ["", "complete"].contains(&s(&state, "phase").as_str());
+    let due = due_kinds_for(
+        &db,
+        &repo_key,
+        root,
+        &run.resolved_kinds(),
+        &pushed,
+        &prior_commit,
+        opts.force,
+        || Some(changed_paths.clone()),
+    )?;
+    if due.is_empty() {
+        if idle {
+            save_cursor(&db, &snapshot, &fingerprint, None, &pushed)?;
+        }
+        return Ok(None);
+    }
+    // - 新しい保守（idle）: 期限の来た種類に絞る。絞った種類 id は publication 状態の `kinds` に記録される
+    //   （`publish_locked_with` が worker 起動前に書く）。保守後検査も絞った集合で行う（従来どおり）。
+    // - 再開（未完了 phase）: 前回絞った種類 id の記録があれば、プロンプトと `plan_documents` をその集合で
+    //   作る（編集可能パスは記録済みの `before` なので、プロンプトだけ全種類分になる食い違いを防ぐ）。
+    //   保守後検査は全種類のまま（`run` は絞らずに渡す）。記録の無い旧状態は従来どおり絞らない。
+    //   成功したら記録の集合について種類別の最終完了を記録する（記録の無い旧状態は従来どおり記録しない）。
+    let narrowed;
+    let resumed: Vec<ResolvedKind>;
+    let (run, record, kinds): (&MaintenanceOptions, &[ResolvedKind], Vec<ResolvedKind>) = if idle {
+        narrowed = crate::timing::narrow_options(run, &due);
+        (&narrowed, &due, narrowed.resolved_kinds())
+    } else {
+        resumed = recorded_kinds(&state, run);
+        if resumed.is_empty() {
+            (run, &[], run.resolved_kinds())
+        } else {
+            (run, &resumed, resumed.clone())
+        }
+    };
+    // 実際に処理する種類（`kinds`）と、そのテンプレート。テンプレートの検査に失敗したら worker を起動せず、
+    // 処理済み位置も進めずに見送る（上の Hold と同じ。復旧処理を止めないよう、ここまで遅らせている）。
+    let templates = match crate::kinds::load_templates(&kinds, &crate::kinds::settings_dir(), root)
+    {
+        Ok(t) => t,
+        Err(message) => return Ok(Some(message)),
+    };
+    let scope = match maintenance_scope_for(root, &prior_commit, &pushed, &kinds) {
         Ok(scope) => scope,
         Err(e) => {
             return save_error(
@@ -1629,51 +1924,40 @@ pub fn poll_repository_with(
         )
         .unwrap_or_default()
     };
-    // 設定の documents に含まれない種類の削除は、保守対象にも許可パスにもしない。
+    // 設定の種類に含まれない文書の削除は、保守対象にも許可パスにもしない（AGENTS・DESIGN だけが対象。
+    // README・CHANGELOG・カスタムの削除は「前回存在したか」でプロンプト側が判定する）。
     let deleted: Vec<_> = text(deleted)?
         .split('\0')
-        .filter(|n| {
-            !n.is_empty()
-                && match Path::new(n).file_name().and_then(|n| n.to_str()) {
-                    Some("AGENTS.md" | "AGENTS.override.md") => {
-                        run.documents.contains(&Document::Agents)
-                    }
-                    Some("DESIGN.md") => run.documents.contains(&Document::Design),
-                    _ => false,
-                }
-        })
+        .filter(|n| !n.is_empty() && crate::kinds::keeps_deleted(&kinds, n))
         .map(|n| root.join(n))
         .collect();
-    let reason = build_maintenance_reason_for(
+    let reason = build_maintenance_reason_with(
         root,
         &scope,
         &deleted,
         &prior_commit,
         &pushed,
-        &run.documents,
+        &kinds,
+        &templates,
     );
-    // worker に許す変更パスの元になる一覧。対象文書の種類ごとに設定で絞る。
-    let mut docs: Vec<PathBuf> = Vec::new();
-    if run.documents.contains(&Document::Agents) {
-        if scope.agents.is_empty() {
-            scope.agents.push(root.join("AGENTS.md"))
-        }
-        docs.extend(scope.agents);
-        docs.extend(scope.size_only);
+    // worker に許す変更パスの元になる一覧（種類ごとの規則は propose モードと共通の `plan_documents`）。
+    let docs = crate::kinds::plan_documents(root, &scope, &kinds, &deleted);
+    // 処理する文書が 1 つも無い（有効な種類が無い）新しい保守は、worker を起動せず位置だけ進める。
+    // 種類別の最終完了（kind_runs）は記録しない（何も保守していないため）。未完了の保守の再開は
+    // 記録済みの `before` で進むので、ここでは止めない。
+    if idle && docs.is_empty() {
+        save_cursor(&db, &snapshot, &fingerprint, None, &pushed)?;
+        return Ok(None);
     }
-    if run.documents.contains(&Document::Design) {
-        if scope.design.is_empty() {
-            scope.design.push(root.join("DESIGN.md"))
-        }
-        docs.extend(scope.design);
+    // CHANGELOG が作業ツリーにあるのに保守開始時の HEAD に無く .gitignore で無視されているなら、worker を
+    // 起動しても保守後の不変検査で必ず失敗する。新しい保守では起動前に同じ判定をして、Hold と同じく位置を
+    // 進めずに見送る。再開では判定しない（worker が新規作成した CHANGELOG も HEAD に無いため）。
+    if idle
+        && let Some(message) =
+            crate::changelog::untracked_changelog_hold(root, &head, &scope, &kinds)
+    {
+        return Ok(Some(message));
     }
-    if run.documents.contains(&Document::Readme) {
-        if scope.readme.is_empty() {
-            scope.readme.push(root.join("README.md"))
-        }
-        docs.extend(scope.readme);
-    }
-    docs.extend(deleted);
     if let Some(e) = maintain_and_publish_with(
         root,
         &reason,
@@ -1690,8 +1974,131 @@ pub fn poll_repository_with(
         pushed
     };
     save_cursor(&db, &snapshot, &fingerprint, None, &processed)?;
+    // 保守が完了した（処理済み位置を error なしで保存した）ので、今回対象になった種類の最終完了を記録する。
+    crate::timing::record_kind_runs(&db, &repo_key, record, &processed, now())?;
     prior_fingerprint.clear();
     Ok(None)
+}
+/// 未完了の保守を再開するときの種類: publication 状態に記録された種類 id（`kinds`）のうち、今の設定に
+/// あるものを設定の順序で返す。記録が無い（旧版が作った状態）・どれも今の設定に無いときは空
+/// （呼び出し側は従来どおり全種類で再開する）。
+fn recorded_kinds(state: &Value, run: &MaintenanceOptions) -> Vec<ResolvedKind> {
+    let Some(ids) = state.get("kinds").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let ids: BTreeSet<&str> = ids.iter().filter_map(Value::as_str).collect();
+    run.resolved_kinds()
+        .into_iter()
+        .filter(|k| ids.contains(k.id()))
+        .collect()
+}
+/// 今回の push 範囲（`prior..pushed`。`prior` が空なら `pushed` 単体）の変更パス。取得できなければ None。
+/// push モードの AGENTS サイズ検証と同じ取り方（タイミングの `paths` 条件用）。
+fn push_range_paths(root: &Path, prior: &str, pushed: &str) -> Option<Vec<String>> {
+    let raw = if prior.is_empty() {
+        run_git(
+            root,
+            &[
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--name-only",
+                "-r",
+                "-z",
+                pushed,
+            ],
+        )
+    } else {
+        run_git(root, &["diff", "--name-only", "-z", prior, pushed])
+    }?;
+    Some(
+        String::from_utf8(raw)
+            .ok()?
+            .split('\0')
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+/// 今回処理する（期限が来た）種類。判定本体は `crate::timing::due_kinds`（純粋関数）。
+/// - 最初に、対象が存在せず新規作成も許されない CHANGELOG・カスタム種類を外す（従来 3 種は外さない）。
+/// - force（run-now）または残りの全種類が「毎 push・paths なし・間隔なし」（従来 3 種の既定構成）なら、
+///   状態 DB も git も追加で見ずに残りの全種類を返す（従来 3 種だけの構成は従来と同じ挙動・同じ git 呼び出し）。
+/// - `changed` は `paths` 条件を持つ種類があるときだけ呼ぶ。None（変更パスを取得できない）のときは
+///   `paths` 条件を満たすものとして扱う（判定不能で保守を止めず、より早く実行される側に倒す）。
+fn due_kinds_for(
+    db: &Connection,
+    repo_key: &str,
+    root: &Path,
+    kinds: &[ResolvedKind],
+    pushed: &str,
+    prior: &str,
+    force: bool,
+    changed: impl FnOnce() -> Option<Vec<String>>,
+) -> Result<Vec<ResolvedKind>> {
+    // CHANGELOG・カスタム種類のうち、対象が存在せず新規作成も許されないものは判定から外す。
+    // 外さないと「期限が来たのは存在しない種類だけ」の push で、許可パスが空のまま worker が起動し、
+    // 存在しない種類の最終完了まで記録されてしまう。従来 3 種は従来どおり常に判定対象にする
+    // （作成可否は保守本体の規則に任せ、期限判定で挙動を変えない）。
+    // この除外は force（run-now）・always_due の早期 return より前に行う。後ろに置くと、毎 push の構成や
+    // run-now では非アクティブな種類が残り、有効な種類が 1 つも無いのに worker が起動していた。
+    // 従来 3 種だけの構成では除外が起きない（other_scope も空）ので、結果も git 呼び出しも従来どおり。
+    let other = Scope {
+        other: crate::kinds::other_scope(root, kinds),
+        ..Scope::default()
+    };
+    let kinds: Vec<ResolvedKind> = kinds
+        .iter()
+        .filter(|k| {
+            matches!(
+                k.document,
+                Document::Agents | Document::Design | Document::Readme
+            ) || crate::kinds::is_active(root, &other, k)
+        })
+        .cloned()
+        .collect();
+    let kinds = kinds.as_slice();
+    if force || crate::timing::always_due(kinds) {
+        return Ok(kinds.to_vec());
+    }
+    let changed = if kinds.iter().any(|k| !k.timing.paths.is_empty()) {
+        changed()
+    } else {
+        Some(Vec::new())
+    };
+    // 変更パスが不明なら、評価用の写しから `paths` 条件を外す（結果は元の種類で返す）。
+    let eval: Vec<ResolvedKind> = match &changed {
+        Some(_) => kinds.to_vec(),
+        None => kinds
+            .iter()
+            .cloned()
+            .map(|mut k| {
+                k.timing.paths.clear();
+                k
+            })
+            .collect(),
+    };
+    let changed = changed.unwrap_or_default();
+    let last_done = crate::timing::last_done_map(&crate::timing::load_kind_runs(db, repo_key)?);
+    let release = |k: &ResolvedKind| crate::timing::release_due_in_repo(root, pushed, prior, k);
+    let due: BTreeSet<String> = crate::timing::due_kinds(
+        &eval,
+        &crate::timing::TimingInput {
+            changed_paths: &changed,
+            last_done: &last_done,
+            now: now(),
+            force,
+            release_due: &release,
+        },
+    )
+    .iter()
+    .map(|k| k.id().to_string())
+    .collect();
+    Ok(kinds
+        .iter()
+        .filter(|k| due.contains(k.id()))
+        .cloned()
+        .collect())
 }
 pub fn handle_hook(payload: &Value) -> Result<Option<String>> {
     let event = payload
@@ -1745,12 +2152,30 @@ pub fn handle_hook(payload: &Value) -> Result<Option<String>> {
                     )));
                 }
                 config::Loaded::Missing => {
-                    let config = Config::legacy_all_push();
-                    if let Err(e) = config::save(&config) {
-                        return Ok(Some(format!(
-                            "従来設定の引き継ぎに失敗したため文書保守を行いません: {e}"
-                        )));
-                    }
+                    // 設定の更新は U1 の `config::update_in`（設定ロック・版照合・アトミック保存）を通す。
+                    // 期待する版を「ファイルなし」にすることで、管理画面や CLI が先に設定を作った場合は
+                    // 衝突として扱い、その設定を上書きしない。ロック順は「poll → 設定」で enable と同じ。
+                    let created = config::update_in(
+                        &config::Store::current(),
+                        Some(&config::Revision::missing()),
+                        |cfg, _existed| {
+                            *cfg = Config::legacy_all_push();
+                            Ok(())
+                        },
+                    );
+                    let config = match created {
+                        Ok(updated) => updated.config,
+                        Err(config::UpdateError::Conflict { .. }) => {
+                            // 別の経路が先に設定を作った。今回は何もせず、次回の hook でその設定に従う。
+                            return Ok(None);
+                        }
+                        Err(e) => {
+                            return Ok(Some(format!(
+                                "従来設定の引き継ぎに失敗したため文書保守を行いません: {}",
+                                crate::cli::one_line(&format!("{e:?}"))
+                            )));
+                        }
+                    };
                     notice = Some(format!(
                         "従来の動作（全リポジトリで push 後に文書を保守）を引き継ぐ設定を {} に作成しました。対象は設定で絞れます",
                         config::config_path().display()
@@ -1790,6 +2215,27 @@ pub fn handle_hook(payload: &Value) -> Result<Option<String>> {
         (n, m) => Ok(n.or(m)),
     }
 }
+/// `documents` のうち設定を解決できない種類（定義の無いカスタム種類など）があるときの見送りメッセージ
+/// （無ければ None）。hook 経路の `plan_for_decision` を通らない run-now のように `PollPlan` を直接組み立てる
+/// 経路も同じ判定を通るよう、`poll_repository_with` の入口でまとめて見る。
+/// CHANGELOG・カスタムは通常の文書種類として保守する（P2）。ただし CHANGELOG 固有の処理
+/// （コミット履歴の資料、リリース済みエントリの不変検査、promote、遡り）は P4 まで無い。
+fn unresolved_kinds_hold(run: &MaintenanceOptions) -> Option<String> {
+    let kinds = run.resolved_kinds();
+    let missing: Vec<&str> = run
+        .documents
+        .iter()
+        .filter(|d| !kinds.iter().any(|k| &k.document == *d))
+        .map(Document::id)
+        .collect();
+    (!missing.is_empty()).then(|| {
+        format!(
+            "文書の種類 {} の設定を解決できないため文書保守を見送りました（設定の [kinds.<id>] を確認すると次回処理します）",
+            missing.join("、")
+        )
+    })
+}
+
 /// 判定結果から push 検知後の処理方針を決める唯一の場所。
 /// propose モードは `PollPlan::Propose`（P5。`crate::proposal`）。
 pub fn plan_for_decision(decision: &Decision) -> PollPlan {
@@ -2750,10 +3196,12 @@ pub fn publish_locked_with(
                     &relative,
                 ],
             );
+            // 共有文書: 対象（`documents`）に含まれ、ファイル名が個人用の AGENTS.override.md でも
+            // `.gitignore` でもないもの（従来 3 種・CHANGELOG・カスタム種類）。
             let shared = documents.contains(&candidate)
-                && matches!(
+                && !matches!(
                     candidate.file_name().and_then(|v| v.to_str()),
-                    Some("AGENTS.md" | "DESIGN.md" | "README.md")
+                    Some("AGENTS.override.md" | ".gitignore")
                 )
                 && candidate.is_file()
                 && status.as_ref().is_some_and(|v| {
@@ -2779,7 +3227,22 @@ pub fn publish_locked_with(
             .iter()
             .map(|d| safe_relative(root, d))
             .collect::<Result<_>>()?;
-        state = json!({"phase":"worker_pending","head":head,"branch":branch,"remote":remote,"ref":reference,"destination":destination,"before":before,"after":before,"ignored_before":ignored,"error":null,"history":history,"poll_fingerprint":fingerprint,"validation_dirs":validations});
+        // 今回処理する種類 id。中断後の再開でプロンプトと編集対象の一覧を同じ集合で作り直すために記録する
+        // （`poll_repository_with` の `recorded_kinds`）。
+        // 中断からの復旧（interrupted_recovered）はここで記録を作り直すが、呼び出し側は再開時に保守後検査用の
+        // 全種類の `options` を渡すので、そこから取ると絞った集合が全種類に広がってしまう。前回の記録があれば
+        // それを引き継ぐ（`before` は記録の集合で作った一覧から作られるので、両者が一致したままになる）。
+        let kind_ids: Value = match state.get("kinds").filter(|v| v.is_array()) {
+            Some(recorded) if s(&state, "phase") == "interrupted_recovered" => recorded.clone(),
+            _ => json!(
+                options
+                    .resolved_kinds()
+                    .iter()
+                    .map(|k| k.id().to_string())
+                    .collect::<Vec<_>>()
+            ),
+        };
+        state = json!({"phase":"worker_pending","head":head,"branch":branch,"remote":remote,"ref":reference,"destination":destination,"before":before,"after":before,"ignored_before":ignored,"error":null,"history":history,"poll_fingerprint":fingerprint,"validation_dirs":validations,"kinds":kind_ids});
         save_publication(path, &mut state)?;
     }
     if ["worker_pending", "worker_failed"].contains(&s(&state, "phase").as_str()) {
@@ -2938,6 +3401,44 @@ pub fn publish_locked_with(
             &mut state,
             format!("{e}。差分・index・未送信コミットは保持しています"),
         );
+    }
+    // 種類ごとの上限（文字数・バイト数）と必須見出しの検査。権限モードに関係なく、AGENTS の上限超過と
+    // 同じ扱い（commit せず phase は ready のまま。中断復旧でも必ずここを通る）。
+    // 検査対象は worker に編集を許したパス（記録済みの `before` のキー）。
+    let editable: Vec<String> = state["before"]
+        .as_object()
+        .ok_or("before 不正")?
+        .keys()
+        .cloned()
+        .collect();
+    let resolved = options.resolved_kinds();
+    if let Some(e) = crate::kinds::limit_error(root, &resolved, &editable) {
+        return fail(
+            path,
+            &mut state,
+            format!("{e}。差分・index・未送信コミットは保持しています"),
+        );
+    }
+    // CHANGELOG のリリース済みエントリ不変の検査（上限検査と同じ扱い・同じ位置。権限モードに関係なく通る）。
+    // 編集前の内容は保守開始時の HEAD（`state.head`）の CHANGELOG.md。記録のハッシュが null なら新規作成で、
+    // 上限と必須見出しの検査だけになる。CHANGELOG の種類が無い・編集を許していないときは git を呼ばない。
+    if let Some(kind) = crate::changelog::changelog_kind(&resolved)
+        && let Some(rel) = crate::changelog::find_changelog_path(&editable)
+    {
+        let existed = !state["before"][rel.as_str()].is_null();
+        if let Some(e) = crate::changelog::check_released_entries(
+            root,
+            rel,
+            &s(&state, "head"),
+            Some(existed),
+            kind,
+        ) {
+            return fail(
+                path,
+                &mut state,
+                format!("{e}。差分・index・未送信コミットは保持しています"),
+            );
+        }
     }
     let before = state["before"].as_object().ok_or("before 不正")?;
     let after = state["after"].as_object().ok_or("after 不正")?;
