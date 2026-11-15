@@ -12,6 +12,74 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 static ENV: Mutex<()> = Mutex::new(());
+
+/// 実行ファイルの名前（Windows は `.exe` 付き、それ以外は拡張子なし）。
+/// スタブは `file_stem` で役割を決めるので、どちらの名前でも同じ役割になる。
+fn exe(name: &str) -> String {
+    format!("{name}{}", env::consts::EXE_SUFFIX)
+}
+
+/// PATH から本物の git を探す（`where.exe` や `which` に頼らず、Windows・Linux で同じ手順にする）。
+/// フィクスチャが PATH へスタブを足す前に呼ぶこと。
+fn find_real_git() -> String {
+    let name = exe("git");
+    let path = env::var_os("PATH").unwrap_or_default();
+    env::split_paths(&path)
+        .map(|dir| dir.join(&name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("PATH に {name} が見つかりません"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// 指定 PID のプロセスがまだ生きているか。
+#[cfg(windows)]
+fn process_alive(pid: &str) -> bool {
+    Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue;if(-not $p){{exit 1}};exit 0"
+            ),
+        ])
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+/// 指定 PID のプロセスがまだ生きているか。ゾンビ（終了済みで回収待ち）は終了扱いにする。
+#[cfg(not(windows))]
+fn process_alive(pid: &str) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // 「pid (comm) 状態 ...」。comm に空白や括弧が入り得るので、最後の `)` の後ろを見る。
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| state != "Z" && state != "X"),
+        // /proc が無い環境では kill -0 で存在だけ確かめる。
+        Err(_) if !std::path::Path::new("/proc/self").exists() => Command::new("kill")
+            .args(["-0", pid])
+            .output()
+            .is_ok_and(|o| o.status.success()),
+        Err(_) => false,
+    }
+}
+
+/// 指定 PID のプロセスが `millis` ミリ秒以内に終了するまで待つ。終了していれば true。
+fn wait_process_exit(pid: &str, millis: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(millis);
+    loop {
+        if !process_alive(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
 #[test]
 fn uncertain_commit_or_push_from_stop_is_never_automatically_repeated() {
     for operation in ["commit", "push"] {
@@ -139,7 +207,13 @@ fn graphql_falsey_errors_match_python_without_skipping_shape_checks() {
 fn null_stdio_with_inherited_windows_handles_still_has_deadline() {
     let f = Fixture::new();
     f.helper_environment();
-    let c = scriptura::process::command(f.base.join("bin/null-parent.exe").to_str().unwrap());
+    let c = scriptura::process::command(
+        f.base
+            .join("bin")
+            .join(exe("null-parent"))
+            .to_str()
+            .unwrap(),
+    );
     let result = scriptura::process::capture(c, None, Duration::from_millis(300), false);
     assert!(result.err().unwrap().to_string().contains("unconfirmed"));
     f.finish_live_helper();
@@ -259,36 +333,25 @@ impl Fixture {
         let bin = base.join("bin");
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&bin).unwrap();
-        let real = String::from_utf8(
-            Command::new("where.exe")
-                .arg("git.exe")
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .lines()
-        .next()
-        .unwrap()
-        .to_string();
+        // 本物の git は、PATH へスタブを足す前に PATH から探す。
+        let real = find_real_git();
         for name in [
-            "claude.exe",
-            "gh.exe",
-            "pipe-parent.exe",
-            "pipe-grandchild.exe",
-            "managed-host.exe",
-            "detached-parent.exe",
-            "null-parent.exe",
-            "filter.exe",
+            &exe("claude"),
+            &exe("gh"),
+            &exe("pipe-parent"),
+            &exe("pipe-grandchild"),
+            &exe("managed-host"),
+            &exe("detached-parent"),
+            &exe("null-parent"),
+            &exe("filter"),
         ] {
             fs::copy(env!("CARGO_BIN_EXE_hook-test-stub"), bin.join(name)).unwrap();
         }
         let old_path = env::var_os("PATH").unwrap_or_default();
         unsafe {
-            env::set_var(
-                "PATH",
-                format!("{};{}", bin.display(), old_path.to_string_lossy()),
-            );
+            // PATH の区切り文字は OS で違う（Windows は `;`、Linux は `:`）ので join_paths で組む。
+            let dirs = std::iter::once(bin.clone()).chain(env::split_paths(&old_path));
+            env::set_var("PATH", env::join_paths(dirs).unwrap());
             env::set_var("SCRIPTURA_DB", base.join("state/state.sqlite3"));
             env::set_var("HOOK_STUB_PROMPT", base.join("prompt.json"));
             env::set_var("SCRIPTURA_CONFIG", base.join("config.toml"));
@@ -417,7 +480,7 @@ impl Fixture {
     fn stub_git(&self) {
         fs::copy(
             env!("CARGO_BIN_EXE_hook-test-stub"),
-            self.base.join("bin/git.exe"),
+            self.base.join("bin").join(exe("git")),
         )
         .unwrap();
     }
@@ -429,11 +492,10 @@ impl Fixture {
     }
     fn finish_live_helper(&self) {
         let pid = fs::read_to_string(self.base.join("child.pid")).unwrap();
-        let r=Command::new("pwsh").args(["-NoProfile","-Command",&format!("$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue;if(-not $p){{exit 1}};exit 0")]).output().unwrap();
+        let alive = process_alive(&pid);
         fs::write(self.base.join("child-exit"), "exit").unwrap();
-        assert!(r.status.success(), "helper was killed");
-        let r=Command::new("pwsh").args(["-NoProfile","-Command",&format!("$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue;if($p){{$p.WaitForExit(5000);if(-not $p.HasExited){{exit 1}}}};exit 0")]).output().unwrap();
-        assert!(r.status.success(), "fixture helper did not exit");
+        assert!(alive, "helper was killed");
+        assert!(wait_process_exit(&pid, 5000), "fixture helper did not exit");
     }
     fn docs(&self) -> Vec<PathBuf> {
         ["AGENTS.md", "DESIGN.md", "README.md"]
@@ -958,18 +1020,28 @@ fn malformed_payload_binary_is_fail_open_without_secrets() {
     assert!(p["systemMessage"].as_str().unwrap().contains("内部エラー"));
     assert!(f.root.exists());
 }
+// Job Object（Windows 限定の仕組み）で子孫を管理する検査。Linux の process::capture は managed 時に Job を使わない。
+#[cfg(windows)]
 #[test]
 fn managed_job_closes_inherited_descendant_pipes() {
     let f = Fixture::new();
     unsafe {
         env::set_var("HOOK_CHILD_PID", f.base.join("child.pid"));
     }
-    let mut c = scriptura::process::command(f.base.join("bin/pipe-parent.exe").to_str().unwrap());
+    let mut c = scriptura::process::command(
+        f.base
+            .join("bin")
+            .join(exe("pipe-parent"))
+            .to_str()
+            .unwrap(),
+    );
     c.current_dir(&f.root);
     let r = scriptura::process::capture(c, None, Duration::from_secs(5), true).unwrap();
     assert_eq!(r.code, Some(0));
     assert!(r.stderr.len() <= 8192);
 }
+// Job Object による子孫の一括終了の検査。Windows 限定。
+#[cfg(windows)]
 #[test]
 fn managed_job_timeout_kills_descendants() {
     let f = Fixture::new();
@@ -977,7 +1049,13 @@ fn managed_job_timeout_kills_descendants() {
         env::set_var("HOOK_CHILD_PID", f.base.join("child.pid"));
         env::set_var("HOOK_PARENT_SLEEP", "1");
     }
-    let c = scriptura::process::command(f.base.join("bin/pipe-parent.exe").to_str().unwrap());
+    let c = scriptura::process::command(
+        f.base
+            .join("bin")
+            .join(exe("pipe-parent"))
+            .to_str()
+            .unwrap(),
+    );
     let r = scriptura::process::capture(c, None, Duration::from_millis(300), true);
     assert_eq!(r.err().unwrap().kind(), std::io::ErrorKind::TimedOut);
 }
@@ -1094,7 +1172,8 @@ fn clean_filter_expansion_is_retained_without_push() {
         "config",
         "filter.expand.clean",
         &f.base
-            .join("bin/filter.exe")
+            .join("bin")
+            .join(exe("filter"))
             .to_string_lossy()
             .replace('\\', "/"),
     ]);
@@ -1155,6 +1234,8 @@ fn deleted_override_and_nested_design_do_not_request_replacement() {
     assert!(!reason.contains("There is no valid DESIGN.md"));
     assert!(reason.contains("keep it deleted without recreating it"));
 }
+// Windows のパスは大文字小文字を区別しない前提の検査。Linux では小文字にしたパスが別物になる。
+#[cfg(windows)]
 #[test]
 fn windows_case_changed_and_relative_cwd_keep_validation() {
     let f = Fixture::new();
@@ -1195,6 +1276,8 @@ fn casefold_collisions_are_ambiguous_in_index() {
         "ambiguous"
     );
 }
+// 親の死亡で Job Object が閉じて子孫が終わる検査（KILL_ON_JOB_CLOSE）。Windows 限定。
+#[cfg(windows)]
 #[test]
 fn parent_death_closes_worker_job() {
     let f = Fixture::new();
@@ -1202,7 +1285,7 @@ fn parent_death_closes_worker_job() {
         env::set_var("HOOK_CHILD_PID", f.base.join("child.pid"));
         env::set_var("HOOK_PARENT_SLEEP", "1")
     };
-    let mut host = Command::new(f.base.join("bin/managed-host.exe"))
+    let mut host = Command::new(f.base.join("bin").join(exe("managed-host")))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1218,9 +1301,7 @@ fn parent_death_closes_worker_job() {
     let pid = fs::read_to_string(pid_path).unwrap();
     host.kill().unwrap();
     host.wait().unwrap();
-    let mut c = Command::new("pwsh");
-    let r=c.args(["-NoProfile","-Command",&format!("$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue; if($p){{try{{$p.WaitForExit(5000)}}catch{{}}; if(-not $p.HasExited){{exit 1}}}}; exit 0")]).output().unwrap();
-    assert!(r.status.success());
+    assert!(wait_process_exit(&pid, 5000));
 }
 
 #[test]
@@ -1425,7 +1506,13 @@ fn unmanaged_pipe_deadline_preserves_helper_after_parent_exit_or_timeout() {
         if parent_running {
             unsafe { env::set_var("HOOK_PARENT_SLEEP", "1") }
         }
-        let c = scriptura::process::command(f.base.join("bin/pipe-parent.exe").to_str().unwrap());
+        let c = scriptura::process::command(
+            f.base
+                .join("bin")
+                .join(exe("pipe-parent"))
+                .to_str()
+                .unwrap(),
+        );
         let result = scriptura::process::capture(
             c,
             Some(vec![b'x'; 1000000]),
@@ -1444,15 +1531,20 @@ fn unmanaged_success_does_not_kill_detached_helper() {
         env::set_var("HOOK_CHILD_PID", f.base.join("child.pid"));
         env::set_var("HOOK_CHILD_EXIT", &exit);
     }
-    let c = scriptura::process::command(f.base.join("bin/detached-parent.exe").to_str().unwrap());
+    let c = scriptura::process::command(
+        f.base
+            .join("bin")
+            .join(exe("detached-parent"))
+            .to_str()
+            .unwrap(),
+    );
     let result = scriptura::process::capture(c, None, Duration::from_secs(5), false).unwrap();
     assert_eq!(result.code, Some(0));
     let pid = fs::read_to_string(f.base.join("child.pid")).unwrap();
-    let r=Command::new("pwsh").args(["-NoProfile","-Command",&format!("$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue; if(-not $p){{exit 1}}; exit 0")]).output().unwrap();
+    let alive = process_alive(&pid);
     fs::write(exit, "exit").unwrap();
-    assert!(r.status.success());
-    let r=Command::new("pwsh").args(["-NoProfile","-Command",&format!("$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue; if($p){{$p.WaitForExit(5000);if(-not $p.HasExited){{exit 1}}}};exit 0")]).output().unwrap();
-    assert!(r.status.success());
+    assert!(alive);
+    assert!(wait_process_exit(&pid, 5000));
 }
 
 // ---------------------------------------------------------------------------
@@ -1782,10 +1874,14 @@ fn restricted_worker_argument_contract_and_settings() {
     // PATH のスタブを退避し、設定の claude_path だけで起動できること（優先されること）を確かめる。
     let alt = f.base.join("alt");
     fs::create_dir_all(&alt).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_hook-test-stub"), alt.join("claude.exe")).unwrap();
+    fs::copy(
+        env!("CARGO_BIN_EXE_hook-test-stub"),
+        alt.join(exe("claude")),
+    )
+    .unwrap();
     fs::rename(
-        f.base.join("bin/claude.exe"),
-        f.base.join("bin/claude-disabled.exe"),
+        f.base.join("bin").join(exe("claude")),
+        f.base.join("bin").join(exe("claude-disabled")),
     )
     .unwrap();
     let extra = vec!["custom/**".to_string()];
@@ -1798,7 +1894,7 @@ fn restricted_worker_argument_contract_and_settings() {
             timeout_secs: 300,
             max_budget_usd: 2.5,
             permission: Permission::Restricted,
-            claude_path: alt.join("claude.exe").to_string_lossy().into_owned(),
+            claude_path: alt.join(exe("claude")).to_string_lossy().into_owned(),
         },
         kinds: Vec::new(),
     };
@@ -1925,11 +2021,11 @@ fn find_in_path_works_like_which() {
     let bin = f.base.join("bin");
     let joined = env::join_paths([f.base.join("missing"), bin.clone()]).unwrap();
     assert_eq!(
-        find_in_path("claude.exe", Some(joined.clone())),
-        Some(bin.join("claude.exe"))
+        find_in_path(&exe("claude"), Some(joined.clone())),
+        Some(bin.join(exe("claude")))
     );
-    assert_eq!(find_in_path("no-such-tool.exe", Some(joined)), None);
-    assert_eq!(find_in_path("claude.exe", None), None);
+    assert_eq!(find_in_path(&exe("no-such-tool"), Some(joined)), None);
+    assert_eq!(find_in_path(&exe("claude"), None), None);
 }
 #[test]
 fn worker_timeout_comes_from_settings() {

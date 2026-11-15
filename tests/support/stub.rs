@@ -159,7 +159,7 @@ fn main() {
         }
         let exe = env::current_exe()
             .unwrap()
-            .with_file_name("pipe-grandchild.exe");
+            .with_file_name(format!("pipe-grandchild{}", env::consts::EXE_SUFFIX));
         let child = Command::new(exe)
             .stdin(if role != "pipe-parent" {
                 Stdio::null()
@@ -201,7 +201,7 @@ fn main() {
     } else if role == "managed-host" {
         let exe = env::current_exe()
             .unwrap()
-            .with_file_name("pipe-parent.exe");
+            .with_file_name(format!("pipe-parent{}", env::consts::EXE_SUFFIX));
         let c = scriptura::process::command(exe.to_str().unwrap());
         let _ = scriptura::process::capture(c, None, std::time::Duration::from_secs(60), true);
     } else if role == "git" {
@@ -224,7 +224,7 @@ fn main() {
             let child = Command::new(
                 env::current_exe()
                     .unwrap()
-                    .with_file_name("pipe-grandchild.exe"),
+                    .with_file_name(format!("pipe-grandchild{}", env::consts::EXE_SUFFIX)),
             )
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
