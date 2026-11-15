@@ -203,6 +203,8 @@ fn graphql_falsey_errors_match_python_without_skipping_shape_checks() {
             .contains("不明")
     );
 }
+// 継承された Windows のハンドルが pipe を握り続ける現象の検査。Linux では同じ状況が起きず、期限内に正常終了する。
+#[cfg(windows)]
 #[test]
 fn null_stdio_with_inherited_windows_handles_still_has_deadline() {
     let f = Fixture::new();
@@ -578,11 +580,15 @@ fn github_url_forms_and_invalid_targets() {
 #[test]
 fn python_normcase_and_publication_key() {
     let f = Fixture::new();
-    assert_eq!(normcase("D:/Dev/İΟΣ"), "d:\\dev\\İοσ");
-    assert_eq!(
-        hash(normcase("D:\\Dev\\skills")),
-        "05629082bd22e81e1dcbdf1da39fdfca9c45b422d7afcb1c905b21e88fa81fea"
-    );
+    // normcase は Windows の大文字小文字・区切り文字の正規化を再現するもの。Windows でだけ確かめる。
+    #[cfg(windows)]
+    {
+        assert_eq!(normcase("D:/Dev/İΟΣ"), "d:\\dev\\İοσ");
+        assert_eq!(
+            hash(normcase("D:\\Dev\\skills")),
+            "05629082bd22e81e1dcbdf1da39fdfca9c45b422d7afcb1c905b21e88fa81fea"
+        );
+    }
     assert!(
         publication_paths(&f.root)
             .0
@@ -784,8 +790,20 @@ fn python_worker_running_and_legacy_missing_fields_recovers() {
     let f = Fixture::new();
     let mut state = f.checkpoint("worker_running");
     f.save(&mut state);
-    assert_eq!(f.maintain(), None);
-    assert_eq!(f.state()["phase"], "complete");
+    // 中断した worker の終了確認（`worker_quiescence_error`）は Windows でだけ行える。
+    #[cfg(windows)]
+    {
+        assert_eq!(f.maintain(), None);
+        assert_eq!(f.state()["phase"], "complete");
+    }
+    // Windows 以外では終了を確認できないので、fail-closed で再開を見送り、worker も起動しない。
+    #[cfg(not(windows))]
+    {
+        let message = f.maintain().expect("再開を見送る理由を返す");
+        assert!(message.contains("中断 worker"), "{message}");
+        assert_eq!(f.state()["phase"], "worker_running");
+        assert!(!f.base.join("prompt.json").exists());
+    }
 }
 #[test]
 fn interrupted_ignored_checkpoints_are_fail_closed() {
