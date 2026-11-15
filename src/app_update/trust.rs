@@ -65,6 +65,7 @@ const MAC_UPDATER_ENTRY: &str = "lib/app/Contents/MacOS/UpdateMac";
 
 /// 署名の検証を省いてよいか。テスト用の feature を付けたビルドで、環境変数が明示されたときだけ真。
 /// 本番ビルドでは常に偽で、この分岐自体がコンパイルされない。
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn unsigned_allowed_for_test() -> bool {
     #[cfg(feature = "update-feed-test")]
     {
@@ -78,6 +79,10 @@ fn unsigned_allowed_for_test() -> bool {
 
 /// nupkg の中の主実行ファイルを検証する。通れば Ok、満たさなければ理由つきの Err。
 pub fn verify_package(package: &Path) -> Result<()> {
+    // テスト用に省けるのは「署名」の検証だけ。Linux には署名が無く、検証は置き場の所有者・権限と
+    // パッケージの形（モジュールの説明の信頼モデル）なので、テスト用の環境変数でも省かない。
+    // 省くと、他人が書ける置き場を拒否する検査が隔離 E2E（ALLOW_UNSIGNED=1）で一度も働かない。
+    #[cfg(not(target_os = "linux"))]
     if unsigned_allowed_for_test() {
         return Ok(());
     }

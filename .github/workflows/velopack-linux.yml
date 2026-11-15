@@ -113,12 +113,21 @@ jobs:
           bash -n scripts/velopack/e2e-linux.sh
 
       - name: Test on Linux
+        env:
+          # x64 のランナー（ubuntu-latest）は空きが少なく、テスト用バイナリ約 13 本のデバッグ情報で
+          # ディスクが尽きて「No space left on device」でジョブごと落ちた。デバッグ情報を作らず、
+          # 増分ビルドの中間物も残さない（テストの判定には不要）。
+          CARGO_PROFILE_DEV_DEBUG: '0'
+          CARGO_INCREMENTAL: '0'
         run: |
           set -euo pipefail
           # テストが利用者の設定・状態へ書かないよう、保存場所を作業フォルダーへ隔離する。
           export SCRIPTURA_HOME="$CI_ROOT/validation/scriptura-home"
           export NO_PROXY=127.0.0.1,localhost,::1
+          # ディスクの空きを前後で記録する（容量不足の再発を見分けるため）。
+          df -h / "$CI_ROOT" || true
           cargo test --locked --features test-support -- --test-threads=1
+          df -h / "$CI_ROOT" || true
 
       - name: Build the test executable and pack 9.0.0 / 9.0.1
         run: |
