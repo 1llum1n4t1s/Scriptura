@@ -19,6 +19,16 @@ fn exe(name: &str) -> String {
     format!("{name}{}", env::consts::EXE_SUFFIX)
 }
 
+/// 監視の開始時刻（`started_at`）が属する秒が終わるまで待つ。
+/// reflog の時刻は秒精度（切り捨て）で、開始時刻は小数秒。待たないと、監視開始と同じ秒に行った
+/// テスト内の push が「開始前の push」と判定されて見送られる。Windows では git が遅くて表に出ないが、
+/// 速い Linux ランナーでは起きる。製品の判定は変えず、テストの順序だけを確定させる。
+fn settle_after_monitor_start() {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let rest = 1_000_000_000 - u128::from(now.subsec_nanos());
+    std::thread::sleep(Duration::from_nanos(rest as u64) + Duration::from_millis(20));
+}
+
 /// PATH から本物の git を探す（`where.exe` や `which` に頼らず、Windows・Linux で同じ手順にする）。
 /// フィクスチャが PATH へスタブを足す前に呼ぶこと。
 fn find_real_git() -> String {
@@ -84,7 +94,7 @@ fn wait_process_exit(pid: &str, millis: u64) -> bool {
 fn uncertain_commit_or_push_from_stop_is_never_automatically_repeated() {
     for operation in ["commit", "push"] {
         let f = Fixture::new();
-        handle_hook(&json!({"hook_event_name":"UserPromptSubmit","cwd":f.root})).unwrap();
+        f.hook("UserPromptSubmit");
         fs::write(f.root.join("source.txt"), "new push").unwrap();
         f.git(&["add", "source.txt"]);
         f.git(&["commit", "-m", "new"]);
@@ -223,7 +233,7 @@ fn null_stdio_with_inherited_windows_handles_still_has_deadline() {
 #[test]
 fn logical_parent_cwd_is_rejected_before_worker() {
     let f = Fixture::new();
-    handle_hook(&json!({"hook_event_name":"UserPromptSubmit","cwd":f.root})).unwrap();
+    f.hook("UserPromptSubmit");
     fs::create_dir(f.root.join("child")).unwrap();
     fs::write(f.root.join("source.txt"), "new").unwrap();
     f.git(&["add", "source.txt"]);
@@ -294,7 +304,7 @@ fn tree_case_sensitive_chain_cannot_be_hidden_by_other_case_override() {
 #[test]
 fn fetch_without_push_does_not_trigger_worker() {
     let f = Fixture::new();
-    handle_hook(&json!({"hook_event_name":"UserPromptSubmit","cwd":f.root})).unwrap();
+    f.hook("UserPromptSubmit");
     f.git(&["fetch", "origin"]);
     assert_eq!(
         handle_hook(&json!({"hook_event_name":"Stop","cwd":f.root})).unwrap(),
@@ -443,7 +453,11 @@ impl Fixture {
         self.git(&["push"]);
     }
     fn hook(&self, event: &str) -> Option<String> {
-        handle_hook(&json!({"hook_event_name":event,"cwd":self.root})).unwrap()
+        let result = handle_hook(&json!({"hook_event_name":event,"cwd":self.root})).unwrap();
+        if event == "UserPromptSubmit" {
+            settle_after_monitor_start();
+        }
+        result
     }
     /// poll_cursors の (fingerprint, pushed_commit)。DB が無ければ None（作成しない）。
     fn cursor(&self) -> Option<(String, String)> {
@@ -988,10 +1002,7 @@ fn existing_python_db_schema_is_migrated() {
 #[test]
 fn hook_initialization_and_stop_process_local_push() {
     let f = Fixture::new();
-    assert_eq!(
-        handle_hook(&json!({"hook_event_name":"UserPromptSubmit","cwd":f.root})).unwrap(),
-        None
-    );
+    assert_eq!(f.hook("UserPromptSubmit"), None);
     fs::write(f.root.join("source.txt"), "new change").unwrap();
     f.git(&["add", "source.txt"]);
     f.git(&["commit", "-m", "new pushed source"]);
@@ -1095,7 +1106,7 @@ fn commit_failure_recovers_owned_index() {
 #[test]
 fn push_failure_retains_commit_and_poll_retries_without_worker() {
     let f = Fixture::new();
-    handle_hook(&json!({"hook_event_name":"UserPromptSubmit","cwd":f.root})).unwrap();
+    f.hook("UserPromptSubmit");
     fs::write(f.root.join("source.txt"), "new").unwrap();
     f.git(&["add", "source.txt"]);
     f.git(&["commit", "-m", "new"]);
@@ -1139,7 +1150,7 @@ fn changed_index_blocks_staged_recovery() {
 #[test]
 fn unpushed_head_and_worktree_changes_do_not_run_worker() {
     let f = Fixture::new();
-    handle_hook(&json!({"hook_event_name":"UserPromptSubmit","cwd":f.root})).unwrap();
+    f.hook("UserPromptSubmit");
     fs::write(f.root.join("source.txt"), "new").unwrap();
     assert_eq!(
         handle_hook(&json!({"hook_event_name":"Stop","cwd":f.root})).unwrap(),
@@ -1156,12 +1167,12 @@ fn unpushed_head_and_worktree_changes_do_not_run_worker() {
 #[test]
 fn stopped_prompt_does_not_consume_prior_turn_push() {
     let f = Fixture::new();
-    handle_hook(&json!({"hook_event_name":"UserPromptSubmit","cwd":f.root})).unwrap();
+    f.hook("UserPromptSubmit");
     fs::write(f.root.join("source.txt"), "after turn").unwrap();
     f.git(&["add", "source.txt"]);
     f.git(&["commit", "-m", "after turn"]);
     f.git(&["push"]);
-    handle_hook(&json!({"hook_event_name":"UserPromptSubmit","cwd":f.root})).unwrap();
+    f.hook("UserPromptSubmit");
     assert!(!f.base.join("prompt.json").exists());
     assert_eq!(
         handle_hook(&json!({"hook_event_name":"Stop","cwd":f.root})).unwrap(),
@@ -1208,7 +1219,7 @@ fn clean_filter_expansion_is_retained_without_push() {
 #[test]
 fn completed_recovery_records_warnings_and_preserves_later_push() {
     let f = Fixture::new();
-    handle_hook(&json!({"hook_event_name":"UserPromptSubmit","cwd":f.root})).unwrap();
+    f.hook("UserPromptSubmit");
     fs::write(f.root.join("source.txt"), "new").unwrap();
     f.git(&["add", "source.txt"]);
     f.git(&["commit", "-m", "new"]);
@@ -1325,7 +1336,7 @@ fn parent_death_closes_worker_job() {
 #[test]
 fn first_push_on_new_branch_after_monitor_start_is_processed() {
     let f = Fixture::new();
-    handle_hook(&json!({"hook_event_name":"UserPromptSubmit","cwd":f.root})).unwrap();
+    f.hook("UserPromptSubmit");
     // Reflog timestamps have second precision; make the monitor-before-push ordering explicit.
     open_state_db()
         .unwrap()
@@ -1413,7 +1424,7 @@ fn committed_agents_symlink_is_fail_closed() {
 #[test]
 fn unchanged_turn_and_noop_push_do_not_continue() {
     let f = Fixture::new();
-    handle_hook(&json!({"hook_event_name":"UserPromptSubmit","cwd":f.root})).unwrap();
+    f.hook("UserPromptSubmit");
     for _ in 0..2 {
         handle_hook(&json!({"hook_event_name":"Stop","cwd":f.root})).unwrap();
     }
