@@ -1802,9 +1802,14 @@ fn restricted_worker_argument_contract_and_settings() {
         },
         kinds: Vec::new(),
     };
+    // ANTHROPIC_BASE_URL は、Claude デスクトップから起動されたとき（CLAUDE_CODE_ENTRYPOINT がある）だけ
+    // 親セッション由来として取り除く仕様（src/maintenance.rs の scrub_host_env）。利用者が自分で設定した
+    // ANTHROPIC_BASE_URL は残すため。テストの結果が実行する環境（手元の Claude Code セッションか、
+    // CI のランナーか）に左右されないよう、デスクトップ起動の状態をここで明示的に作る。
     let keys = [
         "CLAUDECODE",
         "CLAUDE_CODE_SIMPLE",
+        "CLAUDE_CODE_ENTRYPOINT",
         "ANTHROPIC_BASE_URL",
         "CLAUDE_CODE_OAUTH_TOKEN",
     ];
