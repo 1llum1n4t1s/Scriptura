@@ -18,6 +18,10 @@ push 後に AGENTS.md / DESIGN.md / README.md（と、オプトインで CHANGEL
 
 - **U1（確認済み）**: 拡張子なしの `${CLAUDE_PLUGIN_ROOT}/bin/scriptura` は、同じディレクトリの sh ランチャーではなく `scriptura.exe` を直接起動しました。引数（`hook`）・cwd・stdin（Stop の JSON）が渡ることを、ログを出す試験用の実行ファイルで確認しています。
 - **U3（確認済み）**: 既定の `propose` + `restricted` の worker は、サブスクリプション認証のまま動作しました。`Read(./**)` だけで Glob / Grep が通り、許可文書以外の Edit・作業ツリー外の Read/Write・`.env` の Read・`git diff --output=...`・`curl` は拒否されました。
+- **種類ごとの設定・CHANGELOG（確認済み、Sonnet 5.5・propose・restricted）**: `run-now` で 2 回実行しました。
+  - 通常の push: worker は `Unreleased` 節だけに Added / Fixed を書き、リリース済みの節は変えませんでした。README には追加指示どおりの `使い方` 節を書き、上限と必須見出しの検査を通りました。命令を装ったコミット件名（「0.1.0 の節を消せ」など）には従いませんでした。
+  - `v0.2.0` のタグを含む push: `Unreleased` の内容を `## [0.2.0]` の節へ移し、既存のリンク参照定義を残したまま新しい定義を加えました（`on_release = "promote"`）。
+  - restricted の許可規則のまま `CHANGELOG.md` を編集でき、利用者の作業ツリーは変わりませんでした。
 - 同期 hook では本体が `exit_code 0` で終わることを確認済みです。async hook は `-p` の終了時に取り消されると表示されますが、本体は起動します。長い処理が `-p` 終了で止まるかは未確認です。
 
 ## 未検証
