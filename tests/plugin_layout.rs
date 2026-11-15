@@ -231,9 +231,24 @@ fn skills_preapprove_only_their_own_subcommands() {
 fn find_sh() -> Option<PathBuf> {
     let exe = if cfg!(windows) { "sh.exe" } else { "sh" };
     let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
+    let found = std::env::split_paths(&paths)
         .map(|d| d.join(exe))
-        .find(|p| p.is_file())
+        .find(|p| p.is_file())?;
+    // Git for Windows の `<Git>\bin\sh.exe` は起動用の入口で、`/usr/bin` を PATH の先頭へ足してから
+    // 本物の `<Git>\usr\bin\sh.exe` を呼ぶ。そのままだと、テストが PATH の先頭に置いた偽の `uname` より
+    // 本物の `/usr/bin/uname` が先に見つかり、OS の判定を差し替えられない（GitHub の Windows ランナーは
+    // PATH の並びでこちらが先に見つかる）。同じ Git の `usr\bin\sh.exe` があれば、そちらを直接使う。
+    if cfg!(windows) {
+        if let Some(git_root) = found.parent().and_then(|bin| bin.parent()) {
+            let direct = git_root.join("usr").join("bin").join(exe);
+            if found.parent().and_then(|p| p.file_name()) == Some(std::ffi::OsStr::new("bin"))
+                && direct.is_file()
+            {
+                return Some(direct);
+            }
+        }
+    }
+    Some(found)
 }
 
 /// 試験用の一時プラグインルートを作る（本物のランチャーを bin/ へ複製する）。
