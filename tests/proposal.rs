@@ -48,13 +48,17 @@ impl Fixture {
         let bin = base.join("bin");
         fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&bin).unwrap();
-        fs::copy(env!("CARGO_BIN_EXE_hook-test-stub"), bin.join("claude.exe")).unwrap();
+        // スタブは file_stem で役割（claude）を決める。Windows は `.exe` 付き、Linux は拡張子なしで置く。
+        fs::copy(
+            env!("CARGO_BIN_EXE_hook-test-stub"),
+            bin.join(format!("claude{}", env::consts::EXE_SUFFIX)),
+        )
+        .unwrap();
         let old_path = env::var_os("PATH").unwrap_or_default();
         unsafe {
-            env::set_var(
-                "PATH",
-                format!("{};{}", bin.display(), old_path.to_string_lossy()),
-            );
+            // PATH の区切り文字は OS で違う（Windows は `;`、Linux は `:`）ので join_paths で組む。
+            let dirs = std::iter::once(bin.clone()).chain(env::split_paths(&old_path));
+            env::set_var("PATH", env::join_paths(dirs).unwrap());
             env::set_var("SCRIPTURA_DB", base.join("state/state.sqlite3"));
             env::set_var("HOOK_STUB_PROMPT", base.join("prompt.json"));
             env::set_var("SCRIPTURA_CONFIG", base.join("config.toml"));

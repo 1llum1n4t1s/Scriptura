@@ -266,6 +266,18 @@ fn temp_plugin_root(tag: &str) -> PathBuf {
     dir
 }
 
+/// 実行ビットを付ける（Unix のみ）。`std::fs::write` で作ったスクリプトは既定で実行不可になり、
+/// ランチャーの `[ -x ... ]` 判定や PATH 上の偽 `uname` の検索に通らない。Windows では不要。
+fn make_executable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 #[test]
 fn launcher_script_selects_a_bundle_for_every_supported_os() {
     // 静的な確認: 対応する OS 名ごとの分岐が書かれていること（Windows の Git Bash を含む）。
@@ -355,6 +367,7 @@ fn launcher_picks_the_bundle_by_uname_and_skips_unsupported_platforms() {
             format!("#!/bin/sh\ncase \"$1\" in -s) echo {os};; -m) echo {cpu};; esac\n"),
         )
         .unwrap();
+        make_executable(&fakes.join("uname"));
         let libexec = dir.join("libexec");
         std::fs::create_dir_all(&libexec).unwrap();
         for t in [
@@ -367,6 +380,7 @@ fn launcher_picks_the_bundle_by_uname_and_skips_unsupported_platforms() {
                 format!("#!/bin/sh\necho picked-{t}\n"),
             )
             .unwrap();
+            make_executable(&libexec.join(format!("scriptura-{t}")));
         }
         let mut path = std::ffi::OsString::from(&fakes);
         path.push(if cfg!(windows) { ";" } else { ":" });
