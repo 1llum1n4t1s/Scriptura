@@ -1,10 +1,10 @@
 {% extends "ui/base.html" %}
 {% block content %}
-<div class="heading"><h1>診断</h1></div>
+<div class="heading"><h1>{{ crate::locale::tr("ui.nav.doctor") }}</h1></div>
 <section class="panel">
-  <p class="notice{% if !ok %} warning{% endif %}">{% if ok %}致命的な問題はありません。{% else %}このままでは動かない項目があります（fail）。{% endif %}</p>
+  <p class="notice{% if !ok %} warning{% endif %}">{% if ok %}{{ crate::locale::tr("ui.doctor.ok") }}{% else %}{{ crate::locale::tr("ui.doctor.failed") }}{% endif %}</p>
   <div class="table-wrap"><table>
-    <thead><tr><th>項目</th><th>結果</th><th>内容</th></tr></thead>
+    <thead><tr><th>{{ crate::locale::tr("ui.doctor.item") }}</th><th>{{ crate::locale::tr("ui.doctor.result") }}</th><th>{{ crate::locale::tr("ui.doctor.detail") }}</th></tr></thead>
     <tbody>{% for i in items %}<tr><td><code>{{ i.id }}</code></td><td><span class="badge status-{{ i.status }}">{{ i.status }}</span></td><td>{{ i.detail }}</td></tr>{% endfor %}</tbody>
   </table></div>
 </section>

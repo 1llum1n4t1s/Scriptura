@@ -1,19 +1,21 @@
 ---
 name: ui
-description: Scriptura の管理画面（設定・文書の種類・更新案・変更履歴・診断）をブラウザーで開く。Open the Scriptura settings UI in the browser.
+description: Open the Scriptura management UI (settings, document kinds, proposals, history, diagnostics) in the browser. Open the Scriptura settings UI in the browser.
 allowed-tools: Bash(scriptura ui *)
 disable-model-invocation: true
 ---
 
 # Scriptura ui
 
-利用者が明示して呼んだときだけ使います。管理画面は設定を変えられる画面なので、自動では起動しません。
+Use this only when the user explicitly invokes it. The management UI can change settings, so it is never started automatically.
 
-`scriptura ui --port 7468` を **バックグラウンドで** 実行します（このコマンドは画面を閉じるまで終わりません。Bash ツールの `run_in_background` を使い、完了を待たないでください）。起動すると標準出力の 1 行目に `http://127.0.0.1:<port>/auth?key=…` の URL が出て、既定のブラウザーが開きます。
+Run `scriptura ui --port 7468` **in the background** (this command does not finish until the UI is closed; use the Bash tool's `run_in_background` and do not wait for it to complete). Once started, the first line of standard output shows a URL of the form `http://127.0.0.1:<port>/auth?key=...` and the default browser opens.
 
-- ブラウザーが開かなかったときは、出力の URL を開くよう案内します。URL は一度だけ使える鍵を含むので、会話の外へ転記・共有しないよう伝えます（この会話で URL を繰り返し表示しません）。
-- ポートが使用中で終了したときは、すでに別の管理画面が起動している可能性を伝え、`--port 0`（空いているポート）での再実行を提案します。
-- `管理画面が含まれていない` と出たときは、`ui` 機能を含まないビルドであることを伝えます。
-- 画面は「終了」ボタン・Ctrl+C・60 分の無操作で終わります。
+- If the browser did not open, tell the user to open the URL from the output. The URL contains a one-time key, so tell them not to copy or share it outside the conversation (do not repeat the URL in this conversation).
+- If the command exited because the port is in use, tell the user another management UI may already be running, and suggest running again with `--port 0` (any free port).
+- If the command reports that the management UI is not included (the CLI's own message, whatever the language), tell the user the build does not include the `ui` feature.
+- The UI ends with the "quit" button, Ctrl+C, or 60 minutes of inactivity.
 
-設定の変更は画面の中で利用者自身が行います。スキルから設定を変えたり、画面の操作を代行したりしません。
+The user changes settings themselves inside the UI. Do not change settings from the skill or operate the UI on the user's behalf.
+
+Reply in the language the user is writing in.

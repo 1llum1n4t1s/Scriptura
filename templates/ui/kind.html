@@ -1,80 +1,80 @@
 {% extends "ui/base.html" %}
 {% block content %}
-<a class="back" href="/kinds">← 文書の種類</a>
-<div class="heading"><h1>{% if form.is_new %}カスタム種類を追加{% else %}{{ form.name }}{% if !form.builtin %} <span class="tag">カスタム</span>{% endif %}{% endif %}</h1></div>
+<a class="back" href="/kinds">← {{ crate::locale::tr("ui.nav.kinds") }}</a>
+<div class="heading"><h1>{% if form.is_new %}{{ crate::locale::tr("ui.kind.add_custom") }}{% else %}{{ form.name }}{% if !form.builtin %} <span class="tag">{{ crate::locale::tr("cli.docs.custom") }}</span>{% endif %}{% endif %}</h1></div>
 {% if !resolved.is_empty() %}
 <section class="panel">
-  <h2>実効値（組み込みの既定に設定を重ねた結果）</h2>
+  <h2>{{ crate::locale::tr("ui.kind.effective") }}</h2>
   <dl class="facts">{% for f in resolved %}<dt>{{ f.name }}</dt><dd>{{ f.value }}</dd>{% endfor %}</dl>
 </section>
 {% endif %}
 <section class="panel">
-  <h2>設定（空欄・「既定」は組み込みの既定に従います）</h2>
+  <h2>{{ crate::locale::tr("ui.kind.settings") }}</h2>
   <form method="post" action="{% if form.is_new %}/kinds/new{% else %}/kinds/{{ form.id }}{% endif %}" class="stack">
     <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}">
-    {% if form.is_new %}<label>id（英小文字で始まる英小文字・数字・ハイフン、32 文字まで）<input name="id" required pattern="[a-z][a-z0-9\-]{0,31}" placeholder="architecture"></label>{% endif %}
+    {% if form.is_new %}<label>{{ crate::locale::tr("ui.kind.id") }}<input name="id" required pattern="[a-z][a-z0-9\-]{0,31}" placeholder="architecture"></label>{% endif %}
     {% if !form.builtin %}
-    <label>何を書く文書か（guidance。必須・{{ guidance_max }} 字以内）<textarea name="guidance" rows="3" data-max="{{ guidance_max }}">{{ form.guidance }}</textarea><span class="counter" data-for="guidance"></span></label>
-    <label>対象パス（1 行に 1 つ。リポジトリルートからの相対パス、1〜10 件。md / markdown / mdx / txt / rst / adoc）<textarea name="paths" rows="3">{{ form.paths }}</textarea></label>
+    <label>{{ crate::locale::tr1("ui.kind.guidance", "max", guidance_max) }}<textarea name="guidance" rows="3" data-max="{{ guidance_max }}">{{ form.guidance }}</textarea><span class="counter" data-for="guidance"></span></label>
+    <label>{{ crate::locale::tr("ui.kind.paths") }}<textarea name="paths" rows="3">{{ form.paths }}</textarea></label>
     {% endif %}
-    <label>対象が無いとき<select name="create_if_missing">{% for c in form.create_if_missing %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+    <label>{{ crate::locale::tr("ui.kind.when_missing") }}<select name="create_if_missing">{% for c in form.create_if_missing %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
     <div class="row">
-      <label>テンプレート<select name="template">{% for c in form.template %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
-      <label>テンプレートのファイル名（templates/ からの相対パス）<input name="template_file" value="{{ form.template_file }}" placeholder="architecture.md"></label>
+      <label>{{ crate::locale::tr("ui.kind.summary_template") }}<select name="template">{% for c in form.template %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+      <label>{{ crate::locale::tr("ui.kind.template_file_label") }}<input name="template_file" value="{{ form.template_file }}" placeholder="architecture.md"></label>
     </div>
     <div class="row">
-      <label>最大文字数<input name="max_chars" inputmode="numeric" value="{{ form.max_chars }}"></label>
-      <label>最大バイト数<input name="max_bytes" inputmode="numeric" value="{{ form.max_bytes }}"></label>
-      <label>言語（ja・en-US など。空なら既存文書に従う）<input name="language" value="{{ form.language }}"></label>
+      <label>{{ crate::locale::tr("ui.kind.max_chars") }}<input name="max_chars" inputmode="numeric" value="{{ form.max_chars }}"></label>
+      <label>{{ crate::locale::tr("ui.kind.max_bytes") }}<input name="max_bytes" inputmode="numeric" value="{{ form.max_bytes }}"></label>
+      <label>{{ crate::locale::tr("ui.kind.language") }}<input name="language" value="{{ form.language }}"></label>
     </div>
-    <label>追加の編集指示（{{ instructions_max }} 字以内。利用者本人の設定としてプロンプト末尾の枠に入ります）<textarea name="instructions" rows="4" data-max="{{ instructions_max }}">{{ form.instructions }}</textarea><span class="counter" data-for="instructions"></span></label>
-    <label>必須の見出し（1 行に 1 つ。20 件以内。保守後に存在を検査します）<textarea name="required_headings" rows="3">{{ form.required_headings }}</textarea></label>
-    <fieldset class="choices"><legend>タイミング</legend>
+    <label>{{ crate::locale::tr1("ui.kind.instructions", "max", instructions_max) }}<textarea name="instructions" rows="4" data-max="{{ instructions_max }}">{{ form.instructions }}</textarea><span class="counter" data-for="instructions"></span></label>
+    <label>{{ crate::locale::tr("ui.kind.required_headings") }}<textarea name="required_headings" rows="3">{{ form.required_headings }}</textarea></label>
+    <fieldset class="choices"><legend>{{ crate::locale::tr("ui.kind.summary_timing") }}</legend>
       <div class="row">
-        <label>いつ<select name="timing_when">{% for c in form.timing_when %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
-        <label>最小間隔（時間、0〜720。間隔が過ぎた後の次の push で実行）<input name="timing_min_interval" inputmode="numeric" value="{{ form.timing_min_interval }}"></label>
+        <label>{{ crate::locale::tr("ui.kind.when") }}<select name="timing_when">{% for c in form.timing_when %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+        <label>{{ crate::locale::tr("ui.kind.min_interval_label") }}<input name="timing_min_interval" inputmode="numeric" value="{{ form.timing_min_interval }}"></label>
       </div>
-      <label>変更パスの条件（glob を 1 行に 1 つ。空なら条件なし）<textarea name="timing_paths" rows="2">{{ form.timing_paths }}</textarea></label>
+      <label>{{ crate::locale::tr("ui.kind.timing_paths") }}<textarea name="timing_paths" rows="2">{{ form.timing_paths }}</textarea></label>
     </fieldset>
     {% if form.is_changelog %}
     <fieldset class="choices"><legend>CHANGELOG</legend>
       <div class="row">
-        <label>形式<select name="cl_format">{% for c in form.cl_format %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
-        <label>リリースとみなすタグ（glob。既定 v*）<input name="cl_release_tag" value="{{ form.cl_release_tag }}"></label>
+        <label>{{ crate::locale::tr("ui.kind.cl_format") }}<select name="cl_format">{% for c in form.cl_format %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+        <label>{{ crate::locale::tr("ui.kind.cl_release_tag") }}<input name="cl_release_tag" value="{{ form.cl_release_tag }}"></label>
       </div>
       <div class="row">
-        <label>リリース時<select name="cl_on_release">{% for c in form.cl_on_release %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
-        <label>新規作成時の遡り<select name="cl_backfill">{% for c in form.cl_backfill %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+        <label>{{ crate::locale::tr("ui.kind.cl_on_release") }}<select name="cl_on_release">{% for c in form.cl_on_release %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+        <label>{{ crate::locale::tr("ui.kind.cl_backfill") }}<select name="cl_backfill">{% for c in form.cl_backfill %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
       </div>
       <div class="row">
-        <label>遡るリリース数（1〜50）<input name="cl_backfill_max_releases" inputmode="numeric" value="{{ form.cl_backfill_max_releases }}"></label>
-        <label>遡るコミット数（1〜1000）<input name="cl_backfill_max_commits" inputmode="numeric" value="{{ form.cl_backfill_max_commits }}"></label>
+        <label>{{ crate::locale::tr("ui.kind.cl_backfill_releases") }}<input name="cl_backfill_max_releases" inputmode="numeric" value="{{ form.cl_backfill_max_releases }}"></label>
+        <label>{{ crate::locale::tr("ui.kind.cl_backfill_commits") }}<input name="cl_backfill_max_commits" inputmode="numeric" value="{{ form.cl_backfill_max_commits }}"></label>
       </div>
     </fieldset>
     {% endif %}
-    <div class="actions"><button class="primary" type="submit">{% if form.is_new %}追加する{% else %}保存する{% endif %}</button></div>
+    <div class="actions"><button class="primary" type="submit">{% if form.is_new %}{{ crate::locale::tr("ui.common.add") }}{% else %}{{ crate::locale::tr("ui.common.save") }}{% endif %}</button></div>
   </form>
 </section>
 {% if let Some(t) = editor %}
 <section class="panel">
-  <h2>テンプレートの内容（templates/{{ t.name }}）</h2>
-  <p class="note"><code>{{ t.path }}</code>{% if !t.exists %}（まだありません。保存すると作成します）{% endif %}。{{ template_max }} バイト以内、改行・タブ以外の制御文字と <code>&lt;&lt;&lt;</code> は使えません。</p>
+  <h2>{{ crate::locale::tr1("ui.kind.template_content", "name", t.name) }}</h2>
+  <p class="note"><code>{{ t.path }}</code>{% if !t.exists %}{{ crate::locale::tr("ui.kind.template_not_yet") }}{% endif %} {{ crate::locale::tr1("ui.kind.template_rules", "max", template_max) }} <code>&lt;&lt;&lt;</code></p>
   {% if !t.problem.is_empty() %}<p class="notice warning">{{ t.problem }}</p>{% else %}
   <form method="post" action="/templates/save" class="stack">
     <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="kind" value="{{ form.id }}"><input type="hidden" name="name" value="{{ t.name }}">
     <textarea class="code-editor" name="content" rows="16" data-max-bytes="{{ template_max }}">{{ t.content }}</textarea><span class="counter" data-for="content"></span>
-    <div class="actions"><button type="submit">テンプレートを保存</button></div>
+    <div class="actions"><button type="submit">{{ crate::locale::tr("ui.kind.template_save") }}</button></div>
   </form>
   {% endif %}
 </section>
 {% endif %}
 {% if !form.is_new && !form.builtin %}
 <section class="panel">
-  <h2>削除</h2>
+  <h2>{{ crate::locale::tr("ui.kind.delete_heading") }}</h2>
   <form method="post" action="/kinds/{{ form.id }}/delete">
     <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}">
-    <p class="note">対象の文書に挙げているリポジトリや既定があると削除できません（先に外してください）。</p>
-    <button class="destructive" type="submit">この種類を削除する</button>
+    <p class="note">{{ crate::locale::tr("ui.kind.delete_note") }}</p>
+    <button class="destructive" type="submit">{{ crate::locale::tr("ui.kind.delete") }}</button>
   </form>
 </section>
 {% endif %}

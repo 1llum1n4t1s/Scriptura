@@ -1,27 +1,27 @@
 {% extends "ui/base.html" %}
 {% block content %}
-<a class="back" href="/proposals">← 更新案</a>
-<div class="heading"><h1>更新案 <code>{{ row.short }}</code></h1></div>
+<a class="back" href="/proposals">← {{ crate::locale::tr("ui.nav.proposals") }}</a>
+<div class="heading"><h1>{{ crate::locale::tr("ui.proposal.heading") }} <code>{{ row.short }}</code></h1></div>
 <section class="panel">
   <dl class="facts">
-    <dt>リポジトリ</dt><dd><code>{{ row.root }}</code></dd>
-    <dt>コミット</dt><dd><code>{{ row.sha }}</code></dd>
-    <dt>作成</dt><dd>{{ row.created_at }}</dd>
-    <dt>文書</dt><dd>{{ row.documents }}</dd>
-    <dt>変更量</dt><dd><pre class="diffstat">{{ row.diffstat }}</pre></dd>
-    <dt>状態</dt><dd>{% if row.applied %}適用済み{% else %}未適用{% endif %}</dd>
+    <dt>{{ crate::locale::tr("ui.common.repository") }}</dt><dd><code>{{ row.root }}</code></dd>
+    <dt>{{ crate::locale::tr("ui.proposal.commit") }}</dt><dd><code>{{ row.sha }}</code></dd>
+    <dt>{{ crate::locale::tr("ui.proposal.created") }}</dt><dd>{{ row.created_at }}</dd>
+    <dt>{{ crate::locale::tr("ui.proposal.documents") }}</dt><dd>{{ row.documents }}</dd>
+    <dt>{{ crate::locale::tr("ui.proposal.diffstat") }}</dt><dd><pre class="diffstat">{{ row.diffstat }}</pre></dd>
+    <dt>{{ crate::locale::tr("ui.proposal.state") }}</dt><dd>{% if row.applied %}{{ crate::locale::tr("ui.proposal.applied") }}{% else %}{{ crate::locale::tr("ui.proposal.pending") }}{% endif %}</dd>
   </dl>
   <div class="actions wrap">
     {% if !row.applied %}
-    <form method="post" action="/proposals/apply"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ row.root }}"><input type="hidden" name="sha" value="{{ row.sha }}"><button class="primary" type="submit">作業ツリーへ適用する</button></form>
+    <form method="post" action="/proposals/apply"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ row.root }}"><input type="hidden" name="sha" value="{{ row.sha }}"><button class="primary" type="submit">{{ crate::locale::tr("ui.proposal.apply") }}</button></form>
     {% endif %}
-    <form method="post" action="/proposals/discard"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ row.root }}"><input type="hidden" name="sha" value="{{ row.sha }}"><button class="destructive" type="submit">破棄する</button></form>
+    <form method="post" action="/proposals/discard"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ row.root }}"><input type="hidden" name="sha" value="{{ row.sha }}"><button class="destructive" type="submit">{{ crate::locale::tr("ui.proposal.discard") }}</button></form>
   </div>
-  <p class="note">適用は stage・commit をしません。差分を確認してから自分で commit してください。</p>
+  <p class="note">{{ crate::locale::tr("ui.proposal.note") }}</p>
 </section>
 <section class="panel">
-  <h2>差分</h2>
-  {% if truncated %}<p class="notice warning">大きいため先頭の一部だけを表示しています。</p>{% endif %}
+  <h2>{{ crate::locale::tr("ui.proposal.diff") }}</h2>
+  {% if truncated %}<p class="notice warning">{{ crate::locale::tr("ui.proposal.truncated") }}</p>{% endif %}
   <pre class="diff">{% for l in lines %}<span class="{{ l.class }}">{{ l.text }}</span>
 {% endfor %}</pre>
 </section>

@@ -43,10 +43,27 @@ use crate::{
 
 /// 同意文（CLI の同意の説明と同じ内容。送信データと費用を明示する）。
 pub(crate) fn consent_text() -> String {
-    "Scriptura は push 後に Claude Code CLI の worker（Sonnet）を起動して文書を保守します。\
-worker が読んだリポジトリの内容は、あなた自身の Claude 認証で Anthropic へ送信され、\
-実行ごとに Claude の利用料金（使用量）が発生します。"
-        .to_string()
+    crate::t!("ui.consent.text").to_string()
+}
+
+/// 同意の出所の表示名。
+fn consent_source(source: ConsentSource) -> &'static str {
+    match source {
+        ConsentSource::Cli => "CLI",
+        ConsentSource::Ui => crate::t!("ui.consent.source_ui"),
+        ConsentSource::LegacyMigration => crate::t!("ui.consent.source_legacy"),
+    }
+}
+
+/// 表示言語を引き継いで spawn_blocking する（task-local の言語はブロッキングスレッドへ渡らないため、
+/// 呼び出し時点の言語を `locale::scoped` で明示する）。ops・エンジン由来の文言も画面と同じ言語になる。
+fn blocking<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let language = crate::locale::current();
+    tokio::task::spawn_blocking(move || crate::locale::scoped(language, f))
 }
 
 #[derive(Deserialize, Default)]
@@ -107,7 +124,10 @@ fn html<T: Template>(page: T) -> Response {
         Ok(body) => Html(body).into_response(),
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            views::bare_page("表示できません", "画面の描画に失敗しました。"),
+            views::bare_page(
+                crate::t!("ui.error.render_title"),
+                crate::t!("ui.error.render"),
+            ),
         )
             .into_response(),
     }
@@ -120,7 +140,7 @@ fn error_page(
     back: impl Into<String>,
 ) -> Response {
     let page = ErrorPage {
-        layout: layout(state, "エラー", "", None, None),
+        layout: layout(state, crate::t!("ui.title.error"), "", None, None),
         status: status.as_u16(),
         message: message.into(),
         back: back.into(),
@@ -139,10 +159,7 @@ fn update_error(state: &AppState, e: UpdateError, back: &str) -> Response {
         UpdateError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     let message = match &e {
-        UpdateError::Conflict { .. } => {
-            "設定ファイルが他で変更されたため保存しませんでした。画面を読み込み直してから、もう一度操作してください。"
-                .to_string()
-        }
+        UpdateError::Conflict { .. } => crate::t!("ui.error.conflict").to_string(),
         // Display は先頭行だけを使う（設定ファイルの内容を写さない）。
         other => views::redact(&other.to_string()),
     };
@@ -154,16 +171,16 @@ fn internal(state: &AppState, back: &str) -> Response {
     error_page(
         state,
         StatusCode::INTERNAL_SERVER_ERROR,
-        "処理中に予期しない失敗が起きました。",
+        crate::t!("ui.error.internal"),
         back,
     )
 }
 
 fn mode_label(mode: Mode) -> &'static str {
     match mode {
-        Mode::Off => "off（停止）",
-        Mode::Propose => "propose（更新案を作る）",
-        Mode::Push => "push（自動で commit・push）",
+        Mode::Off => crate::t!("ui.mode.off"),
+        Mode::Propose => crate::t!("ui.mode.propose"),
+        Mode::Push => crate::t!("ui.mode.push"),
     }
 }
 
@@ -216,7 +233,7 @@ fn document_choices(config: &Config, selected: &[Document]) -> Vec<Choice> {
             let label = if d.is_builtin() {
                 d.name().to_string()
             } else {
-                format!("{}（カスタム）", d.name())
+                crate::t!("ui.document.custom", name = d.name())
             };
             Choice::new(d.name(), label, selected.contains(&d))
         })
@@ -260,7 +277,7 @@ fn repo_row(config: &Config, index: usize, repo: &Repository, with_proposals: bo
             "{}{}",
             mode_label(mode),
             if repo.mode.is_none() {
-                "・既定に従う"
+                crate::t!("ui.mode.follows_default_suffix")
             } else {
                 ""
             }
@@ -273,7 +290,7 @@ fn repo_row(config: &Config, index: usize, repo: &Repository, with_proposals: bo
                 .unwrap_or(&config.defaults.documents),
         ),
         branches: if repo.branches.is_empty() {
-            "制限なし".into()
+            crate::t!("cli.branches.any").into()
         } else {
             repo.branches.join(", ")
         },
@@ -316,7 +333,7 @@ where
         return error_page(
             state,
             StatusCode::BAD_REQUEST,
-            "設定の版が送られていません。画面を読み込み直してください。",
+            crate::t!("ui.error.no_revision"),
             back,
         );
     };
@@ -361,7 +378,7 @@ where
         return response;
     }
     let worker = state.clone();
-    match tokio::task::spawn_blocking(move || exec(&worker, &expected)).await {
+    match blocking(move || exec(&worker, &expected)).await {
         Ok(Ok(url)) => Redirect::to(&url).into_response(),
         Ok(Err(e)) => update_error(state, e, back),
         Err(_) => internal(state, back),
@@ -389,13 +406,13 @@ fn gate(
         return Some(error_page(
             state,
             StatusCode::CONFLICT,
-            "確認が無効です（期限の 10 分が過ぎた・内容が変わった・既に使われた、のいずれかです）。もう一度操作してください。",
+            crate::t!("ui.error.nonce"),
             back,
         ));
     }
     let nonce = state.issue_nonce(digest);
     Some(html(ConfirmPage {
-        layout: layout(state, "確認", "", None, None),
+        layout: layout(state, crate::t!("ui.title.confirm"), "", None, None),
         action: action.to_string(),
         dangers: list.to_vec(),
         fields: carried
@@ -431,10 +448,7 @@ pub async fn auth(State(state): State<AppState>, Query(q): Query<AuthQuery>) -> 
     if !accepted {
         return (
             StatusCode::UNAUTHORIZED,
-            views::bare_page(
-                "この URL は使えません",
-                "URL の鍵が違うか、既に使われています。`scriptura ui` を起動し直して、表示された URL を開いてください。",
-            ),
+            views::bare_page(crate::t!("ui.deny.key_title"), crate::t!("ui.deny.key")),
         )
             .into_response();
     }
@@ -469,7 +483,7 @@ pub async fn not_found(State(state): State<AppState>) -> Response {
     error_page(
         &state,
         StatusCode::NOT_FOUND,
-        "ページが見つかりません。",
+        crate::t!("ui.error.not_found"),
         "/",
     )
 }
@@ -478,7 +492,7 @@ pub async fn not_found(State(state): State<AppState>) -> Response {
 pub async fn shutdown(State(state): State<AppState>) -> Response {
     state.shutdown.notify_one();
     html(DonePage {
-        layout: layout(&state, "終了しました", "", None, None),
+        layout: layout(&state, crate::t!("ui.title.done"), "", None, None),
     })
 }
 
@@ -491,12 +505,10 @@ fn warnings(c: &Config) -> Vec<String> {
     let mut out = Vec::new();
     match &c.consent {
         Some(x) if x.version >= CURRENT_CONSENT_VERSION => {}
-        _ => out.push(
-            "同意が記録されていないため、文書保守は動きません（「同意」から記録できます）。".into(),
-        ),
+        _ => out.push(crate::t!("ui.warn.no_consent").into()),
     }
     if c.worker.permission == Permission::Bypass {
-        out.push("worker の権限が bypass です（worker がツールの許可確認なしで動きます）。".into());
+        out.push(crate::t!("ui.warn.bypass").into());
     }
     let push = c
         .repository
@@ -504,32 +516,25 @@ fn warnings(c: &Config) -> Vec<String> {
         .filter(|r| r.mode.unwrap_or(c.defaults.mode) == Mode::Push)
         .count();
     if push > 0 {
-        out.push(format!(
-            "push モードの登録が {push} 件あります（文書の変更を自動で commit・push します）。"
-        ));
+        out.push(crate::t!("ui.warn.push_count", count = push));
     }
     if c.defaults.mode == Mode::Push {
-        out.push("既定のモードが push です。".into());
+        out.push(crate::t!("ui.warn.default_push").into());
     }
     match c.enrollment.policy {
-        Policy::All => {
-            out.push("自動登録の方針が all です（登録していないリポジトリも対象です）。".into())
-        }
-        Policy::RemoteOwner => out.push(
-            "自動登録の方針が remote-owner です（指定 owner のリポジトリが登録なしで対象です）。"
-                .into(),
-        ),
+        Policy::All => out.push(crate::t!("ui.warn.policy_all").into()),
+        Policy::RemoteOwner => out.push(crate::t!("ui.warn.policy_owner").into()),
         Policy::Explicit => {}
     }
     if c.worker.max_budget_usd == 0.0 {
-        out.push("worker の費用上限（max_budget_usd）が未設定です（0 = 上限なし）。".into());
+        out.push(crate::t!("ui.warn.no_budget").into());
     }
     out
 }
 
 pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
     let s = state.clone();
-    let built = tokio::task::spawn_blocking(move || {
+    let built = blocking(move || {
         let cur = current(&s);
         let status = app::status();
         let repos: Vec<RepoRow> = cur
@@ -541,20 +546,16 @@ pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Re
             .collect();
         let pending = repos.iter().map(|r| r.pending).sum();
         let config_state = match (&cur.broken, cur.missing) {
-            (Some(reason), _) => format!("壊れています: {reason}"),
-            (None, true) => "まだありません（有効化すると作られます）".into(),
-            (None, false) => "読み込めます".into(),
+            (Some(reason), _) => crate::t!("ui.overview.config_broken", reason = reason),
+            (None, true) => crate::t!("ui.overview.config_missing").into(),
+            (None, false) => crate::t!("ui.overview.config_ok").into(),
         };
         let consent = cur.config.consent.as_ref().map(|c| {
-            format!(
-                "版 {}・{}・{}",
-                c.version,
-                c.accepted_at,
-                match c.source {
-                    ConsentSource::Cli => "CLI",
-                    ConsentSource::Ui => "管理画面",
-                    ConsentSource::LegacyMigration => "旧版からの移行",
-                }
+            crate::t!(
+                "ui.overview.consent",
+                version = c.version,
+                at = c.accepted_at,
+                source = consent_source(c.source)
             )
         });
         let consent_current = cur
@@ -587,7 +588,13 @@ pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Re
         return internal(&state, "/");
     };
     html(OverviewPage {
-        layout: layout(&state, "概要", "overview", q.msg.as_deref(), broken),
+        layout: layout(
+            &state,
+            crate::t!("ui.nav.overview"),
+            "overview",
+            q.msg.as_deref(),
+            broken,
+        ),
         version: d.version,
         installed: d.installed,
         config_path: d.config_path,
@@ -618,7 +625,7 @@ struct OverviewPageData {
 
 pub async fn repos(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
     let s = state.clone();
-    let Ok((cur, rows)) = tokio::task::spawn_blocking(move || {
+    let Ok((cur, rows)) = blocking(move || {
         let cur = current(&s);
         let rows: Vec<RepoRow> = cur
             .config
@@ -634,7 +641,13 @@ pub async fn repos(State(state): State<AppState>, Query(q): Query<Msg>) -> Respo
         return internal(&state, "/");
     };
     html(ReposPage {
-        layout: layout(&state, "リポジトリ", "repos", q.msg.as_deref(), cur.broken),
+        layout: layout(
+            &state,
+            crate::t!("ui.nav.repos"),
+            "repos",
+            q.msg.as_deref(),
+            cur.broken,
+        ),
         revision: cur.revision.to_string(),
         repos: rows,
         documents: document_choices(&cur.config, &[]),
@@ -650,7 +663,7 @@ pub async fn repo_detail(
     Query(q): Query<Msg>,
 ) -> Response {
     let s = state.clone();
-    let Ok(built) = tokio::task::spawn_blocking(move || {
+    let Ok(built) = blocking(move || {
         let cur = current(&s);
         let repo = cur.config.repository.get(n)?.clone();
         let row = repo_row(&cur.config, n, &repo, true);
@@ -667,20 +680,26 @@ pub async fn repo_detail(
                             .files
                             .iter()
                             .map(|f| match (f.exists, f.chars) {
-                                (true, Some(c)) => format!("{}（{c} 文字）", f.path),
-                                (true, None) => format!("{}（あり）", f.path),
-                                (false, _) => format!("{}（なし）", f.path),
+                                (true, Some(c)) => {
+                                    crate::t!("ui.repo.file_chars", path = f.path, count = c)
+                                }
+                                (true, None) => crate::t!("ui.repo.file_exists", path = f.path),
+                                (false, _) => crate::t!("ui.repo.file_missing", path = f.path),
                             })
                             .collect(),
                         template: match &k.template {
                             ops::TemplateState::None => k.template_spec.clone(),
-                            ops::TemplateState::Builtin => "builtin（組み込み）".into(),
-                            ops::TemplateState::Ok { bytes } => {
-                                format!("{}（{bytes} バイト）", k.template_spec)
-                            }
-                            ops::TemplateState::Error(e) => {
-                                format!("{}（使えません: {e}）", k.template_spec)
-                            }
+                            ops::TemplateState::Builtin => crate::t!("ui.template.builtin").into(),
+                            ops::TemplateState::Ok { bytes } => crate::t!(
+                                "ui.template.bytes",
+                                spec = k.template_spec,
+                                bytes = bytes
+                            ),
+                            ops::TemplateState::Error(e) => crate::t!(
+                                "cli.docs.template_error",
+                                spec = k.template_spec,
+                                error = e
+                            ),
                         },
                         last_done: k
                             .last_done
@@ -692,7 +711,7 @@ pub async fn repo_detail(
                                     &r.last_commit[..r.last_commit.len().min(12)]
                                 )
                             })
-                            .unwrap_or_else(|| "記録なし".into()),
+                            .unwrap_or_else(|| crate::t!("ui.repo.no_record").into()),
                     })
                     .collect(),
                 String::new(),
@@ -734,7 +753,10 @@ pub async fn repo_detail(
                 mode_choices: vec![
                     Choice::new(
                         "default",
-                        format!("既定に従う（{}）", mode_label(cur.config.defaults.mode)),
+                        crate::t!(
+                            "ui.mode.follows_default",
+                            mode = mode_label(cur.config.defaults.mode)
+                        ),
                         repo.mode.is_none(),
                     ),
                     Choice::new(
@@ -766,14 +788,14 @@ pub async fn repo_detail(
         return error_page(
             &state,
             StatusCode::NOT_FOUND,
-            "その番号のリポジトリは登録されていません。",
+            crate::t!("ui.error.repo_index"),
             "/repos",
         );
     };
     html(RepoPage {
         layout: layout(
             &state,
-            "リポジトリの詳細",
+            crate::t!("ui.title.repo"),
             "repos",
             q.msg.as_deref(),
             broken,
@@ -816,7 +838,7 @@ pub async fn repo_enable(
         return error_page(
             &state,
             StatusCode::BAD_REQUEST,
-            "リポジトリのパスを入力してください。",
+            crate::t!("ui.error.repo_path"),
             back,
         );
     };
@@ -824,7 +846,7 @@ pub async fn repo_enable(
         return error_page(
             &state,
             StatusCode::BAD_REQUEST,
-            "モードは propose / push / off のどれかです。",
+            crate::t!("ui.error.mode"),
             back,
         );
     };
@@ -845,19 +867,17 @@ pub async fn repo_enable(
             return error_page(
                 &state,
                 StatusCode::BAD_REQUEST,
-                "有効化には同意が必要です。同意文を読み、チェックを付けてから送信してください。",
+                crate::t!("ui.error.enable_consent"),
                 back,
             );
         }
     }
     let mut extra = Vec::new();
     if mode == Mode::Push {
-        extra.push(format!(
-            "{repo} を push モードで有効化します（文書の変更を自動で commit し、remote へ push します）"
-        ));
+        extra.push(crate::t!("ui.danger.enable_push", repo = repo));
     }
     if needs_consent {
-        extra.push("同意を記録します（worker が読んだリポジトリの内容があなたの Claude 認証で Anthropic へ送信され、実行ごとに利用料金が発生します）".into());
+        extra.push(crate::t!("ui.danger.consent").into());
     }
     let request = ops::EnableRequest {
         repo,
@@ -890,7 +910,7 @@ fn require_repo(state: &AppState, form: &FormData) -> Result<(usize, String), Re
         error_page(
             state,
             StatusCode::NOT_FOUND,
-            "登録されていないリポジトリです。",
+            crate::t!("ui.error.not_registered"),
             "/repos",
         )
     })
@@ -915,7 +935,7 @@ async fn pause_or_resume(state: AppState, form: FormData, paused: bool) -> Respo
         &back,
         Vec::new(),
         |c| {
-            let i = ops::find_repo(c, &target).ok_or("登録されていないリポジトリです")?;
+            let i = ops::find_repo(c, &target).ok_or(crate::t!("ui.error.not_registered_short"))?;
             c.repository[i].paused = paused;
             Ok(())
         },
@@ -964,7 +984,7 @@ pub async fn repo_mode(
             return error_page(
                 &state,
                 StatusCode::BAD_REQUEST,
-                "push モードへはここでは変更できません。「push モードで有効化し直す」から登録し直してください。",
+                crate::t!("ui.error.push_here"),
                 back,
             );
         }
@@ -977,7 +997,7 @@ pub async fn repo_mode(
         &back,
         Vec::new(),
         |c| {
-            let i = ops::find_repo(c, &target).ok_or("登録されていないリポジトリです")?;
+            let i = ops::find_repo(c, &target).ok_or(crate::t!("ui.error.not_registered_short"))?;
             c.repository[i].mode = mode;
             Ok(())
         },
@@ -1010,7 +1030,7 @@ pub async fn repo_documents(
                 return error_page(
                     &state,
                     StatusCode::BAD_REQUEST,
-                    "対象の文書を 1 つ以上選ぶか、「既定に従う」を選んでください。",
+                    crate::t!("ui.error.documents"),
                     back,
                 );
             }
@@ -1019,7 +1039,7 @@ pub async fn repo_documents(
         }
     };
     let change = move |c: &mut Config, root: &str, docs: Option<Vec<Document>>| {
-        let i = ops::find_repo(c, root).ok_or("登録されていないリポジトリです")?;
+        let i = ops::find_repo(c, root).ok_or(crate::t!("ui.error.not_registered_short"))?;
         c.repository[i].documents = docs;
         Ok::<(), String>(())
     };
@@ -1060,7 +1080,7 @@ pub async fn repo_disable(
         &back,
         Vec::new(),
         |c| {
-            let i = ops::find_repo(c, &target).ok_or("登録されていないリポジトリです")?;
+            let i = ops::find_repo(c, &target).ok_or(crate::t!("ui.error.not_registered_short"))?;
             c.repository.remove(i);
             Ok(())
         },
@@ -1108,29 +1128,26 @@ fn run_now_result(index: usize, result: Result<RunNow, String>) -> JobResult {
     match result {
         Ok(RunNow::Created(x)) => JobResult {
             ok: true,
-            message: format!(
-                "更新案を作成しました: {}（{}）",
-                &x.sha[..x.sha.len().min(12)],
-                x.documents.join("、")
+            message: crate::t!(
+                "ui.job.created",
+                sha = &x.sha[..x.sha.len().min(12)],
+                documents = x.documents.join(crate::t!("list.separator"))
             ),
             proposal: Some(format!("/proposals/{index}/{}", x.sha)),
         },
         Ok(RunNow::Unchanged) => JobResult {
             ok: true,
-            message: "更新案は作成されませんでした（文書に変更が無い・同じコミットの更新案が既にある・未 push のコミットがある、のいずれかです）。".into(),
+            message: crate::t!("ui.job.unchanged").into(),
             proposal: None,
         },
         Ok(RunNow::Completed) => JobResult {
             ok: true,
-            message: "保守を実行しました（文書に変更があれば commit と push 済みです）。".into(),
+            message: crate::t!("ui.job.completed").into(),
             proposal: None,
         },
         Ok(RunNow::Rejected { reason }) => JobResult {
             ok: true,
-            message: format!(
-                "保守後の検査に違反したため更新案を作成しませんでした: {}",
-                views::redact(&reason)
-            ),
+            message: crate::t!("ui.job.rejected", reason = views::redact(&reason)),
             proposal: None,
         },
         Err(e) => JobResult {
@@ -1158,9 +1175,7 @@ pub async fn repo_run_now(
             .unwrap_or(cur.config.defaults.mode)
     }) == Some(Mode::Push);
     let extra = if push {
-        vec![format!(
-            "{root} は push モードです。いま保守を実行し、文書に変更があれば commit して remote へ push します"
-        )]
+        vec![crate::t!("ui.danger.run_now_push", repo = root)]
     } else {
         Vec::new()
     };
@@ -1189,7 +1204,7 @@ pub async fn repo_run_now(
                     .any(|j| j.root == root && j.result.is_none())
                 {
                     return Err(UpdateError::Rejected(
-                        "このリポジトリの run-now は実行中です。完了を待ってください。".into(),
+                        crate::t!("ui.error.job_running").into(),
                     ));
                 }
                 jobs.next += 1;
@@ -1214,13 +1229,17 @@ pub async fn repo_run_now(
             };
             let worker = s.clone();
             // spawn_blocking はランタイムの破棄時に完了を待たれる（保守の途中で切らない）。
+            // 結果の文言は、起動した画面の言語で作る（ブロッキングスレッドへ言語を明示して渡す）。
+            let language = crate::locale::current();
             tokio::runtime::Handle::current().spawn_blocking(move || {
-                let result = ops::run_now_for(&worker.store, FsPath::new(&root), None);
-                let done = run_now_result(index, result);
-                let mut jobs = worker.jobs.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(job) = jobs.list.get_mut(&id) {
-                    job.result = Some(done);
-                }
+                crate::locale::scoped(language, || {
+                    let result = ops::run_now_for(&worker.store, FsPath::new(&root), None);
+                    let done = run_now_result(index, result);
+                    let mut jobs = worker.jobs.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(job) = jobs.list.get_mut(&id) {
+                        job.result = Some(done);
+                    }
+                })
             });
             Ok(format!("/jobs/{id}"))
         },
@@ -1252,7 +1271,7 @@ pub async fn job(State(state): State<AppState>, Path(id): Path<u64>) -> Response
         None => error_page(
             &state,
             StatusCode::NOT_FOUND,
-            "そのジョブはありません。",
+            crate::t!("ui.error.job_missing"),
             "/repos",
         ),
     }
@@ -1264,9 +1283,9 @@ pub async fn job(State(state): State<AppState>, Path(id): Path<u64>) -> Response
 
 fn when_label(when: When) -> &'static str {
     match when {
-        When::Push => "push（push のたび）",
-        When::Release => "release（リリースのとき）",
-        When::Manual => "manual（run-now のときだけ）",
+        When::Push => crate::t!("ui.when.push"),
+        When::Release => crate::t!("ui.when.release"),
+        When::Manual => crate::t!("ui.when.manual"),
     }
 }
 
@@ -1281,15 +1300,15 @@ fn template_text(spec: &kinds::TemplateSpec) -> String {
 fn limits_text(k: &kinds::ResolvedKind) -> String {
     let mut out = Vec::new();
     if let Some(n) = k.max_chars {
-        out.push(format!("{n} 文字"));
+        out.push(crate::t!("cli.docs.chars", n = n));
     }
     if let Some(n) = k.max_bytes {
-        out.push(format!("{n} バイト"));
+        out.push(crate::t!("cli.docs.bytes", n = n));
     }
     if out.is_empty() {
-        "なし".into()
+        crate::t!("cli.none").into()
     } else {
-        out.join("・")
+        out.join(" / ")
     }
 }
 
@@ -1310,7 +1329,13 @@ pub async fn kinds(State(state): State<AppState>, Query(q): Query<Msg>) -> Respo
         })
         .collect();
     html(KindsPage {
-        layout: layout(&state, "文書の種類", "kinds", q.msg.as_deref(), cur.broken),
+        layout: layout(
+            &state,
+            crate::t!("ui.nav.kinds"),
+            "kinds",
+            q.msg.as_deref(),
+            cur.broken,
+        ),
         kinds: rows,
     })
 }
@@ -1359,21 +1384,24 @@ fn kind_form(id: &str, s: &KindSettings, is_new: bool) -> KindForm {
         create_if_missing: opt_choices(
             s.create_if_missing
                 .map(|b| if b { "true" } else { "false" }),
-            &[("true", "作成してよい"), ("false", "作成しない")],
+            &[
+                ("true", crate::t!("ui.kind.create_yes")),
+                ("false", crate::t!("ui.kind.create_no")),
+            ],
             if builtin {
-                "既定（作成してよい）"
+                crate::t!("ui.kind.create_default_yes")
             } else {
-                "既定（作成しない）"
+                crate::t!("ui.kind.create_default_no")
             },
         ),
         template: opt_choices(
             template_choice,
             &[
-                ("builtin", "builtin（組み込み。CHANGELOG のみ実体あり）"),
-                ("none", "none（使わない）"),
-                ("file", "設定フォルダーの templates/ のファイル"),
+                ("builtin", crate::t!("ui.kind.template_builtin")),
+                ("none", crate::t!("ui.kind.template_none")),
+                ("file", crate::t!("ui.kind.template_file")),
             ],
-            "既定",
+            crate::t!("ui.kind.default"),
         ),
         template_file: s
             .template
@@ -1397,7 +1425,7 @@ fn kind_form(id: &str, s: &KindSettings, is_new: bool) -> KindForm {
                 ("release", when_label(When::Release)),
                 ("manual", when_label(When::Manual)),
             ],
-            "既定（push）",
+            crate::t!("ui.kind.default_push"),
         ),
         timing_paths: timing.paths.join("\n"),
         timing_min_interval: num_text(timing.min_interval_hours),
@@ -1407,10 +1435,10 @@ fn kind_form(id: &str, s: &KindSettings, is_new: bool) -> KindForm {
                 ChangelogFormat::KeepAChangelog => "keep-a-changelog",
             }),
             &[
-                ("existing", "existing（既存の形式を踏襲）"),
+                ("existing", crate::t!("ui.kind.format_existing")),
                 ("keep-a-changelog", "keep-a-changelog"),
             ],
-            "既定（existing）",
+            crate::t!("ui.kind.default_existing"),
         ),
         cl_release_tag: cl.release_tag.clone().unwrap_or_default(),
         cl_on_release: opt_choices(
@@ -1419,10 +1447,10 @@ fn kind_form(id: &str, s: &KindSettings, is_new: bool) -> KindForm {
                 OnRelease::Ignore => "ignore",
             }),
             &[
-                ("promote", "promote（Unreleased を版の節へ移す）"),
-                ("ignore", "ignore（何もしない）"),
+                ("promote", crate::t!("ui.kind.on_release_promote")),
+                ("ignore", crate::t!("ui.kind.on_release_ignore")),
             ],
-            "既定（promote）",
+            crate::t!("ui.kind.default_promote"),
         ),
         cl_backfill: opt_choices(
             cl.backfill.map(|b| match b {
@@ -1430,10 +1458,10 @@ fn kind_form(id: &str, s: &KindSettings, is_new: bool) -> KindForm {
                 Backfill::Off => "none",
             }),
             &[
-                ("tags", "tags（タグ単位で遡る）"),
-                ("none", "none（遡らない）"),
+                ("tags", crate::t!("ui.kind.backfill_tags")),
+                ("none", crate::t!("ui.kind.backfill_none")),
             ],
-            "既定（tags）",
+            crate::t!("ui.kind.default_tags"),
         ),
         cl_backfill_max_releases: num_text(cl.backfill_max_releases),
         cl_backfill_max_commits: num_text(cl.backfill_max_commits),
@@ -1450,7 +1478,7 @@ fn parse_num<T: std::str::FromStr>(
         Some(v) => v
             .parse::<T>()
             .map(Some)
-            .map_err(|_| format!("{label} は 0 以上の整数です: {v}")),
+            .map_err(|_| crate::t!("ui.kind.number_invalid", label = label, value = v)),
     }
 }
 
@@ -1480,13 +1508,13 @@ fn parse_kind_form(form: &FormData, id: &str) -> Result<KindSettings, String> {
         Some("file") => {
             let name = form
                 .text("template_file")
-                .ok_or("テンプレートのファイル名を入力してください（templates/ からの相対パス）")?;
+                .ok_or(crate::t!("ui.kind.template_file_required"))?;
             Some(format!("{}/{name}", kinds::TEMPLATES_DIR))
         }
         _ => None,
     };
-    s.max_chars = parse_num(form, "max_chars", "最大文字数")?;
-    s.max_bytes = parse_num(form, "max_bytes", "最大バイト数")?;
+    s.max_chars = parse_num(form, "max_chars", crate::t!("ui.kind.max_chars"))?;
+    s.max_bytes = parse_num(form, "max_bytes", crate::t!("ui.kind.max_bytes"))?;
     s.instructions = normalized(form, "instructions");
     s.language = form.text("language");
     s.required_headings = lines_of(form.get("required_headings"));
@@ -1498,7 +1526,11 @@ fn parse_kind_form(form: &FormData, id: &str) -> Result<KindSettings, String> {
             _ => None,
         },
         paths: lines_of(form.get("timing_paths")),
-        min_interval_hours: parse_num(form, "timing_min_interval", "最小間隔")?,
+        min_interval_hours: parse_num(
+            form,
+            "timing_min_interval",
+            crate::t!("ui.kind.min_interval"),
+        )?,
     };
     s.timing = (timing != Timing::default()).then_some(timing);
     if id == "changelog" {
@@ -1519,8 +1551,16 @@ fn parse_kind_form(form: &FormData, id: &str) -> Result<KindSettings, String> {
                 Some("none") => Some(Backfill::Off),
                 _ => None,
             },
-            backfill_max_releases: parse_num(form, "cl_backfill_max_releases", "遡るリリース数")?,
-            backfill_max_commits: parse_num(form, "cl_backfill_max_commits", "遡るコミット数")?,
+            backfill_max_releases: parse_num(
+                form,
+                "cl_backfill_max_releases",
+                crate::t!("ui.kind.backfill_releases"),
+            )?,
+            backfill_max_commits: parse_num(
+                form,
+                "cl_backfill_max_commits",
+                crate::t!("ui.kind.backfill_commits"),
+            )?,
         };
         s.changelog = (cl != ChangelogSettings::default()).then_some(cl);
     }
@@ -1554,16 +1594,20 @@ fn template_editor(store: &Store, spec: Option<&str>) -> Option<TemplateEditor> 
         Ok(meta) if crate::maintenance::linked(&meta) || !meta.is_file() => (
             true,
             String::new(),
-            "リンクや通常でないファイルは編集できません。".to_string(),
+            crate::t!("ui.template.not_regular").to_string(),
         ),
         Ok(meta) if meta.len() > kinds::TEMPLATE_MAX_BYTES * 4 => (
             true,
             String::new(),
-            "大きすぎるため表示しません。".to_string(),
+            crate::t!("ui.template.too_large").to_string(),
         ),
         Ok(_) => match std::fs::read(&path).map(String::from_utf8) {
             Ok(Ok(text)) => (true, text, String::new()),
-            _ => (true, String::new(), "UTF-8 として読めません。".to_string()),
+            _ => (
+                true,
+                String::new(),
+                crate::t!("ui.template.not_utf8").to_string(),
+            ),
         },
         Err(_) => (false, String::new(), String::new()),
     };
@@ -1589,30 +1633,42 @@ fn resolved_summary(config: &Config, id: &str) -> Vec<Field> {
     };
     let mut out = vec![
         f(
-            "新規作成",
+            crate::t!("ui.kind.summary_create"),
             if k.create_if_missing {
-                "する"
+                crate::t!("ui.kind.summary_yes")
             } else {
-                "しない"
+                crate::t!("ui.kind.summary_no")
             }
             .into(),
         ),
-        f("テンプレート", template_text(&k.template)),
-        f("上限", limits_text(&k)),
         f(
-            "言語",
+            crate::t!("ui.kind.summary_template"),
+            template_text(&k.template),
+        ),
+        f(crate::t!("ui.kind.summary_limits"), limits_text(&k)),
+        f(
+            crate::t!("ui.kind.summary_language"),
             k.language
                 .clone()
-                .unwrap_or_else(|| "既存文書に従う".into()),
+                .unwrap_or_else(|| crate::t!("ui.kind.language_existing").into()),
         ),
-        f("タイミング", when_label(k.timing.when).into()),
-        f("最小間隔", format!("{} 時間", k.timing.min_interval_hours)),
+        f(
+            crate::t!("ui.kind.summary_timing"),
+            when_label(k.timing.when).into(),
+        ),
+        f(
+            crate::t!("ui.kind.min_interval"),
+            crate::t!("ui.kind.hours", hours = k.timing.min_interval_hours),
+        ),
     ];
     if !k.paths.is_empty() {
-        out.push(f("対象パス", k.paths.join(", ")));
+        out.push(f(crate::t!("ui.kind.summary_paths"), k.paths.join(", ")));
     }
     if let Some(cl) = &k.changelog {
-        out.push(f("リリースのタグ", cl.release_tag.clone()));
+        out.push(f(
+            crate::t!("ui.kind.summary_release_tag"),
+            cl.release_tag.clone(),
+        ));
     }
     out
 }
@@ -1627,9 +1683,9 @@ fn kind_page(state: &AppState, cur: Current, form: KindForm, msg: Option<&str>) 
         layout: layout(
             state,
             if form.is_new {
-                "文書の種類を追加".to_string()
+                crate::t!("ui.title.kind_new").to_string()
             } else {
-                format!("文書の種類: {}", form.name)
+                crate::t!("ui.title.kind", name = form.name)
             },
             "kinds",
             msg,
@@ -1660,7 +1716,7 @@ pub async fn kind_detail(
         return error_page(
             &state,
             StatusCode::NOT_FOUND,
-            "その文書の種類はありません。",
+            crate::t!("ui.error.kind_missing"),
             "/kinds",
         );
     }
@@ -1686,7 +1742,7 @@ pub async fn kind_save(
         return error_page(
             &state,
             StatusCode::NOT_FOUND,
-            "その文書の種類はありません。",
+            crate::t!("ui.error.kind_missing"),
             "/kinds",
         );
     }
@@ -1709,7 +1765,7 @@ pub async fn kind_save(
         Vec::new(),
         |c| {
             if !builtin && !c.kinds.contains_key(&pid) {
-                return Err("定義されていない文書の種類です".into());
+                return Err(crate::t!("ui.error.kind_undefined").into());
             }
             match pvalue {
                 Some(s) => {
@@ -1742,7 +1798,7 @@ pub async fn kind_create(
         return error_page(
             &state,
             StatusCode::BAD_REQUEST,
-            "id を入力してください。",
+            crate::t!("ui.error.id_required"),
             back,
         );
     };
@@ -1750,9 +1806,7 @@ pub async fn kind_create(
         return error_page(
             &state,
             StatusCode::BAD_REQUEST,
-            format!(
-                "id は英小文字で始まる英小文字・数字・ハイフン（32 文字まで）で、組み込みの名前以外です: {id}"
-            ),
+            crate::t!("ui.error.id_invalid", id = id),
             back,
         );
     }
@@ -1769,7 +1823,7 @@ pub async fn kind_create(
         Vec::new(),
         |c| {
             if c.kinds.contains_key(&pid) {
-                return Err(format!("その id の種類は既にあります: {pid}"));
+                return Err(crate::t!("ui.error.id_exists", id = pid));
             }
             c.kinds.insert(pid, psettings);
             Ok(())
@@ -1793,7 +1847,7 @@ pub async fn kind_delete(
         return error_page(
             &state,
             StatusCode::BAD_REQUEST,
-            "組み込みの種類は削除できません（設定を空にすると既定に戻ります）。",
+            crate::t!("ui.error.builtin_delete"),
             back,
         );
     }
@@ -1808,7 +1862,7 @@ pub async fn kind_delete(
             c.kinds
                 .remove(&pid)
                 .map(|_| ())
-                .ok_or_else(|| "定義されていない文書の種類です".to_string())
+                .ok_or_else(|| crate::t!("ui.error.kind_undefined").to_string())
         },
         move |s, rev| {
             ops::set_kind(&s.store, &id, None, Some(rev))?;
@@ -1821,20 +1875,20 @@ pub async fn kind_delete(
 /// テンプレートの内容の検査（保守の実行時と同じ規則: 16 KiB・UTF-8・改行とタブ以外の制御文字なし・`<<<` なし）。
 fn check_template(content: &str) -> Result<(), String> {
     if content.len() as u64 > kinds::TEMPLATE_MAX_BYTES {
-        return Err(format!(
-            "テンプレートは {} バイト以内です（{} バイト）",
-            kinds::TEMPLATE_MAX_BYTES,
-            content.len()
+        return Err(crate::t!(
+            "ui.template.max_bytes",
+            max = kinds::TEMPLATE_MAX_BYTES,
+            size = content.len()
         ));
     }
     if content
         .chars()
         .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
     {
-        return Err("テンプレートに改行・タブ以外の制御文字があります".into());
+        return Err(crate::t!("ui.template.control").into());
     }
     if content.contains("<<<") {
-        return Err("テンプレートに区切り `<<<` は含められません".into());
+        return Err(crate::t!("ui.template.delimiter").into());
     }
     Ok(())
 }
@@ -1849,14 +1903,12 @@ fn write_template(dir: &FsPath, name: &str, content: &str) -> Result<(), String>
         Err(_) => false,
     };
     if link_or_odd(dir, true) {
-        return Err(
-            "設定フォルダーの templates/ がリンクか通常のフォルダーではないため保存しません".into(),
-        );
+        return Err(crate::t!("ui.template.dir_odd").into());
     }
-    std::fs::create_dir_all(dir).map_err(|e| format!("templates/ を作れません: {e}"))?;
+    std::fs::create_dir_all(dir).map_err(|e| crate::t!("ui.template.dir_create", error = e))?;
     let target = dir.join(name);
     if link_or_odd(&target, false) {
-        return Err("保存先がリンクか通常のファイルではないため保存しません".into());
+        return Err(crate::t!("ui.template.target_odd").into());
     }
     let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
     let written = (|| {
@@ -1872,7 +1924,7 @@ fn write_template(dir: &FsPath, name: &str, content: &str) -> Result<(), String>
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    written.map_err(|e| format!("テンプレートを保存できません: {e}"))
+    written.map_err(|e| crate::t!("ui.template.save_failed", error = e))
 }
 
 pub async fn template_save(
@@ -1884,7 +1936,7 @@ pub async fn template_save(
         return error_page(
             &state,
             StatusCode::BAD_REQUEST,
-            "文書の種類が不正です。",
+            crate::t!("ui.error.kind_invalid"),
             "/kinds",
         );
     }
@@ -1894,7 +1946,7 @@ pub async fn template_save(
         return error_page(
             &state,
             StatusCode::BAD_REQUEST,
-            "テンプレート名は英数字・`.`・`_`・`-` だけの `<名前>.md` です。",
+            crate::t!("ui.error.template_name"),
             back,
         );
     }
@@ -1903,7 +1955,7 @@ pub async fn template_save(
         return error_page(&state, StatusCode::BAD_REQUEST, e, back);
     }
     let dir = settings_dir(&state.store).join(kinds::TEMPLATES_DIR);
-    match tokio::task::spawn_blocking(move || write_template(&dir, &name, &content)).await {
+    match blocking(move || write_template(&dir, &name, &content)).await {
         Ok(Ok(())) => Redirect::to(&format!("{back}?msg=template")).into_response(),
         Ok(Err(e)) => error_page(&state, StatusCode::BAD_REQUEST, e, back),
         Err(_) => internal(&state, &back),
@@ -1926,14 +1978,14 @@ fn proposal_row(index: usize, root: &str, p: &proposal::ProposalInfo) -> Proposa
         short: p.sha[..p.sha.len().min(12)].to_string(),
         created_at: p.created_at.clone(),
         diffstat: p.diffstat.clone(),
-        documents: p.documents.join("、"),
+        documents: p.documents.join(crate::t!("list.separator")),
         applied: p.applied,
     }
 }
 
 pub async fn proposals(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
     let s = state.clone();
-    let Ok((broken, rows)) = tokio::task::spawn_blocking(move || {
+    let Ok((broken, rows)) = blocking(move || {
         let cur = current(&s);
         let rows: Vec<ProposalRow> = cur
             .config
@@ -1954,7 +2006,13 @@ pub async fn proposals(State(state): State<AppState>, Query(q): Query<Msg>) -> R
         return internal(&state, "/");
     };
     html(ProposalsPage {
-        layout: layout(&state, "更新案", "proposals", q.msg.as_deref(), broken),
+        layout: layout(
+            &state,
+            crate::t!("ui.nav.proposals"),
+            "proposals",
+            q.msg.as_deref(),
+            broken,
+        ),
         rows,
     })
 }
@@ -1990,12 +2048,12 @@ pub async fn proposal_detail(
         return error_page(
             &state,
             StatusCode::NOT_FOUND,
-            "その更新案はありません。",
+            crate::t!("ui.error.proposal_missing"),
             "/proposals",
         );
     }
     let s = state.clone();
-    let Ok(built) = tokio::task::spawn_blocking(move || {
+    let Ok(built) = blocking(move || {
         let cur = current(&s);
         let repo = cur.config.repository.get(n)?.clone();
         let root = FsPath::new(&repo.root);
@@ -2027,12 +2085,18 @@ pub async fn proposal_detail(
         return error_page(
             &state,
             StatusCode::NOT_FOUND,
-            "その更新案はありません。",
+            crate::t!("ui.error.proposal_missing"),
             "/proposals",
         );
     };
     html(ProposalPage {
-        layout: layout(&state, "更新案の内容", "proposals", None, broken),
+        layout: layout(
+            &state,
+            crate::t!("ui.title.proposal"),
+            "proposals",
+            None,
+            broken,
+        ),
         revision,
         row,
         lines,
@@ -2048,7 +2112,7 @@ fn proposal_target(state: &AppState, form: &FormData) -> Result<(usize, String, 
         return Err(error_page(
             state,
             StatusCode::BAD_REQUEST,
-            "更新案の指定が不正です。",
+            crate::t!("ui.error.proposal_invalid"),
             "/proposals",
         ));
     }
@@ -2065,10 +2129,7 @@ pub async fn proposal_apply(
         Err(r) => return r,
     };
     let back = format!("/proposals/{index}/{sha}");
-    let extra = vec![format!(
-        "更新案 {} を {root} の作業ツリーへ適用します（文書のファイルを書き換えます。stage と commit はしません）",
-        &sha[..12]
-    )];
+    let extra = vec![crate::t!("ui.danger.apply", sha = &sha[..12], repo = root)];
     apply_change(
         &state,
         "/proposals/apply",
@@ -2119,11 +2180,11 @@ pub async fn worker(State(state): State<AppState>, Query(q): Query<Msg>) -> Resp
     let w = &cur.config.worker;
     // claude_path は存在確認だけ（実行はしない）。
     let claude_state = if w.claude_path.trim().is_empty() {
-        "空欄: PATH から claude を探します".to_string()
+        crate::t!("ui.worker.claude_empty").to_string()
     } else if FsPath::new(w.claude_path.trim()).is_file() {
-        "ファイルがあります".to_string()
+        crate::t!("ui.worker.claude_found").to_string()
     } else {
-        "ファイルが見つかりません".to_string()
+        crate::t!("ui.worker.claude_missing").to_string()
     };
     let page = WorkerPage {
         revision: cur.revision.to_string(),
@@ -2136,12 +2197,12 @@ pub async fn worker(State(state): State<AppState>, Query(q): Query<Msg>) -> Resp
         permission: vec![
             Choice::new(
                 "restricted",
-                "restricted（許可した操作だけ）",
+                crate::t!("ui.worker.restricted"),
                 w.permission == Permission::Restricted,
             ),
             Choice::new(
                 "bypass",
-                "bypass（許可確認なし）",
+                crate::t!("ui.worker.bypass"),
                 w.permission == Permission::Bypass,
             ),
         ],
@@ -2149,7 +2210,7 @@ pub async fn worker(State(state): State<AppState>, Query(q): Query<Msg>) -> Resp
         claude_state,
         layout: layout(
             &state,
-            "worker 設定",
+            crate::t!("ui.title.worker"),
             "worker",
             q.msg.as_deref(),
             cur.broken,
@@ -2171,17 +2232,17 @@ pub async fn worker_save(
                 .text("timeout_secs")
                 .unwrap_or_default()
                 .parse()
-                .map_err(|_| "timeout_secs は整数です".to_string())?,
+                .map_err(|_| crate::t!("ui.worker.timeout_invalid").to_string())?,
             max_budget_usd: match form.text("max_budget_usd") {
                 None => 0.0,
                 Some(v) => v
                     .parse()
-                    .map_err(|_| "max_budget_usd は数値です".to_string())?,
+                    .map_err(|_| crate::t!("ui.worker.budget_invalid").to_string())?,
             },
             permission: match form.get("permission") {
                 Some("restricted") => Permission::Restricted,
                 Some("bypass") => Permission::Bypass,
-                _ => return Err("permission は restricted か bypass です".into()),
+                _ => return Err(crate::t!("ui.worker.permission_invalid").into()),
             },
             claude_path: form.text("claude_path").unwrap_or_default(),
         })
@@ -2227,7 +2288,7 @@ pub async fn general(State(state): State<AppState>, Query(q): Query<Msg>) -> Res
     if d.mode == Mode::Push {
         modes.push(Choice::new(
             "push",
-            "push（現在の値。ここでは新たに選べません）",
+            crate::t!("ui.general.push_current"),
             true,
         ));
     }
@@ -2242,22 +2303,28 @@ pub async fn general(State(state): State<AppState>, Query(q): Query<Msg>) -> Res
         policies: vec![
             Choice::new(
                 "explicit",
-                "explicit（登録したリポジトリだけ）",
+                crate::t!("ui.general.policy_explicit"),
                 e.policy == Policy::Explicit,
             ),
             Choice::new(
                 "remote-owner",
-                "remote-owner（指定 owner のリポジトリも対象）",
+                crate::t!("ui.general.policy_owner"),
                 e.policy == Policy::RemoteOwner,
             ),
             Choice::new(
                 "all",
-                "all（すべてのリポジトリが対象）",
+                crate::t!("ui.general.policy_all"),
                 e.policy == Policy::All,
             ),
         ],
         owners: e.owners.join("\n"),
-        layout: layout(&state, "全般設定", "general", q.msg.as_deref(), cur.broken),
+        layout: layout(
+            &state,
+            crate::t!("ui.title.general"),
+            "general",
+            q.msg.as_deref(),
+            cur.broken,
+        ),
     };
     html(page)
 }
@@ -2275,7 +2342,7 @@ struct GeneralValues {
 
 fn apply_general(c: &mut Config, v: GeneralValues) -> Result<(), String> {
     if v.mode == Mode::Push && c.defaults.mode != Mode::Push {
-        return Err("既定のモードを push にはできません。push はリポジトリごとに「push モードで有効化」から登録してください".into());
+        return Err(crate::t!("ui.error.default_push").into());
     }
     c.defaults.mode = v.mode;
     c.defaults.documents = v.documents;
@@ -2295,7 +2362,7 @@ pub async fn general_save(
         return error_page(
             &state,
             StatusCode::BAD_REQUEST,
-            "既定のモードが不正です。",
+            crate::t!("ui.error.default_mode"),
             back,
         );
     };
@@ -2311,7 +2378,7 @@ pub async fn general_save(
             return error_page(
                 &state,
                 StatusCode::BAD_REQUEST,
-                "自動登録の方針が不正です。",
+                crate::t!("ui.error.policy"),
                 back,
             );
         }
@@ -2346,15 +2413,11 @@ pub async fn general_save(
 pub async fn consent(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
     let cur = current(&state);
     let current_text = cur.config.consent.as_ref().map(|c| {
-        format!(
-            "版 {}・{}・出所 {}",
-            c.version,
-            c.accepted_at,
-            match c.source {
-                ConsentSource::Cli => "CLI",
-                ConsentSource::Ui => "管理画面",
-                ConsentSource::LegacyMigration => "旧版からの移行",
-            }
+        crate::t!(
+            "ui.consent.current",
+            version = c.version,
+            at = c.accepted_at,
+            source = consent_source(c.source)
         )
     });
     html(ConsentPage {
@@ -2363,7 +2426,13 @@ pub async fn consent(State(state): State<AppState>, Query(q): Query<Msg>) -> Res
         version: CURRENT_CONSENT_VERSION,
         current: current_text,
         kept: ops::keeps_consent(cur.config.consent.as_ref()),
-        layout: layout(&state, "同意", "consent", q.msg.as_deref(), cur.broken),
+        layout: layout(
+            &state,
+            crate::t!("ui.nav.consent"),
+            "consent",
+            q.msg.as_deref(),
+            cur.broken,
+        ),
     })
 }
 
@@ -2379,7 +2448,7 @@ pub async fn consent_save(
         return error_page(
             &state,
             StatusCode::BAD_REQUEST,
-            "同意文を読み、チェックを付けてから送信してください。",
+            crate::t!("ui.error.consent_check"),
             back,
         );
     }
@@ -2420,7 +2489,7 @@ pub async fn consent_save(
 // ---------------------------------------------------------------------------
 
 pub async fn doctor(State(state): State<AppState>) -> Response {
-    let Ok(result) = tokio::task::spawn_blocking(|| doctor::run(false)).await else {
+    let Ok(result) = blocking(|| doctor::run(false)).await else {
         return internal(&state, "/");
     };
     let items = result["items"]
@@ -2435,7 +2504,13 @@ pub async fn doctor(State(state): State<AppState>) -> Response {
         .collect();
     let cur = current(&state);
     html(DoctorPage {
-        layout: layout(&state, "診断", "doctor", None, cur.broken),
+        layout: layout(
+            &state,
+            crate::t!("ui.nav.doctor"),
+            "doctor",
+            None,
+            cur.broken,
+        ),
         ok: result["ok"].as_bool().unwrap_or(false),
         items,
     })
@@ -2460,7 +2535,7 @@ pub async fn history(State(state): State<AppState>, Query(q): Query<Msg>) -> Res
     html(HistoryPage {
         layout: layout(
             &state,
-            "設定の変更履歴",
+            crate::t!("ui.title.history"),
             "history",
             q.msg.as_deref(),
             cur.broken,
@@ -2475,7 +2550,7 @@ pub async fn history_detail(State(state): State<AppState>, Path(id): Path<String
         return error_page(
             &state,
             StatusCode::NOT_FOUND,
-            "その変更履歴はありません。",
+            crate::t!("ui.error.history_missing"),
             "/history",
         );
     }
@@ -2485,7 +2560,7 @@ pub async fn history_detail(State(state): State<AppState>, Path(id): Path<String
             return error_page(
                 &state,
                 StatusCode::NOT_FOUND,
-                "その変更履歴はありません。",
+                crate::t!("ui.error.history_missing"),
                 "/history",
             );
         }
@@ -2509,15 +2584,24 @@ pub async fn history_detail(State(state): State<AppState>, Path(id): Path<String
         })
         .collect();
     let (state_text, restorable) = match &loaded {
-        Loaded::Ok(_) => ("この版で読めます（復元できます）".to_string(), true),
+        Loaded::Ok(_) => (crate::t!("ui.history.readable").to_string(), true),
         Loaded::Invalid(r) => (
-            format!("この版では読めません: {}", views::redact(&first_line(r))),
+            crate::t!(
+                "ui.history.unreadable",
+                reason = views::redact(&first_line(r))
+            ),
             false,
         ),
-        Loaded::Missing => ("内容がありません".to_string(), false),
+        Loaded::Missing => (crate::t!("ui.history.empty").to_string(), false),
     };
     html(HistoryEntryPage {
-        layout: layout(&state, "変更履歴の内容", "history", None, cur.broken),
+        layout: layout(
+            &state,
+            crate::t!("ui.title.history_entry"),
+            "history",
+            None,
+            cur.broken,
+        ),
         revision: cur.revision.to_string(),
         id,
         state: state_text,
@@ -2537,7 +2621,7 @@ pub async fn history_restore(
         return error_page(
             &state,
             StatusCode::BAD_REQUEST,
-            "変更履歴の指定が不正です。",
+            crate::t!("ui.error.history_invalid"),
             "/history",
         );
     }
@@ -2548,7 +2632,7 @@ pub async fn history_restore(
             return error_page(
                 &state,
                 StatusCode::BAD_REQUEST,
-                "この変更履歴は今の版では読めないため復元できません。",
+                crate::t!("ui.error.history_unrestorable"),
                 back,
             );
         }

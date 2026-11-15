@@ -115,8 +115,8 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
     if !host_ok {
         return deny(
             StatusCode::FORBIDDEN,
-            "接続できません",
-            "この画面は 127.0.0.1 または localhost からだけ開けます。",
+            crate::t!("ui.deny.host_title"),
+            crate::t!("ui.deny.host"),
         );
     }
     // 2. Origin（あれば同一オリジンだけ）。
@@ -125,8 +125,8 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
     if origin_ok == Some(false) {
         return deny(
             StatusCode::FORBIDDEN,
-            "拒否しました",
-            "別のサイトからの要求は受け付けません。",
+            crate::t!("ui.deny.title"),
+            crate::t!("ui.deny.origin"),
         );
     }
     let is_post = req.method() == Method::POST;
@@ -139,8 +139,8 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
         if origin_ok != Some(true) && !same_site {
             return deny(
                 StatusCode::FORBIDDEN,
-                "拒否しました",
-                "同じ画面から送信された要求ではないため受け付けません。",
+                crate::t!("ui.deny.title"),
+                crate::t!("ui.deny.same_site"),
             );
         }
     }
@@ -161,8 +161,8 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
         if !has_session {
             return deny(
                 StatusCode::UNAUTHORIZED,
-                "ログインが必要です",
-                "この画面は `scriptura ui` が表示した URL から開いてください（URL は起動ごとに変わり、一度だけ使えます）。",
+                crate::t!("ui.deny.login_title"),
+                crate::t!("ui.deny.login"),
             );
         }
         state.touch();
@@ -175,8 +175,8 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
             Err(_) => {
                 return deny(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    "送信内容が大きすぎます",
-                    "送信内容が上限を超えています。",
+                    crate::t!("ui.deny.too_large_title"),
+                    crate::t!("ui.deny.too_large"),
                 );
             }
         };
@@ -184,8 +184,8 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
         if !form.get("csrf").is_some_and(|t| same(t, &state.csrf)) {
             return deny(
                 StatusCode::FORBIDDEN,
-                "拒否しました",
-                "フォームの確認用トークンが一致しません。画面を開き直してから操作してください。",
+                crate::t!("ui.deny.title"),
+                crate::t!("ui.deny.csrf"),
             );
         }
         parts.extensions.insert(form);

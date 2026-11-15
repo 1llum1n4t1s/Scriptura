@@ -1,9 +1,11 @@
 ---
 name: review
-description: propose モードで作られた文書パッチの内容を確認する。Review pending Scriptura patches.
+description: Review the contents of document patches created in propose mode. Review pending Scriptura patches.
 allowed-tools: Bash(scriptura review *)
 ---
 
 # Scriptura review
 
-読み取り専用です。`scriptura review --json` を実行し、`proposals` の更新案ごとに diffstat・パッチのパス・対象文書（`documents`）を一覧で示します（更新案が無いときは `proposals` が空です）。特定の更新案は sha の前方を引数に付けて確認できます（`scriptura review <sha> --json`）。パッチは適用しません。適用は `/scriptura:apply` を案内します。
+Read-only. Run `scriptura review --json` and list, for each proposal in `proposals`, the diffstat, the patch path and the target documents (`documents`). When there are no proposals, `proposals` is empty. A specific proposal can be inspected by passing the leading part of its sha (`scriptura review <sha> --json`). Do not apply the patch. Point the user to `/scriptura:apply` to apply it.
+
+Reply in the language the user is writing in.

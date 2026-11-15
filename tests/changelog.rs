@@ -193,7 +193,7 @@ fn builtin_template_is_loaded_for_changelog_and_shown_only_when_creating_or_forc
     // 新規作成（対象が無い）ではテンプレートを見せる。
     let creating = settings_frame(&dir, &Scope::default(), &active, &loaded);
     assert!(
-        creating.contains("<<<テンプレート>>>\n# Changelog"),
+        creating.contains("<<<TEMPLATE>>>\n# Changelog"),
         "{creating}"
     );
     // 既存の文書（format = existing）では見せない（既存の形式を踏襲）。
@@ -208,7 +208,7 @@ fn builtin_template_is_loaded_for_changelog_and_shown_only_when_creating_or_forc
     let mut kac = changelog_kind();
     kac.changelog.as_mut().unwrap().format = ChangelogFormat::KeepAChangelog;
     let frame = settings_frame(&dir, &existing, &[&kac], &loaded);
-    assert!(frame.contains("<<<テンプレート>>>"), "{frame}");
+    assert!(frame.contains("<<<TEMPLATE>>>"), "{frame}");
 }
 
 #[test]
@@ -469,7 +469,7 @@ fn backfill_walks_tags_newest_first_within_the_limits() {
     assert_eq!(releases[1]["commits"], json!([]));
     let omitted = m.json["omitted"].to_string();
     assert!(
-        omitted.contains("2 件") && omitted.contains("合計 3 件"),
+        omitted.contains("newest 2") && omitted.contains("3 in total"),
         "{omitted}"
     );
 

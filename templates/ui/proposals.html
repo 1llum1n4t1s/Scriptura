@@ -1,10 +1,10 @@
 {% extends "ui/base.html" %}
 {% block content %}
-<div class="heading"><h1>更新案 <span class="count">{{ rows.len() }}</span></h1></div>
+<div class="heading"><h1>{{ crate::locale::tr("ui.nav.proposals") }} <span class="count">{{ rows.len() }}</span></h1></div>
 <section class="panel">
-  {% if rows.is_empty() %}<p class="note">更新案はありません（propose モードで push すると作られます）。</p>{% else %}
+  {% if rows.is_empty() %}<p class="note">{{ crate::locale::tr("ui.proposals.none") }}</p>{% else %}
   <div class="table-wrap"><table>
-    <thead><tr><th>リポジトリ</th><th>コミット</th><th>作成</th><th>文書</th><th>変更量</th><th>状態</th></tr></thead>
+    <thead><tr><th>{{ crate::locale::tr("ui.common.repository") }}</th><th>{{ crate::locale::tr("ui.proposal.commit") }}</th><th>{{ crate::locale::tr("ui.proposal.created") }}</th><th>{{ crate::locale::tr("ui.proposal.documents") }}</th><th>{{ crate::locale::tr("ui.proposal.diffstat") }}</th><th>{{ crate::locale::tr("ui.proposal.state") }}</th></tr></thead>
     <tbody>
     {% for p in rows %}<tr>
       <td><code>{{ p.root }}</code></td>
@@ -12,11 +12,11 @@
       <td>{{ p.created_at }}</td>
       <td>{{ p.documents }}</td>
       <td><span class="path">{{ p.diffstat }}</span></td>
-      <td>{% if p.applied %}<span class="badge">適用済み</span>{% else %}<span class="badge published">未適用</span>{% endif %}</td>
+      <td>{% if p.applied %}<span class="badge">{{ crate::locale::tr("ui.proposal.applied") }}</span>{% else %}<span class="badge published">{{ crate::locale::tr("ui.proposal.pending") }}</span>{% endif %}</td>
     </tr>{% endfor %}
     </tbody>
   </table></div>
-  <p class="note">新しい更新案は古い更新案の内容を含みます。CHANGELOG を含む更新案は、最新の 1 件だけを適用すれば足ります。</p>
+  <p class="note">{{ crate::locale::tr("ui.proposals.note") }}</p>
   {% endif %}
 </section>
 {% endblock %}

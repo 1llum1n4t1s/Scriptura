@@ -1,8 +1,8 @@
 {% extends "ui/base.html" %}
 {% block content %}
 <section class="panel">
-  <h1>確認してください</h1>
-  <p>次の変更を行います。内容を確認し、よければ「実行する」を押してください（この確認は 10 分間・1 回だけ有効です）。</p>
+  <h1>{{ crate::locale::tr("ui.confirm.title") }}</h1>
+  <p>{{ crate::locale::tr("ui.confirm.lead") }}</p>
   <ul class="dangers">
   {% for d in dangers %}<li>{{ d }}</li>{% endfor %}
   </ul>
@@ -11,7 +11,7 @@
     <input type="hidden" name="confirm" value="{{ nonce }}">
     {% for f in fields %}<input type="hidden" name="{{ f.name }}" value="{{ f.value }}">
     {% endfor %}
-    <div class="actions"><button class="primary" type="submit">実行する</button><a class="button" href="{{ back }}">やめる</a></div>
+    <div class="actions"><button class="primary" type="submit">{{ crate::locale::tr("ui.confirm.run") }}</button><a class="button" href="{{ back }}">{{ crate::locale::tr("ui.confirm.cancel") }}</a></div>
   </form>
 </section>
 {% endblock %}

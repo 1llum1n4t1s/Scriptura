@@ -1,27 +1,29 @@
 ---
 name: setup
-description: Scriptura をこのリポジトリで有効化する（同意確認つき）。Enable Scriptura document maintenance for the current repository.
+description: Enable Scriptura for this repository (with a consent check). Enable Scriptura document maintenance for the current repository.
 disable-model-invocation: true
 allowed-tools: Bash(scriptura enable *)
 ---
 
 # Scriptura setup
 
-このリポジトリで push 後の文書保守を有効にします。副作用があるため、必ず次の順で進めます。
+This enables post-push document maintenance for this repository. Because it has side effects, always proceed in this order.
 
-1. 次を利用者に説明します。
-   - 送信されるデータ: worker が読んだリポジトリ内容は、利用者自身の Claude 認証で Anthropic へ送られます。
-   - 費用: push 1 回につき Sonnet の worker を最大 1 回、上限時間まで実行します。
-   - 初期モードは propose（パッチを作るだけで文書は書き換えません）です。
-2. チャットで本人の明示的な同意（はい・同意する等）を得ます。同意がない、または曖昧なら何も実行せず終了します。
-3. 同意後にだけ、現在のディレクトリを対象に実行します。
+1. Explain the following to the user.
+   - Data sent: the repository contents the worker reads are sent to Anthropic using the user's own Claude authentication.
+   - Cost: for each push, a Sonnet worker runs at most once, up to the time limit.
+   - The initial mode is propose (it only creates patches and does not rewrite documents).
+2. Obtain the user's explicit consent in chat (yes, I agree, and so on). If consent is missing or ambiguous, run nothing and stop.
+3. Only after consent, run the following for the current directory.
 
 ```
 scriptura enable --repo <cwd> --mode propose --accept-consent 1 --json
 ```
 
-`--accept-consent` の値は同意文書の現行の版（現在は 1）です。版が違う、または省略すると CLI が説明文つきで拒否します（その場合は説明をあらためて伝え、同意を得直します）。push モード（`--mode push`）は利用者が明示的に求めたときだけ使い、既定にしません。
+The value of `--accept-consent` is the current version of the consent document (currently 1). If the version is wrong or omitted, the CLI refuses with an explanatory message (in that case, explain it again and obtain consent again). Use push mode (`--mode push`) only when the user explicitly asks for it, and never make it the default.
 
-保守する文書は既定で AGENTS.md / DESIGN.md / README.md の 3 種です。CHANGELOG.md やカスタム種類（設定ファイルの `[kinds.<id>]` で定義した id）は、利用者が求めたときだけ `--documents AGENTS.md,DESIGN.md,README.md,CHANGELOG.md` のように明示して加えます（定義の無い id は CLI が拒否します）。
+By default three kinds of documents are maintained: AGENTS.md / DESIGN.md / README.md. Add CHANGELOG.md or a custom kind (an id defined as `[kinds.<id>]` in the configuration file) only when the user asks, by listing them explicitly, for example `--documents AGENTS.md,DESIGN.md,README.md,CHANGELOG.md` (the CLI rejects ids that are not defined).
 
-4. 実行結果の JSON（`ok`、`mode`、`branches`、`documents`、`configPath`、失敗時は `error`）を簡潔に要約して伝えます。失敗時は `error` の内容を伝え、必要なら `/scriptura:doctor` を案内します。
+4. Briefly summarize the resulting JSON (`ok`, `mode`, `branches`, `documents`, `configPath`, and `error` on failure). On failure, report the content of `error` and, if needed, point the user to `/scriptura:doctor`.
+
+Reply in the language the user is writing in.

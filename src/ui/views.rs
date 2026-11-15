@@ -39,21 +39,42 @@ pub fn redact(text: &str) -> String {
 /// 直前の操作の結果の文言（`?msg=` のコード → 固定文言）。未知のコードは表示しない。
 pub fn flash_text(code: Option<&str>) -> Option<&'static str> {
     Some(match code? {
-        "saved" => "保存しました。",
-        "unchanged" => "変更はありませんでした。",
-        "enabled" => "有効化しました。",
-        "paused" => "一時停止しました。",
-        "resumed" => "再開しました。",
-        "disabled" => "登録を解除しました。",
-        "consent" => "同意を記録しました。",
-        "restored" => "設定を復元しました（復元前の内容も変更履歴に残っています）。",
-        "applied" => "更新案を作業ツリーへ適用しました（stage はしていません）。",
-        "discarded" => "更新案を破棄しました。",
-        "deleted" => "文書の種類を削除しました。",
-        "created" => "文書の種類を追加しました。",
-        "template" => "テンプレートを保存しました。",
+        "saved" => crate::t!("ui.flash.saved"),
+        "unchanged" => crate::t!("ui.flash.unchanged"),
+        "enabled" => crate::t!("ui.flash.enabled"),
+        "paused" => crate::t!("ui.flash.paused"),
+        "resumed" => crate::t!("ui.flash.resumed"),
+        "disabled" => crate::t!("ui.flash.disabled"),
+        "consent" => crate::t!("ui.flash.consent"),
+        "restored" => crate::t!("ui.flash.restored"),
+        "applied" => crate::t!("ui.flash.applied"),
+        "discarded" => crate::t!("ui.flash.discarded"),
+        "deleted" => crate::t!("ui.flash.deleted"),
+        "created" => crate::t!("ui.flash.created"),
+        "template" => crate::t!("ui.flash.template"),
         _ => return None,
     })
+}
+
+/// 画面上部の言語の選択欄の選択肢（先頭は「自動」。言語名はその言語自身の表記で、訳さない）。
+pub fn language_choices() -> Vec<Choice> {
+    let current = super::locale::current();
+    let mut out = vec![Choice::new(
+        "auto",
+        crate::t!("ui.lang.auto"),
+        current.preference.is_none(),
+    )];
+    out.extend(
+        crate::locale::Language::ALL
+            .into_iter()
+            .map(|l| Choice::new(l.tag(), l.native_name(), current.preference == Some(l))),
+    );
+    out
+}
+
+/// 現在の表示言語のタグ（`<html lang>` に使う）。
+pub fn lang() -> &'static str {
+    crate::locale::current().tag()
 }
 
 /// 選択肢 1 つ（select の option・チェックボックス）。

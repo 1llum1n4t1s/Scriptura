@@ -1,36 +1,36 @@
 {% extends "ui/base.html" %}
 {% block content %}
-<div class="heading"><h1>リポジトリ</h1></div>
+<div class="heading"><h1>{{ crate::locale::tr("ui.nav.repos") }}</h1></div>
 <section class="panel">
-  <h2>登録済み <span class="count">{{ repos.len() }}</span></h2>
-  {% if repos.is_empty() %}<p class="note">まだ登録がありません。</p>{% else %}
+  <h2>{{ crate::locale::tr("ui.repos.registered") }} <span class="count">{{ repos.len() }}</span></h2>
+  {% if repos.is_empty() %}<p class="note">{{ crate::locale::tr("ui.repos.none") }}</p>{% else %}
   <div class="table-wrap"><table>
-    <thead><tr><th>リポジトリ</th><th>モード</th><th>対象の文書</th><th>ブランチ</th><th>更新案</th></tr></thead>
+    <thead><tr><th>{{ crate::locale::tr("ui.common.repository") }}</th><th>{{ crate::locale::tr("ui.repo.mode") }}</th><th>{{ crate::locale::tr("ui.repo.documents") }}</th><th>{{ crate::locale::tr("ui.repos.branches") }}</th><th>{{ crate::locale::tr("ui.nav.proposals") }}</th></tr></thead>
     <tbody>
     {% for r in repos %}<tr>
-      <td><a href="/repos/{{ r.index }}"><code>{{ r.root }}</code></a>{% if r.paused %} <span class="badge">一時停止中</span>{% endif %}{% if !r.remote.is_empty() %}<br><span class="path">{{ r.remote }}</span>{% endif %}</td>
+      <td><a href="/repos/{{ r.index }}"><code>{{ r.root }}</code></a>{% if r.paused %} <span class="badge">{{ crate::locale::tr("ui.common.paused") }}</span>{% endif %}{% if !r.remote.is_empty() %}<br><span class="path">{{ r.remote }}</span>{% endif %}</td>
       <td><span class="badge{% if r.push %} warning{% endif %}">{{ r.mode }}</span></td>
       <td>{{ r.documents }}</td>
       <td>{{ r.branches }}</td>
-      <td>未適用 {{ r.pending }}・適用済み {{ r.applied }}</td>
+      <td>{{ crate::locale::tr2("ui.repo.proposal_counts", "pending", r.pending, "applied", r.applied) }}</td>
     </tr>{% endfor %}
     </tbody>
   </table></div>
   {% endif %}
 </section>
 <section class="panel">
-  <h2>有効化（登録・登録し直し）</h2>
+  <h2>{{ crate::locale::tr("ui.repos.enable_heading") }}</h2>
   <form method="post" action="/repos/enable" class="stack">
     <input type="hidden" name="csrf" value="{{ layout.csrf }}">
     <input type="hidden" name="revision" value="{{ revision }}">
-    <label>リポジトリのパス（Git の作業ツリー。サブフォルダーでも可）<input name="repo" required placeholder="D:\Dev\MyRepo"></label>
-    <label>モード<select name="mode">
-      <option value="propose" selected>propose（更新案を作る。作業ツリー・remote は変えない）</option>
-      <option value="off">off（登録だけして動かさない）</option>
-      <option value="push">push（文書の変更を自動で commit・push。確認画面を挟みます）</option>
+    <label>{{ crate::locale::tr("ui.repos.path") }}<input name="repo" required placeholder="D:\Dev\MyRepo"></label>
+    <label>{{ crate::locale::tr("ui.repo.mode") }}<select name="mode">
+      <option value="propose" selected>{{ crate::locale::tr("ui.repos.mode_propose") }}</option>
+      <option value="off">{{ crate::locale::tr("ui.repos.mode_off") }}</option>
+      <option value="push">{{ crate::locale::tr("ui.repos.mode_push") }}</option>
     </select></label>
-    <label>許可ブランチ（カンマ区切り。空なら push は現在のブランチだけ、propose は制限なし）<input name="branches" placeholder="main"></label>
-    <fieldset class="choices"><legend>対象の文書（選ばなければ既定または現在の登録の値）</legend>
+    <label>{{ crate::locale::tr("ui.repos.branches_label") }}<input name="branches" placeholder="main"></label>
+    <fieldset class="choices"><legend>{{ crate::locale::tr("ui.repos.documents_legend") }}</legend>
       {% for d in documents %}<label class="checkbox"><input type="checkbox" name="documents" value="{{ d.value }}">{{ d.label }}</label>
       {% endfor %}
     </fieldset>
@@ -38,10 +38,10 @@
     <div class="consent">
       <p>{{ consent_text }}</p>
       <input type="hidden" name="consent_version" value="{{ consent_version }}">
-      <label class="checkbox"><input type="checkbox" name="consent" value="1">上の内容に同意します（同意文の版 {{ consent_version }}）</label>
+      <label class="checkbox"><input type="checkbox" name="consent" value="1">{{ crate::locale::tr1("ui.consent.agree", "version", consent_version) }}</label>
     </div>
     {% endif %}
-    <div class="actions"><button class="primary" type="submit">有効化する</button></div>
+    <div class="actions"><button class="primary" type="submit">{{ crate::locale::tr("ui.repos.enable") }}</button></div>
   </form>
 </section>
 {% endblock %}

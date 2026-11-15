@@ -2,13 +2,13 @@
   "name": "scriptura",
   "owner": { "name": "IMT" },
   "metadata": {
-    "description": "push 後に AGENTS.md / DESIGN.md / README.md を保守する Scriptura のマーケットプレース"
+    "description": "Marketplace for Scriptura, which maintains AGENTS.md / DESIGN.md / README.md after each push"
   },
   "plugins": [
     {
       "name": "scriptura",
       "source": "./plugins/scriptura",
-      "description": "自分のリポジトリへの push 後に、プロジェクト文書を worker が保守する。"
+      "description": "Maintains project documents with a worker after each push to your own repositories."
     }
   ]
 }

@@ -1,4 +1,4 @@
-use scriptura::{app, cli, connect, maintenance};
+use scriptura::{app, app_update, cli, connect, maintenance};
 use std::process::ExitCode;
 
 fn print(value: &serde_json::Value) {
@@ -9,6 +9,11 @@ fn print(value: &serde_json::Value) {
 }
 
 fn main() -> ExitCode {
+    // 全サブコマンド共通で、引数の解析より前に Velopack を処理する（app_update::startup）。
+    // - 起動時の自動適用は切る（多プロセス型。適用はログオン時の update-apply だけが行う）。
+    // - Setup の install / updated / uninstall などのフック引数は、ここで処理して必ず終了コード 0 で終わる。
+    // - 管理外のビルド（開発・プラグイン同梱・単独 install）では何もせずに戻る。
+    let startup = app_update::startup();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str);
     // 利用者向けコマンド（enable / status / doctor など）は cli が出力と終了コードを決める。
@@ -26,8 +31,22 @@ fn main() -> ExitCode {
         // Claude Code の Stop hook から呼ばれる。stdin の JSON を読み、結果を stdout の JSON で返す。
         Some("hook") => {
             maintenance::run();
+            // Setup 版だけ、本処理の後に条件を満たせば更新を確認・取得する（適用はしない。stdout へは何も書かない）。
+            app_update::after_hook();
             ExitCode::SUCCESS
         }
+        // ログオン時に起動する（HKCU Run・LaunchAgent・XDG autostart）。保留中の更新を、導入先で他の
+        // Scriptura が動いていないときだけ、署名者を検証してから再起動なしで適用する。結果は JSON 1 行。
+        Some("update-apply") => match app_update::update_apply() {
+            Ok(outcome) => {
+                println!("{}", outcome.to_json());
+                ExitCode::from(outcome.exit_code())
+            }
+            Err(e) => {
+                println!("{}", serde_json::json!({"status":"error","error":e}));
+                ExitCode::from(1)
+            }
+        },
         Some("install") => match app::install() {
             Ok(v) => {
                 print(&v);
@@ -53,39 +72,11 @@ fn main() -> ExitCode {
             println!("scriptura {}", app::VERSION);
             ExitCode::SUCCESS
         }
+        // 引数なしの起動（Setup 直後の初回起動・スタートメニュー・AppImage の直接起動）。Setup 版なら登録を
+        // 同期で確かめて日本語の案内を出す。管理外なら従来の使い方を表示する。
+        None if app_update::welcome(startup.first_run) => ExitCode::SUCCESS,
         _ => {
-            println!(
-                "Scriptura {}\n\n\
-使い方: scriptura <command> [--json]\n\
-\n\
-設定・操作:\n\
-  enable --repo <path> --accept-consent <版> [--mode propose|push|off] [--branches a,b] [--documents AGENTS.md,README.md]\n\
-                                    リポジトリで文書保守を有効にする（既定は propose）\n\
-  disable --repo <path>             登録を削除する\n\
-  pause [--repo <path>]             一時停止する\n\
-  resume [--repo <path>]            再開する\n\
-  status                            設定・登録・更新案の件数を表示する\n\
-  doctor [--verify]                 環境と設定を診断する\n\
-  run-now [--repo <path>] [--documents a,b]\n\
-                                    いま 1 回保守を実行する（--documents で処理する種類を絞る）\n\
-  docs list [--repo <path>]         文書の種類（組み込み・カスタム）の設定と状態を一覧する\n\
-  docs show <id> [--repo <path>]    文書の種類 1 件の設定を詳しく表示する\n\
-  ui [--port <n>] [--no-open]       管理画面をブラウザーで開く（127.0.0.1 のみ。既定のポートは 7468）\n\
-\n\
-更新案（propose モード）:\n\
-  review [sha|latest] [--repo <path>]   更新案を確認する\n\
-  apply [sha|latest] [--repo <path>]    更新案を作業ツリーへ適用する（stage はしない）\n\
-  discard [sha|latest] [--repo <path>]  更新案を破棄する\n\
-\n\
-導入・連携:\n\
-  hook                              Claude Code の Stop hook として動く（stdin の JSON を読む）\n\
-  install                           この実行ファイルを利用者ごとの導入先へ置く\n\
-  connect claude-code [--apply]     settings.json へ Stop hook を登録する（--apply まではプレビュー）\n\
-  connect claude-code --remove [--apply]  Scriptura の Stop hook だけを取り除く\n\
-\n\
---json を付けると機械可読の JSON を 1 つ出力します。",
-                app::VERSION
-            );
+            println!("{}", scriptura::t!("cli.help", version = app::VERSION));
             ExitCode::SUCCESS
         }
     }
@@ -99,9 +90,7 @@ fn ui_command(args: &[String]) -> ExitCode {
 
 #[cfg(not(feature = "ui"))]
 fn ui_command(_args: &[String]) -> ExitCode {
-    fail(
-        "この版の Scriptura には管理画面（ui）が含まれていません（feature \"ui\" を有効にしてビルドしてください）",
-    )
+    fail(scriptura::t!("cli.ui.not_included"))
 }
 
 fn fail(message: &str) -> ExitCode {

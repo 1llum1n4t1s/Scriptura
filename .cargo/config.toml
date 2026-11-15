@@ -1,0 +1,6 @@
+# テストの表示言語を日本語に固定する（既存のテストは日本語の文言を期待しているため）。
+# cargo が起動するプロセス（cargo test のテスト実行ファイルと、そこから起動する scriptura）に渡る。
+# 利用者が SCRIPTURA_LANGUAGE を設定していればそちらを優先する（force = false）。
+# 言語判定そのものの検査は tests/localization.rs が環境変数を差し替えた純粋関数で行う。
+[env]
+SCRIPTURA_LANGUAGE = { value = "ja", force = false }

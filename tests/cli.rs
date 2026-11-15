@@ -1627,3 +1627,143 @@ fn doctor_reports_kinds_templates_limits_and_changelog_notes() {
     // 診断はテンプレートの中身などを出力しない。
     assert!(!out.stdout.contains("責務"));
 }
+
+// ---------------------------------------------------------------------------
+// Setup（Velopack）版の機能: 管理外のビルドでは何もしない
+// ---------------------------------------------------------------------------
+
+/// 状態フォルダー（SCRIPTURA_HOME/state）に、Setup 版の更新・登録のファイルがあるか。
+fn setup_files(fx: &Fx) -> Vec<String> {
+    let state = fx.base.join("home").join("state");
+    fs::read_dir(&state)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("app-update") || n.starts_with("setup-registration"))
+        .collect()
+}
+
+#[test]
+fn setup_features_do_nothing_in_a_non_velopack_build() {
+    // テストの実行ファイル（target/ 配下）は開発ビルドと同じく Velopack の管理下ではない。
+    let fx = Fx::new();
+    let settings = json!({
+        "enabledPlugins": {"other@x": true},
+        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "notify"}]}]}
+    });
+    fx.write_settings(&settings);
+    let before = fs::read(fx.settings_path()).unwrap();
+
+    // ログオン時の適用は、管理外なら JSON 1 行で unmanaged を返して終了コード 0。
+    let out = fx.run(&["update-apply"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    assert_eq!(out.json(), json!({"status": "unmanaged"}));
+    // 手動の確認・解除も何もしない。
+    let v = fx.run(&["update", "--check", "--json"]).json();
+    assert_eq!(v["status"], "unmanaged");
+    assert_eq!(v["ok"], true);
+    let v = fx.run(&["uninstall-setup", "--apply", "--json"]).json();
+    assert_eq!(v["status"], "unmanaged");
+    // 引数なしの起動は従来の使い方を表示する（Setup の案内や登録はしない）。
+    let out = fx.run(&[]);
+    assert_eq!(out.code, 0);
+    assert!(out.stdout.contains("使い方"), "{}", out.stdout);
+    assert!(out.stdout.contains("update-apply"));
+    // hook の後の確認・取得もしない（stdout は保守の結果だけ）。
+    let out = fx.hook(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    // status・doctor は Setup 版でないことを報告する。
+    let v = fx.run(&["status", "--json"]).json();
+    assert_eq!(v["setup"]["managed"], false);
+    assert_eq!(v["setup"]["autoUpdate"], true);
+    assert_eq!(v["setup"]["registration"], Value::Null);
+    let v = fx.run(&["doctor", "--json"]).json();
+    let setup = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "setup")
+        .expect("setup item");
+    assert_eq!(setup["status"], "info");
+    // どの操作でも、settings.json と状態フォルダーの Setup 用ファイルに触れていない。
+    assert_eq!(fs::read(fx.settings_path()).unwrap(), before);
+    assert!(setup_files(&fx).is_empty(), "{:?}", setup_files(&fx));
+}
+
+#[test]
+fn update_auto_setting_is_saved_in_the_state_folder() {
+    let fx = Fx::new();
+    let v = fx.run(&["update", "--auto", "off", "--json"]).json();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["autoUpdate"], false);
+    assert_eq!(v["changed"], true);
+    let saved: Value = serde_json::from_slice(
+        &fs::read(fx.base.join("home").join("state").join("app-update.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["auto_update"], false);
+    let v = fx.run(&["update", "--json"]).json();
+    assert_eq!(v["action"], "show");
+    assert_eq!(v["autoUpdate"], false);
+    assert_eq!(v["managed"], false);
+    assert_eq!(
+        fx.run(&["update", "--auto", "off", "--json"]).json()["changed"],
+        false
+    );
+    assert_eq!(fx.run(&["update", "--auto", "--json"]).code, 1);
+    // 不正な値・組み合わせは終了コード 1。
+    assert_eq!(fx.run(&["update", "--auto", "maybe", "--json"]).code, 1);
+    assert_eq!(
+        fx.run(&["update", "--check", "--auto", "on", "--json"])
+            .code,
+        1
+    );
+    let text = fx.run(&["update", "--auto", "on"]).stdout;
+    assert!(text.contains("自動更新を ON にしました"), "{text}");
+}
+
+#[test]
+fn status_reads_install_json_and_falls_back_to_the_legacy_current_json() {
+    let fx = Fx::new();
+    let home = fx.base.join("home");
+    assert_eq!(
+        fx.run(&["status", "--json"]).json()["installedVersion"],
+        Value::Null
+    );
+    fs::create_dir_all(home.join("app")).unwrap();
+    fs::write(
+        home.join("app").join("current.json"),
+        br#"{"version":"0.0.9"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        fx.run(&["status", "--json"]).json()["installedVersion"],
+        "0.0.9"
+    );
+    fs::create_dir_all(home.join("state")).unwrap();
+    fs::write(
+        home.join("state").join("install.json"),
+        br#"{"version":"0.2.0"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        fx.run(&["status", "--json"]).json()["installedVersion"],
+        "0.2.0"
+    );
+    // 単独 install の記録は状態フォルダーの install.json へ書き、旧記録は読むだけで書き換えも削除もしない。
+    let out = fx.run(&["install"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let record: Value =
+        serde_json::from_slice(&fs::read(home.join("state").join("install.json")).unwrap())
+            .unwrap();
+    assert_eq!(record["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        fs::read(home.join("app").join("current.json")).unwrap(),
+        br#"{"version":"0.0.9"}"#
+    );
+    assert_eq!(
+        fx.run(&["status", "--json"]).json()["installedVersion"],
+        env!("CARGO_PKG_VERSION")
+    );
+}

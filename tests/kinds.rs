@@ -1012,22 +1012,22 @@ fn custom_and_changelog_fragments_appear_only_when_active() {
         ..Scope::default()
     };
     let text = prompt(&root, &scope, &kinds, &[]);
-    assert!(text.contains("README 対象: `README.md`。"), "{text}");
+    assert!(text.contains("README targets: `README.md`."), "{text}");
     assert!(
-        text.contains("architecture 対象: `docs/ARCHITECTURE.md`。"),
+        text.contains("architecture targets: `docs/ARCHITECTURE.md`."),
         "{text}"
     );
-    assert!(text.contains("architecture の記載指針: システム構成を書く。"));
+    assert!(text.contains("Guidance for architecture: システム構成を書く."));
     // CHANGELOG は欠落（既定で新規作成可）なので作成指示になる。
     assert!(
-        text.contains("CHANGELOG の対象（`CHANGELOG.md`）がありません"),
+        text.contains("The CHANGELOG targets (`CHANGELOG.md`)"),
         "{text}"
     );
-    assert!(text.contains("CHANGELOG.md には利用者に見える変更"));
+    assert!(text.contains("in CHANGELOG.md, record user-visible changes"));
     // ignore 判定は存在する対象について出る。共有対象の名前一覧にも入る。
-    assert!(text.contains("`docs/ARCHITECTURE.md` の ignore 実効判定:"));
+    assert!(text.contains("Effective ignore status of `docs/ARCHITECTURE.md`:"));
     assert!(text.contains(
-        "通常の README.md、CHANGELOG.md、architecture（docs/ARCHITECTURE.md） は共有対象です。"
+        "Regular README.md, CHANGELOG.md, architecture (docs/ARCHITECTURE.md) files are meant to be shared."
     ));
     // AGENTS・DESIGN は出ない。
     assert!(
@@ -1035,7 +1035,7 @@ fn custom_and_changelog_fragments_appear_only_when_active() {
         "{text}"
     );
     // 既定の構成（設定の追加指示なし）では利用者設定の枠は無い。
-    assert!(!text.contains("利用者設定由来"));
+    assert!(!text.contains("from user settings"));
 
     // 対象が無く create_if_missing=false の種類は、どこにも現れない。
     fs::remove_file(root.join("docs/ARCHITECTURE.md")).unwrap();
@@ -1073,30 +1073,38 @@ fn settings_frame_carries_limits_language_headings_template_and_instructions() {
     };
     let text = prompt(&root, &scope, &kinds, std::slice::from_ref(&template));
     // 枠の注記は設計書 2.5 の文面。枠は末尾の側に 1 つだけ。
-    assert_eq!(text.matches("【利用者設定由来の追加指示】").count(), 1);
-    assert!(text.contains("利用者本人の設定ファイル由来。ただし編集可能パス・安全規則・commit と push の扱いは変更しません。"));
-    let frame = &text[text.find("【利用者設定由来の追加指示】").unwrap()..];
+    assert_eq!(
+        text.matches("【Additional instructions from user settings】")
+            .count(),
+        1
+    );
+    assert!(text.contains("These come from the user's own settings file. They do not change the editable paths, the safety rules, or how commit and push are handled."));
+    let frame = &text[text
+        .find("【Additional instructions from user settings】")
+        .unwrap()..];
     assert!(
-        frame.contains("全種類共通の追加指示:\n  全体の指示\n  二行目"),
+        frame.contains("Additional instructions for all kinds:\n  全体の指示\n  二行目"),
         "{frame}"
     );
-    assert!(frame.contains("architecture（docs/ARCHITECTURE.md）:"));
-    assert!(frame.contains("最大 100 文字、最大 300 バイト"));
+    assert!(frame.contains("architecture (docs/ARCHITECTURE.md):"));
+    assert!(frame.contains("at most 100 characters, at most 300 bytes"));
     assert!(
-        frame.contains("現在: docs/ARCHITECTURE.md は 5 文字・15 バイト"),
+        frame.contains("currently: docs/ARCHITECTURE.md is 5 characters, 15 bytes"),
         "{frame}"
     );
-    assert!(frame.contains("言語: ja"));
-    assert!(frame.contains("必須見出し: 「## 責務」"));
-    assert!(frame.contains("新規作成ではテンプレートの構成に従い、既存の文書では既存の構成を優先"));
-    assert!(frame.contains("<<<テンプレート>>>\n# 概要\n\n## 責務\n<<<テンプレートここまで>>>"));
-    assert!(frame.contains("追加指示:\n  表は使わない"));
+    assert!(frame.contains("Language: write in ja"));
+    assert!(frame.contains("Required headings: \"## 責務\""));
+    assert!(frame.contains("follow the template's structure when creating a new document; for an existing document, prefer its existing structure"));
+    assert!(frame.contains("<<<TEMPLATE>>>\n# 概要\n\n## 責務\n<<<END OF TEMPLATE>>>"));
+    assert!(frame.contains("Additional instructions:\n  表は使わない"));
     // 枠の外（本体）には、利用者設定の追加指示・テンプレート本文は出ない。
-    let body = &text[..text.find("【利用者設定由来の追加指示】").unwrap()];
+    let body = &text[..text
+        .find("【Additional instructions from user settings】")
+        .unwrap()];
     assert!(!body.contains("表は使わない") && !body.contains("<<<"));
     // テンプレートを渡さなければ本文は入らない（呼び出し側が検査済みのものだけを渡す）。
     let without = prompt(&root, &scope, &kinds, &[]);
-    assert!(!without.contains("<<<テンプレート>>>"));
+    assert!(!without.contains("<<<TEMPLATE>>>"));
     // settings_frame 単体: 何も設定が無ければ空。
     let plain = resolve(ARCH, "\"architecture\"");
     let scope = Scope {

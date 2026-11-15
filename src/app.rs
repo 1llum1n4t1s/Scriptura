@@ -8,12 +8,21 @@
 // Windows では起動中の実行ファイルを上書きできないが、名前の変更はできる。そのため旧ファイルを退避名へ
 // 移してから新しいファイルを置き、退避名は削除できるときに片付ける。置き換えたときは、動いている hook
 // プロセスが旧版のまま終わるだけなので再起動は不要だが、結果の `replaced` で知らせる。
+//
+// 一般の利用者向けの導入は Setup（Velopack。crate::app_update）が既定で、この `install` は上級者向けの従来経路として
+// 残す。導入の記録は状態フォルダーの `install.json` に書く。以前の版が導入先に書いた `current.json` は、
+// status の読み取りのフォールバックとしてだけ使う（書かない・消さない）。
 use crate::paths;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{fs, io::Write, path::Path};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// 単独 `install` の記録（状態フォルダー直下）。
+pub const INSTALL_RECORD: &str = "install.json";
+/// 以前の版の記録（導入先直下）。読み取りのフォールバックだけに使う。
+pub const LEGACY_INSTALL_RECORD: &str = "current.json";
 
 fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -101,10 +110,12 @@ pub fn install() -> Result<Value, String> {
     let target = paths::app_executable(&app);
     // 導入先の実行ファイル自身から呼ばれた場合は、同じ内容なので何も変わらない。
     let placement = place_executable(&target, &bytes)?;
-    let record = json!({"version":VERSION,"sha256":digest(&bytes)});
-    fs::write(
-        app.join("current.json"),
-        serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?,
+    let record = json!({"version":VERSION,"sha256":digest(&bytes),"executable":target});
+    let state = paths::state_dir();
+    fs::create_dir_all(&state).map_err(|e| e.to_string())?;
+    crate::app_update::atomic_write(
+        &state.join(INSTALL_RECORD),
+        &serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     Ok(json!({
@@ -116,27 +127,60 @@ pub fn install() -> Result<Value, String> {
     }))
 }
 
+/// 単独 `install` で導入した版。状態フォルダーの `install.json` を先に読み、無ければ（または読めなければ）
+/// 以前の版が導入先に書いた `current.json` を読む。どちらも無ければ None。
+pub fn installed_version(state_dir: &Path, app_dir: &Path) -> Option<Value> {
+    let read = |path: std::path::PathBuf| {
+        fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+            .map(|v| v["version"].clone())
+            .filter(|v| v.is_string())
+    };
+    read(state_dir.join(INSTALL_RECORD)).or_else(|| read(app_dir.join(LEGACY_INSTALL_RECORD)))
+}
+
 /// 導入状態と状態フォルダの場所。worker の設定は利用者設定（config）が正本なので、cli::status が足す。
+/// 既存のキーは改名しない（スキル・利用者のスクリプトが読むため）。Setup 版の情報は `setup` に足す。
 pub fn status() -> Value {
     let app = paths::app_dir();
     let exe = paths::app_executable(&app);
-    let installed = fs::read(app.join("current.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let installed = installed_version(&paths::state_dir(), &app);
     json!({
         "version": VERSION,
         "installRoot": app,
         "executable": exe,
         "installed": exe.is_file(),
-        "installedVersion": installed.as_ref().map(|v| v["version"].clone()),
+        "installedVersion": installed,
         "stateDir": paths::state_dir(),
-        "stateDb": crate::maintenance::state_db_path()
+        "stateDb": crate::maintenance::state_db_path(),
+        "setup": crate::app_update::setup_status()
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_version_prefers_install_json_and_falls_back_to_current_json() {
+        let root =
+            std::env::temp_dir().join(format!("scriptura-installed-{}", uuid::Uuid::new_v4()));
+        let (state, app) = (root.join("state"), root.join("app"));
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&app).unwrap();
+        assert_eq!(installed_version(&state, &app), None);
+        // 以前の版の記録だけがある（従来の利用者）。
+        fs::write(app.join(LEGACY_INSTALL_RECORD), br#"{"version":"0.0.9"}"#).unwrap();
+        assert_eq!(installed_version(&state, &app), Some(json!("0.0.9")));
+        // 新しい記録があればそちらを使う。
+        fs::write(state.join(INSTALL_RECORD), br#"{"version":"0.1.0"}"#).unwrap();
+        assert_eq!(installed_version(&state, &app), Some(json!("0.1.0")));
+        // 新しい記録が壊れていれば、以前の記録へ戻る。
+        fs::write(state.join(INSTALL_RECORD), b"{ broken").unwrap();
+        assert_eq!(installed_version(&state, &app), Some(json!("0.0.9")));
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn executable_placement_is_idempotent_and_replaces_by_rename() {

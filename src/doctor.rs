@@ -42,11 +42,7 @@ pub fn run(verify: bool) -> Value {
     let claude = claude_path(&worker);
     items.push(match &claude {
         Some(p) => item("claude", "ok", format!("{}", p.display())),
-        None => item(
-            "claude",
-            "fail",
-            "Claude Code CLI が見つかりません（PATH に入れるか、設定の worker.claude_path に絶対パスを指定してください）",
-        ),
+        None => item("claude", "fail", crate::t!("doctor.claude_missing")),
     });
     if let Some(p) = &claude {
         items.push(claude_auth(p));
@@ -74,9 +70,13 @@ fn platform() -> Value {
         ("macos", "aarch64") | ("linux", "x86_64") | ("linux", "aarch64") => item(
             "platform",
             "warn",
-            format!("{label}（実機での動作は未検証です）"),
+            crate::t!("doctor.platform_unverified", platform = label),
         ),
-        _ => item("platform", "fail", format!("{label} は対応していません")),
+        _ => item(
+            "platform",
+            "fail",
+            crate::t!("doctor.platform_unsupported", platform = label),
+        ),
     }
 }
 
@@ -84,7 +84,7 @@ fn git() -> Value {
     let name = if cfg!(windows) { "git.exe" } else { "git" };
     match maintenance::find_in_path(name, std::env::var_os("PATH")) {
         Some(p) => item("git", "ok", p.display().to_string()),
-        None => item("git", "fail", "git が PATH にありません"),
+        None => item("git", "fail", crate::t!("doctor.git_missing")),
     }
 }
 
@@ -115,20 +115,20 @@ fn claude_auth(claude: &Path) -> Value {
                 Some(m) => item(
                     "claudeAuth",
                     "ok",
-                    format!("ログイン済み（authMethod: {m}）"),
+                    crate::t!("doctor.claude_auth_method", method = m),
                 ),
-                None => item("claudeAuth", "ok", "ログイン済み"),
+                None => item("claudeAuth", "ok", crate::t!("doctor.logged_in")),
             }
         }
         Ok(_) => item(
             "claudeAuth",
             "fail",
-            "Claude Code にログインしていません（claude auth login を実行してください）",
+            crate::t!("doctor.claude_not_logged_in"),
         ),
         Err(_) => item(
             "claudeAuth",
             "warn",
-            "claude auth status を確認できませんでした（時間切れまたは起動失敗）",
+            crate::t!("doctor.claude_auth_unknown"),
         ),
     }
 }
@@ -149,26 +149,14 @@ fn github_push_registered(config: Option<&config::Config>) -> bool {
 fn gh_auth() -> Value {
     let name = if cfg!(windows) { "gh.exe" } else { "gh" };
     let Some(gh) = maintenance::find_in_path(name, std::env::var_os("PATH")) else {
-        return item(
-            "gh",
-            "fail",
-            "push モードの GitHub リポジトリがありますが gh が PATH にありません",
-        );
+        return item("gh", "fail", crate::t!("doctor.gh_missing"));
     };
     let mut c = command(&gh.to_string_lossy());
     c.args(["auth", "status"]);
     match capture(c, None, AUTH_TIMEOUT, false) {
-        Ok(r) if r.code == Some(0) => item("gh", "ok", "gh にログイン済み"),
-        Ok(_) => item(
-            "gh",
-            "fail",
-            "gh にログインしていません（gh auth login を実行してください）",
-        ),
-        Err(_) => item(
-            "gh",
-            "warn",
-            "gh auth status を確認できませんでした（時間切れまたは起動失敗）",
-        ),
+        Ok(r) if r.code == Some(0) => item("gh", "ok", crate::t!("doctor.gh_logged_in")),
+        Ok(_) => item("gh", "fail", crate::t!("doctor.gh_not_logged_in")),
+        Err(_) => item("gh", "warn", crate::t!("doctor.gh_auth_unknown")),
     }
 }
 
@@ -178,46 +166,43 @@ fn config_items(loaded: &Loaded) -> Vec<Value> {
         Loaded::Missing => vec![item(
             "config",
             "warn",
-            format!(
-                "設定ファイルがありません（{}）。scriptura enable で有効化してください",
-                path.display()
-            ),
+            crate::t!("doctor.config_missing", path = path.display()),
         )],
         Loaded::Invalid(reason) => vec![item(
             "config",
             "fail",
-            format!(
-                "設定ファイルを読めません（{}）: {}",
-                path.display(),
-                crate::cli::one_line(reason)
+            crate::t!(
+                "doctor.config_invalid",
+                path = path.display(),
+                reason = crate::cli::one_line(reason)
             ),
         )],
         Loaded::Ok(c) => {
             let consent = match &c.consent {
-                None => item(
-                    "consent",
-                    "warn",
-                    "同意が記録されていません（scriptura enable で同意してください）",
-                ),
+                None => item("consent", "warn", crate::t!("doctor.consent_missing")),
                 Some(x) if x.version < config::CURRENT_CONSENT_VERSION => item(
                     "consent",
                     "warn",
-                    format!(
-                        "同意の版が古いため動作しません（記録 {} / 現行 {}）。scriptura enable で再同意してください",
-                        x.version,
-                        config::CURRENT_CONSENT_VERSION
+                    crate::t!(
+                        "doctor.consent_old",
+                        recorded = x.version,
+                        current = config::CURRENT_CONSENT_VERSION
                     ),
                 ),
-                Some(x) => item("consent", "ok", format!("同意済み（版 {}）", x.version)),
+                Some(x) => item(
+                    "consent",
+                    "ok",
+                    crate::t!("doctor.consent_ok", version = x.version),
+                ),
             };
             vec![
                 item(
                     "config",
                     "ok",
-                    format!(
-                        "{}（登録リポジトリ {} 件）",
-                        path.display(),
-                        c.repository.len()
+                    crate::t!(
+                        "doctor.config_ok",
+                        path = path.display(),
+                        count = c.repository.len()
                     ),
                 ),
                 consent,
@@ -293,14 +278,15 @@ fn kinds_items(config: Option<&config::Config>) -> Vec<Value> {
             }
         }
     }
-    let summary = format!(
-        "組み込み 4 種・カスタム {} 種{}。テンプレートが読めるもの {readable} 件",
-        custom.len(),
-        if custom.is_empty() {
+    let summary = crate::t!(
+        "doctor.kinds_summary",
+        custom = custom.len(),
+        ids = if custom.is_empty() {
             String::new()
         } else {
-            format!("（{}）", custom.join(", "))
-        }
+            crate::t!("doctor.kinds_ids", ids = custom.join(", "))
+        },
+        readable = readable
     );
     let mut items = vec![if problems.is_empty() {
         item("kinds", "ok", summary)
@@ -308,7 +294,11 @@ fn kinds_items(config: Option<&config::Config>) -> Vec<Value> {
         item(
             "kinds",
             if blocking { "fail" } else { "warn" },
-            format!("{summary}。{}", problems.join(" / ")),
+            crate::t!(
+                "doctor.kinds_problems",
+                summary = summary,
+                problems = problems.join(" / ")
+            ),
         )
     }];
 
@@ -341,7 +331,12 @@ fn kinds_items(config: Option<&config::Config>) -> Vec<Value> {
                 let too_many_chars = matches!((kind.max_chars, chars), (Some(m), Some(c)) if c > m);
                 let too_many_bytes = kind.max_bytes.is_some_and(|m| bytes > m);
                 if too_many_chars || too_many_bytes {
-                    over.push(format!("{}（{}・{}）", rel, kind.id(), repo.root));
+                    over.push(crate::t!(
+                        "doctor.limit_over_item",
+                        path = rel,
+                        id = kind.id(),
+                        repo = repo.root
+                    ));
                 }
             }
         }
@@ -350,20 +345,14 @@ fn kinds_items(config: Option<&config::Config>) -> Vec<Value> {
         items.push(item(
             "kindsLimits",
             "info",
-            format!(
-                "既存の文書が設定した上限を超えています: {}。次の保守では、上限内に収まらない更新案は作られません（棄却されます）",
-                over.join(", ")
-            ),
+            crate::t!("doctor.limit_over", items = over.join(", ")),
         ));
     }
     if !push_changelog.is_empty() {
         items.push(item(
             "kindsChangelog",
             "info",
-            format!(
-                "push モードで CHANGELOG.md を保守するリポジトリがあります（{}）。リリース手順（vava など）が同じ CHANGELOG.md を更新する場合、保守の commit と競合することがあります。版の節が既にあれば Scriptura は何もしません",
-                push_changelog.join(", ")
-            ),
+            crate::t!("doctor.changelog_push", repos = push_changelog.join(", ")),
         ));
     }
     items
@@ -380,7 +369,7 @@ fn state_dir() -> Value {
         return item(
             "stateDir",
             "fail",
-            format!("{} の親が見つかりません", dir.display()),
+            crate::t!("doctor.state_no_parent", path = dir.display()),
         );
     };
     let probe = base.join(format!(
@@ -391,19 +380,27 @@ fn state_dir() -> Value {
         Ok(()) => {
             let _ = fs::remove_file(&probe);
             if base == dir {
-                item("stateDir", "ok", format!("{}（書き込み可）", dir.display()))
+                item(
+                    "stateDir",
+                    "ok",
+                    crate::t!("doctor.state_writable", path = dir.display()),
+                )
             } else {
                 item(
                     "stateDir",
                     "ok",
-                    format!("{}（未作成・作成可能）", dir.display()),
+                    crate::t!("doctor.state_creatable", path = dir.display()),
                 )
             }
         }
         Err(e) => item(
             "stateDir",
             "fail",
-            format!("{} へ書き込めません（{}）", base.display(), e.kind()),
+            crate::t!(
+                "doctor.state_unwritable",
+                path = base.display(),
+                error = e.kind()
+            ),
         ),
     }
 }
@@ -418,31 +415,24 @@ fn settings_items() -> Vec<Value> {
                 return vec![item(
                     "settings",
                     "warn",
-                    format!(
-                        "{} を JSON として読めないため hook の確認を省略しました",
-                        path.display()
-                    ),
+                    crate::t!("doctor.settings_invalid", path = path.display()),
                 )];
             }
         },
         // 無ければ確認する登録が無いだけ。
         Err(_) => json!({}),
     };
-    let (scriptura_hook, legacy_hook) = connect::scan_stop_hooks(&settings);
-    // プラグインが有効か（enabledPlugins のキーは `名前@マーケットプレイス`）。
-    let plugin_enabled = settings["enabledPlugins"].as_object().is_some_and(|m| {
-        m.iter()
-            .any(|(k, v)| k.split('@').next() == Some("scriptura") && *v == json!(true))
-    });
+    // Setup 版なら、その実行ファイルを完全パス一致で指す hook も Scriptura のものとして数える
+    // （Linux で AppImage の名前を変えた場合も二重登録を見落とさないため）。
+    let own = crate::app_update::setup_executable();
+    let scan = connect::scan_settings(&settings, own.as_deref());
+    let (scriptura_hook, legacy_hook, plugin_enabled) =
+        (scan.scriptura_hook, scan.legacy_hook, scan.plugin_enabled);
     let mut items = Vec::new();
     items.push(if scriptura_hook && plugin_enabled {
-        item(
-            "hookDuplicate",
-            "warn",
-            "settings.json の Stop hook と scriptura プラグインの両方が有効で、二重に実行されます。scriptura connect claude-code --remove --apply で単独登録を外してください",
-        )
+        item("hookDuplicate", "warn", crate::t!("doctor.hook_duplicate"))
     } else {
-        item("hookDuplicate", "ok", "hook の二重登録はありません")
+        item("hookDuplicate", "ok", crate::t!("doctor.hook_single"))
     });
     let mut policy = Vec::new();
     if settings["allowManagedHooksOnly"] == json!(true) {
@@ -452,24 +442,22 @@ fn settings_items() -> Vec<Value> {
         policy.push("disableAllHooks");
     }
     items.push(if policy.is_empty() {
-        item("hookPolicy", "ok", "hook を無効にする設定は見当たりません")
+        item("hookPolicy", "ok", crate::t!("doctor.hook_policy_ok"))
     } else {
         item(
             "hookPolicy",
             "warn",
-            format!(
-                "{} が設定されているため hook が動かない可能性があります",
-                policy.join(" / ")
-            ),
+            crate::t!("doctor.hook_policy_warn", settings = policy.join(" / ")),
         )
     });
     if legacy_hook {
-        items.push(item(
-            "legacyHook",
-            "warn",
-            "旧 agents-maintenance の Stop hook が残っています。scriptura connect claude-code --apply で置き換えるか、手動で削除してください",
-        ));
+        items.push(item("legacyHook", "warn", crate::t!("doctor.legacy_hook")));
     }
+    // Setup（Velopack）版の項目（プラグインとの重複・登録・旧単独導入の残存・自動更新）。管理外なら 1 項目だけ。
+    items.extend(crate::app_update::doctor_items(
+        plugin_enabled,
+        scan.own_hook,
+    ));
     items
 }
 
@@ -487,11 +475,7 @@ fn file_sha256(path: &Path) -> Option<String> {
 /// 実行中の本体が `<plugin>/bin|libexec/` 配下なら、プラグインの SHA256SUMS と照合する。
 fn verify_bundle() -> Value {
     let Ok(exe) = std::env::current_exe().and_then(fs::canonicalize) else {
-        return item(
-            "verify",
-            "info",
-            "実行ファイルの場所を確認できないため対象外です",
-        );
+        return item("verify", "info", crate::t!("doctor.verify_no_exe"));
     };
     verify_at(&exe)
 }
@@ -504,55 +488,55 @@ pub fn verify_at(exe: &Path) -> Value {
         .is_some_and(|n| n == "bin" || n == "libexec");
     let root = dir.and_then(Path::parent);
     let (true, Some(root)) = (in_bundle, root) else {
-        return item(
-            "verify",
-            "info",
-            "プラグイン配下の実行ファイルではないため対象外です",
-        );
+        return item("verify", "info", crate::t!("doctor.verify_not_plugin"));
     };
     let sums = root.join("SHA256SUMS");
     let Ok(text) = fs::read_to_string(&sums) else {
         // プラグインの形（.claude-plugin/plugin.json）なのに SHA256SUMS が無いのは配布事故。
         return if root.join(".claude-plugin").join("plugin.json").is_file() {
-            item("verify", "fail", "プラグインに SHA256SUMS がありません")
+            item("verify", "fail", crate::t!("doctor.verify_sums_missing"))
         } else {
-            item("verify", "info", "SHA256SUMS が無いため対象外です")
+            item("verify", "info", crate::t!("doctor.verify_no_sums"))
         };
     };
     let mut checked = 0;
     let mut listed_self = false;
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let Some((hex, rel)) = parse_sum_line(line.trim_end_matches('\r')) else {
-            return item("verify", "fail", "SHA256SUMS の形式が不正です");
+            return item("verify", "fail", crate::t!("doctor.verify_bad_format"));
         };
         if rel.is_empty()
             || rel.starts_with('/')
             || rel.contains('\\')
             || rel.split('/').any(|s| s == ".." || s.is_empty())
         {
-            return item("verify", "fail", "SHA256SUMS に不正なパスがあります");
+            return item("verify", "fail", crate::t!("doctor.verify_bad_path"));
         }
         let target = root.join(rel);
         let Some(actual) = file_sha256(&target) else {
-            return item("verify", "fail", format!("同梱ファイルを読めません: {rel}"));
+            return item(
+                "verify",
+                "fail",
+                crate::t!("doctor.verify_unreadable", path = rel),
+            );
         };
         if !actual.eq_ignore_ascii_case(hex) {
-            return item("verify", "fail", format!("ハッシュが一致しません: {rel}"));
+            return item(
+                "verify",
+                "fail",
+                crate::t!("doctor.verify_mismatch", path = rel),
+            );
         }
         listed_self |= fs::canonicalize(&target).is_ok_and(|t| t == exe);
         checked += 1;
     }
     if !listed_self {
-        return item(
-            "verify",
-            "fail",
-            "実行中の本体が SHA256SUMS に載っていません",
-        );
+        return item("verify", "fail", crate::t!("doctor.verify_self_missing"));
     }
     item(
         "verify",
         "ok",
-        format!("同梱ファイル {checked} 件のハッシュが一致しました"),
+        crate::t!("doctor.verify_ok", count = checked),
     )
 }
 

@@ -31,6 +31,7 @@ use crate::config::Store;
 mod confirm;
 mod guard;
 mod handlers;
+pub mod locale;
 mod read;
 mod views;
 
@@ -102,6 +103,14 @@ impl AppState {
             shutdown: tokio::sync::Notify::new(),
         };
         (Self(Arc::new(inner)), key)
+    }
+
+    /// 待ち受けのポート（Host の値から取る。言語の Cookie の名前に使う）。
+    pub(crate) fn port(&self) -> u16 {
+        self.hosts[0]
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse().ok())
+            .unwrap_or(0)
     }
 
     /// 操作があったことを記録する。
@@ -180,8 +189,14 @@ pub fn router(state: AppState) -> Router {
         .route("/history/restore", post(handlers::history_restore))
         .route("/history/{id}", get(handlers::history_detail))
         .route("/shutdown", post(handlers::shutdown))
+        .route("/language", post(locale::choose))
         .fallback(handlers::not_found)
         .layer(middleware::from_fn_with_state(state.clone(), guard::guard))
+        // 表示言語は保護より外側で決める（拒否ページも同じ言語にする）。
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            locale::localize,
+        ))
         .layer(middleware::from_fn(guard::security_headers))
         .with_state(state)
 }
@@ -207,16 +222,14 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         match arg.as_str() {
             "--no-open" => out.open = false,
             "--port" => {
-                let raw = it.next().ok_or("--port <番号> が必要です")?;
+                let raw = it.next().ok_or(crate::t!("ui.cli.port_required"))?;
                 out.port = raw
                     .trim()
                     .parse::<u16>()
-                    .map_err(|_| format!("--port は 0〜65535 の数です: {raw}"))?;
+                    .map_err(|_| crate::t!("ui.cli.port_invalid", value = raw))?;
             }
             other => {
-                return Err(format!(
-                    "未知の引数です: {other}（使い方: scriptura ui [--port <n>] [--no-open]）"
-                ));
+                return Err(crate::t!("ui.cli.unknown_arg", arg = other));
             }
         }
     }
@@ -238,7 +251,7 @@ pub fn run(args: &[String]) -> i32 {
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("管理画面を起動できません: {e}");
+            eprintln!("{}", crate::t!("ui.cli.start_failed", error = e));
             return 1;
         }
     };
@@ -250,36 +263,32 @@ pub fn run(args: &[String]) -> i32 {
 
 async fn serve(args: Args) -> i32 {
     // 127.0.0.1 にだけ bind する（設計書 9.2-1）。
-    let listener = match tokio::net::TcpListener::bind(SocketAddr::from((
-        Ipv4Addr::LOCALHOST,
-        args.port,
-    )))
-    .await
-    {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!(
-                "ポート {} で待ち受けられません（既に scriptura ui が起動中か、ほかのアプリが使用中です）: {e}",
-                args.port
-            );
-            return 1;
-        }
-    };
+    let listener =
+        match tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, args.port)))
+            .await
+        {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    crate::t!("ui.cli.bind_failed", port = args.port, error = e)
+                );
+                return 1;
+            }
+        };
     let port = match listener.local_addr() {
         Ok(a) => a.port(),
         Err(e) => {
-            eprintln!("待ち受けのポートを確認できません: {e}");
+            eprintln!("{}", crate::t!("ui.cli.port_unknown", error = e));
             return 1;
         }
     };
     let (state, key) = AppState::new(Store::current(), port);
     let url = format!("http://127.0.0.1:{port}/auth?key={key}");
-    println!("Scriptura 管理画面: {url}");
-    println!(
-        "この URL は一度だけ使えます。終了するには Ctrl+C、画面の「終了」、または 60 分操作しないでください。"
-    );
+    println!("{}", crate::t!("ui.cli.url", url = url));
+    println!("{}", crate::t!("ui.cli.url_once"));
     if args.open && !open_browser(&url) {
-        println!("ブラウザーを開けませんでした。上の URL をブラウザーで開いてください。");
+        println!("{}", crate::t!("ui.cli.browser_failed"));
     }
     let app = router(state.clone());
     let waiter = state.clone();
@@ -288,18 +297,18 @@ async fn serve(args: Args) -> i32 {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 if waiter.idle_for() >= IDLE_LIMIT && !waiter.has_running_jobs() {
-                    println!("60 分操作が無かったため終了します。");
+                    println!("{}", crate::t!("ui.cli.idle_exit"));
                     break;
                 }
             }
         };
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => println!("終了します（Ctrl+C）。"),
-            _ = waiter.shutdown_requested() => println!("終了します（画面の「終了」）。"),
+            _ = tokio::signal::ctrl_c() => println!("{}", crate::t!("ui.cli.exit_ctrl_c")),
+            _ = waiter.shutdown_requested() => println!("{}", crate::t!("ui.cli.exit_button")),
             _ = idle => {}
         }
         if waiter.has_running_jobs() {
-            println!("実行中の run-now の完了を待っています…");
+            println!("{}", crate::t!("ui.cli.waiting_jobs"));
         }
     };
     match axum::serve(listener, app)
@@ -308,7 +317,7 @@ async fn serve(args: Args) -> i32 {
     {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("管理画面のサーバーが異常終了しました: {e}");
+            eprintln!("{}", crate::t!("ui.cli.server_failed", error = e));
             1
         }
     }

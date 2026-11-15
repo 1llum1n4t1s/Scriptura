@@ -256,13 +256,16 @@ fn validate_text(field: &str, text: &str, max_chars: usize) -> Result<(), String
         .chars()
         .any(|c| c.is_control() && !matches!(c, '\n' | '\t' | '\r'))
     {
-        return Err(format!(
-            "{field} に使えない文字（改行・タブ以外の制御文字）があります"
-        ));
+        return Err(crate::t!("kinds.text_control_chars", field = field));
     }
     let count = normalize_text(text).chars().count();
     if count > max_chars {
-        return Err(format!("{field} は {max_chars} 字以内です（{count} 字）"));
+        return Err(crate::t!(
+            "kinds.text_too_long",
+            field = field,
+            max = max_chars,
+            count = count
+        ));
     }
     Ok(())
 }
@@ -280,8 +283,11 @@ pub fn validate_template_spec(field: &str, spec: &str) -> Result<(), String> {
         return Ok(());
     }
     let bad = || {
-        format!(
-            "{field} は \"builtin\" / \"none\" / \"{TEMPLATES_DIR}/<名前>.md\" のどれかです: {spec}"
+        crate::t!(
+            "kinds.template_spec_invalid",
+            field = field,
+            dir = TEMPLATES_DIR,
+            spec = spec
         )
     };
     let rest = spec
@@ -329,7 +335,14 @@ pub(crate) fn compile_glob(field: &str, pattern: &str) -> Result<globset::Glob, 
         .literal_separator(true)
         .case_insensitive(true)
         .build()
-        .map_err(|e| format!("{field} の glob を解釈できません: {pattern}（{e}）"))
+        .map_err(|e| {
+            crate::t!(
+                "kinds.glob_invalid",
+                field = field,
+                pattern = pattern,
+                error = e
+            )
+        })
 }
 
 /// 機密パターン照合器。既定の機密パターン + exclude の「加算」を、パス区切りを意識した glob として
@@ -393,9 +406,16 @@ fn windows_reserved(segment: &str) -> bool {
 /// カスタム種類の対象パスの検証（設定読み込み時）。`sensitive` は機密パターンの照合器。
 /// 種類間の重複は呼び出し側（`validate_kinds`）が見る。
 pub fn validate_custom_path(field: &str, path: &str, sensitive: &GlobSet) -> Result<(), String> {
-    let bad = |why: &str| Err(format!("{field} のパスが不正です（{why}）: {path}"));
+    let bad = |why: &str| {
+        Err(crate::t!(
+            "kinds.path_invalid",
+            field = field,
+            why = why,
+            path = path
+        ))
+    };
     if path.is_empty() || path.len() > 200 {
-        return bad("1〜200 文字");
+        return bad(crate::t!("kinds.path_why_length"));
     }
     // worker の許可規則（`Edit(./<path>)`）と `--allowedTools` の区切りを壊さないよう ASCII の安全字種だけ。
     // 空白・カンマ・グロブ・括弧・バックスラッシュ・制御文字はここで落ちる。
@@ -403,21 +423,21 @@ pub fn validate_custom_path(field: &str, path: &str, sensitive: &GlobSet) -> Res
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
     {
-        return bad("英数字と . _ / - だけ");
+        return bad(crate::t!("kinds.path_why_chars"));
     }
     if path.starts_with('/') || path.ends_with('/') || path.contains("//") {
-        return bad("相対パスで、先頭・末尾の / と // は不可");
+        return bad(crate::t!("kinds.path_why_relative"));
     }
     let segments: Vec<&str> = path.split('/').collect();
     for seg in &segments {
         if matches!(*seg, "." | "..") {
-            return bad("`.` / `..` の区切りは不可");
+            return bad(crate::t!("kinds.path_why_dots"));
         }
         if seg.eq_ignore_ascii_case(".git") {
-            return bad(".git 配下は不可");
+            return bad(crate::t!("kinds.path_why_git"));
         }
         if seg.ends_with('.') || windows_reserved(seg) {
-            return bad("Windows で別名・予約名になる名前は不可");
+            return bad(crate::t!("kinds.path_why_windows"));
         }
     }
     let name = segments[segments.len() - 1];
@@ -427,7 +447,7 @@ pub fn validate_custom_path(field: &str, path: &str, sensitive: &GlobSet) -> Res
             .iter()
             .any(|e| e.eq_ignore_ascii_case(ext))
     {
-        return bad("拡張子は md / markdown / mdx / txt / rst / adoc");
+        return bad(crate::t!("kinds.path_why_extension"));
     }
     // 組み込みの対象（AGENTS / DESIGN / README / CHANGELOG・個人 override・.gitignore）と同名は不可。
     // AGENTS・DESIGN はサブディレクトリでも scoped 検出の対象なので階層を問わず拒否する。
@@ -438,10 +458,10 @@ pub fn validate_custom_path(field: &str, path: &str, sensitive: &GlobSet) -> Res
         "agents.md" | "agents.override.md" | "design.md" | ".gitignore"
     ) || RESERVED_NAMES.contains(&lower_path.as_str())
     {
-        return bad("組み込みの対象と同じ文書は指定できません");
+        return bad(crate::t!("kinds.path_why_builtin"));
     }
     if is_sensitive(sensitive, path) {
-        return bad("機密パターン・exclude に一致します");
+        return bad(crate::t!("kinds.path_why_sensitive"));
     }
     Ok(())
 }
@@ -461,25 +481,32 @@ fn validate_changelog_table(id: &str, c: &ChangelogSettings) -> Result<(), Strin
         validate_glob_list(&format!("{at}.release_tag"), std::slice::from_ref(tag))?;
         // git の引数として使うので、オプションに見える値は拒否する。
         if tag.starts_with('-') {
-            return Err(format!("{at}.release_tag は `-` で始められません"));
+            return Err(crate::t!(
+                "kinds.release_tag_dash",
+                field = format!("{at}.release_tag")
+            ));
         }
     }
     if let Some(n) = c.backfill_max_releases
         && !BACKFILL_RELEASES_RANGE.contains(&n)
     {
-        return Err(format!(
-            "{at}.backfill_max_releases は {}..={} の範囲です: {n}",
-            BACKFILL_RELEASES_RANGE.start(),
-            BACKFILL_RELEASES_RANGE.end()
+        return Err(crate::t!(
+            "kinds.range",
+            field = format!("{at}.backfill_max_releases"),
+            min = BACKFILL_RELEASES_RANGE.start(),
+            max = BACKFILL_RELEASES_RANGE.end(),
+            value = n
         ));
     }
     if let Some(n) = c.backfill_max_commits
         && !BACKFILL_COMMITS_RANGE.contains(&n)
     {
-        return Err(format!(
-            "{at}.backfill_max_commits は {}..={} の範囲です: {n}",
-            BACKFILL_COMMITS_RANGE.start(),
-            BACKFILL_COMMITS_RANGE.end()
+        return Err(crate::t!(
+            "kinds.range",
+            field = format!("{at}.backfill_max_commits"),
+            min = BACKFILL_COMMITS_RANGE.start(),
+            max = BACKFILL_COMMITS_RANGE.end(),
+            value = n
         ));
     }
     Ok(())
@@ -490,8 +517,12 @@ fn validate_timing(id: &str, t: &Timing) -> Result<(), String> {
     if let Some(h) = t.min_interval_hours
         && h > MIN_INTERVAL_HOURS_MAX
     {
-        return Err(format!(
-            "{at}.min_interval_hours は 0..={MIN_INTERVAL_HOURS_MAX} の範囲です: {h}"
+        return Err(crate::t!(
+            "kinds.range",
+            field = format!("{at}.min_interval_hours"),
+            min = 0,
+            max = MIN_INTERVAL_HOURS_MAX,
+            value = h
         ));
     }
     validate_glob_list(&format!("{at}.paths"), &t.paths)
@@ -510,35 +541,42 @@ pub fn validate_kinds(config: &Config) -> Result<(), String> {
         let at = format!("kinds.{id}");
         let builtin = Document::BUILTIN.iter().any(|d| d.id() == id);
         if !builtin && !is_valid_kind_id(id) {
-            return Err(format!(
-                "{at}: 種類の id は組み込み（agents / design / readme / changelog）か、英小文字・数字・ハイフンの 32 文字以内です（予約語 new は使えません）"
-            ));
+            return Err(crate::t!("kinds.id_invalid", field = at));
         }
         if builtin {
             // 組み込みの対象と説明は固定。変えられると保守対象や指針をすり替えられてしまう。
             if !s.paths.is_empty() {
-                return Err(format!("{at}.paths は組み込みの種類には書けません"));
+                return Err(crate::t!(
+                    "kinds.builtin_field",
+                    field = format!("{at}.paths")
+                ));
             }
             if s.guidance.is_some() {
-                return Err(format!("{at}.guidance は組み込みの種類には書けません"));
+                return Err(crate::t!(
+                    "kinds.builtin_field",
+                    field = format!("{at}.guidance")
+                ));
             }
         } else {
             custom_count += 1;
             if custom_count > MAX_CUSTOM_KINDS {
-                return Err(format!("カスタム種類は {MAX_CUSTOM_KINDS} 種までです"));
+                return Err(crate::t!("kinds.too_many_custom", max = MAX_CUSTOM_KINDS));
             }
             if !CUSTOM_PATHS_RANGE.contains(&s.paths.len()) {
-                return Err(format!(
-                    "{at}.paths は {}〜{} 件が必須です",
-                    CUSTOM_PATHS_RANGE.start(),
-                    CUSTOM_PATHS_RANGE.end()
+                return Err(crate::t!(
+                    "kinds.paths_count",
+                    field = format!("{at}.paths"),
+                    min = CUSTOM_PATHS_RANGE.start(),
+                    max = CUSTOM_PATHS_RANGE.end()
                 ));
             }
             for p in &s.paths {
                 validate_custom_path(&format!("{at}.paths"), p, &sensitive)?;
                 if !seen_paths.insert(p.to_ascii_lowercase()) {
-                    return Err(format!(
-                        "{at}.paths のパスが重複しています（種類内・種類間）: {p}"
+                    return Err(crate::t!(
+                        "kinds.paths_duplicate",
+                        field = format!("{at}.paths"),
+                        path = p
                     ));
                 }
             }
@@ -546,7 +584,12 @@ pub fn validate_kinds(config: &Config) -> Result<(), String> {
                 Some(g) if !g.trim().is_empty() => {
                     validate_text(&format!("{at}.guidance"), g, GUIDANCE_MAX_CHARS)?
                 }
-                _ => return Err(format!("{at}.guidance は必須です（何を書く文書か）")),
+                _ => {
+                    return Err(crate::t!(
+                        "kinds.guidance_required",
+                        field = format!("{at}.guidance")
+                    ));
+                }
             }
         }
         if let Some(t) = &s.template {
@@ -554,15 +597,21 @@ pub fn validate_kinds(config: &Config) -> Result<(), String> {
         }
         for (name, value) in [("max_chars", s.max_chars), ("max_bytes", s.max_bytes)] {
             if value == Some(0) {
-                return Err(format!("{at}.{name} は 1 以上です"));
+                return Err(crate::t!(
+                    "kinds.at_least_one",
+                    field = format!("{at}.{name}")
+                ));
             }
         }
         if id == "agents"
             && let Some(b) = s.max_bytes
             && b > AGENTS_MAX_BYTES
         {
-            return Err(format!(
-                "{at}.max_bytes は {AGENTS_MAX_BYTES} 以下です（AGENTS 系は 30,000 bytes 未満が規約）: {b}"
+            return Err(crate::t!(
+                "kinds.agents_max_bytes",
+                field = format!("{at}.max_bytes"),
+                max = AGENTS_MAX_BYTES,
+                value = b
             ));
         }
         if let Some(i) = &s.instructions {
@@ -571,13 +620,17 @@ pub fn validate_kinds(config: &Config) -> Result<(), String> {
         if let Some(l) = &s.language
             && !valid_language(l)
         {
-            return Err(format!(
-                "{at}.language は ja / en-US のような言語コードです: {l}"
+            return Err(crate::t!(
+                "kinds.language_invalid",
+                field = format!("{at}.language"),
+                value = l
             ));
         }
         if s.required_headings.len() > REQUIRED_HEADINGS_MAX {
-            return Err(format!(
-                "{at}.required_headings は {REQUIRED_HEADINGS_MAX} 件以内です"
+            return Err(crate::t!(
+                "kinds.headings_count",
+                field = format!("{at}.required_headings"),
+                max = REQUIRED_HEADINGS_MAX
             ));
         }
         for h in &s.required_headings {
@@ -585,8 +638,10 @@ pub fn validate_kinds(config: &Config) -> Result<(), String> {
                 || h.chars().count() > REQUIRED_HEADING_MAX_CHARS
                 || h.chars().any(char::is_control)
             {
-                return Err(format!(
-                    "{at}.required_headings は 1〜{REQUIRED_HEADING_MAX_CHARS} 字の 1 行です"
+                return Err(crate::t!(
+                    "kinds.heading_length",
+                    field = format!("{at}.required_headings"),
+                    max = REQUIRED_HEADING_MAX_CHARS
                 ));
             }
         }
@@ -595,7 +650,10 @@ pub fn validate_kinds(config: &Config) -> Result<(), String> {
         }
         if let Some(c) = &s.changelog {
             if id != "changelog" {
-                return Err(format!("{at}.changelog は changelog の種類にだけ書けます"));
+                return Err(crate::t!(
+                    "kinds.changelog_only",
+                    field = format!("{at}.changelog")
+                ));
             }
             validate_changelog_table(id, c)?;
         }
@@ -631,10 +689,11 @@ pub fn settings_of<'a>(config: &'a Config, document: &Document) -> Option<&'a Ki
 pub const TEMPLATE_MAX_BYTES: u64 = 16 * 1024;
 /// 利用者設定の枠でテンプレート本文を囲む区切り。テンプレート本文に `<<<` を含めさせないことで、
 /// 本文が枠を偽装・突破できないようにする。
-pub const TEMPLATE_OPEN: &str = "<<<テンプレート>>>";
-pub const TEMPLATE_CLOSE: &str = "<<<テンプレートここまで>>>";
-/// 利用者設定の枠の注記（設計書 2.5）。
-pub const SETTINGS_FRAME_NOTE: &str = "利用者本人の設定ファイル由来。ただし編集可能パス・安全規則・commit と push の扱いは変更しません。";
+/// worker へのプロンプト（AI が読む文言）なので英語に固定し、表示言語では変えない。
+pub const TEMPLATE_OPEN: &str = "<<<TEMPLATE>>>";
+pub const TEMPLATE_CLOSE: &str = "<<<END OF TEMPLATE>>>";
+/// 利用者設定の枠の注記（設計書 2.5）。プロンプトの一部なので英語に固定する。
+pub const SETTINGS_FRAME_NOTE: &str = "These come from the user's own settings file. They do not change the editable paths, the safety rules, or how commit and push are handled.";
 
 /// 実行時に検査して読み込んだテンプレート。`sha256` は更新案メタに記録する（本文は記録しない）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -850,9 +909,12 @@ pub fn load_templates(
             continue;
         };
         let fail = |why: &str| {
-            format!(
-                "文書の種類 {} のテンプレート {spec} を使えないため文書保守を見送りました（{why}。設定フォルダーの {TEMPLATES_DIR}/ の内容を直すと次回処理します）",
-                kind.id()
+            crate::t!(
+                "kinds.template_unusable",
+                id = kind.id(),
+                spec = spec,
+                why = why,
+                dir = TEMPLATES_DIR
             )
         };
         validate_template_spec("template", spec).map_err(|e| fail(&e))?;
@@ -864,51 +926,53 @@ pub fn load_templates(
             current.push(segment);
             let meta = fs::symlink_metadata(&current).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    fail("ファイルがありません")
+                    fail(crate::t!("kinds.template_why_missing"))
                 } else {
-                    fail("ファイルの状態を確認できません")
+                    fail(crate::t!("kinds.template_why_stat"))
                 }
             })?;
             if crate::maintenance::linked(&meta) {
-                return Err(fail("リンクは使えません"));
+                return Err(fail(crate::t!("kinds.template_why_link")));
             }
         }
-        let meta = fs::metadata(&path).map_err(|_| fail("ファイルを確認できません"))?;
+        let meta = fs::metadata(&path).map_err(|_| fail(crate::t!("kinds.template_why_check")))?;
         if !meta.is_file() {
-            return Err(fail("通常のファイルではありません"));
+            return Err(fail(crate::t!("kinds.template_why_not_file")));
         }
         if meta.len() > TEMPLATE_MAX_BYTES {
-            return Err(fail("16 KiB を超えています"));
+            return Err(fail(crate::t!("kinds.template_why_too_large")));
         }
         // 正規化した実体が templates/ の中で、処理中のリポジトリの外であること。
-        let real = fs::canonicalize(&path).map_err(|_| fail("実体を解決できません"))?;
+        let real =
+            fs::canonicalize(&path).map_err(|_| fail(crate::t!("kinds.template_why_resolve")))?;
         let real_templates = fs::canonicalize(&templates_dir)
-            .map_err(|_| fail("templates フォルダーがありません"))?;
+            .map_err(|_| fail(crate::t!("kinds.template_why_no_dir")))?;
         let real = PathBuf::from(crate::maintenance::path_string(&real));
         let real_templates = PathBuf::from(crate::maintenance::path_string(&real_templates));
         if !real.starts_with(&real_templates) {
-            return Err(fail("templates フォルダーの外を指しています"));
+            return Err(fail(crate::t!("kinds.template_why_outside")));
         }
         let real_root = fs::canonicalize(repo_root)
             .map(|p| PathBuf::from(crate::maintenance::path_string(&p)))
             .unwrap_or_else(|_| repo_root.to_path_buf());
         if real.starts_with(&real_root) {
-            return Err(fail("処理中のリポジトリ内のファイルは使えません"));
+            return Err(fail(crate::t!("kinds.template_why_in_repo")));
         }
-        let bytes = fs::read(&path).map_err(|_| fail("読み取れません"))?;
+        let bytes = fs::read(&path).map_err(|_| fail(crate::t!("kinds.template_why_read")))?;
         if bytes.len() as u64 > TEMPLATE_MAX_BYTES {
-            return Err(fail("16 KiB を超えています"));
+            return Err(fail(crate::t!("kinds.template_why_too_large")));
         }
-        let text = String::from_utf8(bytes.clone()).map_err(|_| fail("UTF-8 ではありません"))?;
+        let text =
+            String::from_utf8(bytes.clone()).map_err(|_| fail(crate::t!("config.not_utf8")))?;
         let body = normalize_text(&text);
         if body
             .chars()
             .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
         {
-            return Err(fail("改行・タブ以外の制御文字があります"));
+            return Err(fail(crate::t!("kinds.template_why_control")));
         }
         if body.contains("<<<") {
-            return Err(fail("区切り `<<<` を含められません"));
+            return Err(fail(crate::t!("kinds.template_why_delimiter")));
         }
         out.push(LoadedTemplate {
             kind: kind.id().to_string(),
@@ -997,7 +1061,7 @@ pub fn limit_error(root: &Path, kinds: &[ResolvedKind], files: &[String]) -> Opt
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => {
-                problems.push(format!("{rel} の状態を確認できません"));
+                problems.push(crate::t!("kinds.limit_stat", path = rel));
                 continue;
             }
         };
@@ -1007,7 +1071,7 @@ pub fn limit_error(root: &Path, kinds: &[ResolvedKind], files: &[String]) -> Opt
         let data = match fs::read(&path) {
             Ok(d) => d,
             Err(_) => {
-                problems.push(format!("{rel} を読み取れません"));
+                problems.push(crate::t!("kinds.limit_read", path = rel));
                 continue;
             }
         };
@@ -1015,40 +1079,48 @@ pub fn limit_error(root: &Path, kinds: &[ResolvedKind], files: &[String]) -> Opt
         if let Some(max) = kind.max_bytes
             && data.len() as u64 > max
         {
-            problems.push(format!(
-                "{name} の {rel} が上限を超えています（{} バイト、上限 {max} バイト）",
-                data.len()
+            problems.push(crate::t!(
+                "kinds.limit_bytes",
+                name = name,
+                path = rel,
+                size = data.len(),
+                max = max
             ));
         }
         if kind.max_chars.is_none() && kind.required_headings.is_empty() {
             continue;
         }
         let Ok(text) = String::from_utf8(data) else {
-            problems.push(format!(
-                "{rel} が UTF-8 ではないため文字数・見出しを検査できません"
-            ));
+            problems.push(crate::t!("kinds.limit_not_utf8", path = rel));
             continue;
         };
         if let Some(max) = kind.max_chars {
             let count = text.chars().count() as u64;
             if count > max {
-                problems.push(format!(
-                    "{name} の {rel} が上限を超えています（{count} 文字、上限 {max} 文字）"
+                problems.push(crate::t!(
+                    "kinds.limit_chars",
+                    name = name,
+                    path = rel,
+                    count = count,
+                    max = max
                 ));
             }
         }
         for heading in &kind.required_headings {
             if !has_heading(&text, heading) {
-                problems.push(format!(
-                    "{name} の {rel} に必須見出し「{heading}」がありません"
+                problems.push(crate::t!(
+                    "kinds.limit_heading",
+                    name = name,
+                    path = rel,
+                    heading = heading
                 ));
             }
         }
     }
     (!problems.is_empty()).then(|| {
-        format!(
-            "文書の上限・必須見出しの検査に違反しました: {}",
-            problems.join("、")
+        crate::t!(
+            "kinds.limit_violation",
+            problems = problems.join(crate::t!("list.separator"))
         )
     })
 }
@@ -1056,7 +1128,8 @@ pub fn limit_error(root: &Path, kinds: &[ResolvedKind], files: &[String]) -> Opt
 /// 種類の表示名（カスタムは id とパスを併記する）。プロンプト・メッセージ用。
 pub fn display_name(kind: &ResolvedKind) -> String {
     match &kind.document {
-        Document::Custom(id) => format!("{id}（{}）", kind.paths.join("、")),
+        // worker へのプロンプトに入るので英語の記号で書く（表示言語では変えない）。
+        Document::Custom(id) => format!("{id} ({})", kind.paths.join(", ")),
         d => d.name().to_string(),
     }
 }
@@ -1084,17 +1157,20 @@ pub fn settings_frame(
         .map(|k| k.common_instructions.trim())
         .filter(|c| !c.is_empty())
     {
-        blocks.push(format!("全種類共通の追加指示:\n{}", indent(common)));
+        blocks.push(format!(
+            "Additional instructions for all kinds:\n{}",
+            indent(common)
+        ));
     }
     for kind in active {
         let mut lines: Vec<String> = Vec::new();
         if kind.max_chars.is_some() || kind.max_bytes.is_some() {
             let mut limits = Vec::new();
             if let Some(n) = kind.max_chars {
-                limits.push(format!("最大 {n} 文字"));
+                limits.push(format!("at most {n} characters"));
             }
             if let Some(n) = kind.max_bytes {
-                limits.push(format!("最大 {n} バイト"));
+                limits.push(format!("at most {n} bytes"));
             }
             let mut now = Vec::new();
             for file in scope.files(&kind.document) {
@@ -1102,31 +1178,31 @@ pub fn settings_frame(
                     let rel = crate::maintenance::safe_relative(root, file)
                         .unwrap_or_else(|_| file.display().to_string());
                     let chars = String::from_utf8_lossy(&data).chars().count();
-                    now.push(format!("{rel} は {chars} 文字・{} バイト", data.len()));
+                    now.push(format!("{rel} is {chars} characters, {} bytes", data.len()));
                 }
             }
             let current = if now.is_empty() {
                 String::new()
             } else {
-                format!("（現在: {}）", now.join("、"))
+                format!(" (currently: {})", now.join("; "))
             };
             lines.push(format!(
-                "- 上限: {}{current}。保守後に検査され、超えると変更は採用されません。",
-                limits.join("、")
+                "- Limits: {}{current}. They are checked after maintenance; changes that exceed them are not accepted.",
+                limits.join(", ")
             ));
         }
         if let Some(lang) = &kind.language {
-            lines.push(format!("- 言語: {lang} で書いてください。"));
+            lines.push(format!("- Language: write in {lang}."));
         }
         if !kind.required_headings.is_empty() {
             let list = kind
                 .required_headings
                 .iter()
-                .map(|h| format!("「{h}」"))
+                .map(|h| format!("\"{h}\""))
                 .collect::<Vec<_>>()
-                .join("、");
+                .join(", ");
             lines.push(format!(
-                "- 必須見出し: {list}。欠けていれば補ってください（保守後に検査され、欠けていると変更は採用されません）。"
+                "- Required headings: {list}. Add any that are missing (they are checked after maintenance; changes missing them are not accepted)."
             ));
         }
         // 組み込みテンプレート（CHANGELOG の Keep a Changelog 形式）は新規作成のときと、形式に
@@ -1146,12 +1222,15 @@ pub fn settings_frame(
             .filter(|t| !builtin_hidden(t))
         {
             lines.push(format!(
-                "- テンプレート: 新規作成ではテンプレートの構成に従い、既存の文書では既存の構成を優先してください。ただし必須見出しが欠けていれば補ってください。\n{TEMPLATE_OPEN}\n{}\n{TEMPLATE_CLOSE}",
+                "- Template: follow the template's structure when creating a new document; for an existing document, prefer its existing structure. Still add any missing required headings.\n{TEMPLATE_OPEN}\n{}\n{TEMPLATE_CLOSE}",
                 t.body.trim_end()
             ));
         }
         if !kind.instructions.trim().is_empty() {
-            lines.push(format!("- 追加指示:\n{}", indent(kind.instructions.trim())));
+            lines.push(format!(
+                "- Additional instructions:\n{}",
+                indent(kind.instructions.trim())
+            ));
         }
         if !lines.is_empty() {
             blocks.push(format!("{}:\n{}", display_name(kind), lines.join("\n")));
@@ -1161,7 +1240,7 @@ pub fn settings_frame(
         return String::new();
     }
     format!(
-        "\n\n【利用者設定由来の追加指示】{SETTINGS_FRAME_NOTE}\n{}\n【利用者設定由来の追加指示ここまで】\n",
+        "\n\n【Additional instructions from user settings】{SETTINGS_FRAME_NOTE}\n{}\n【End of additional instructions from user settings】\n",
         blocks.join("\n")
     )
 }

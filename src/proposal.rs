@@ -192,11 +192,16 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let r = git_in(cwd, args).map_err(|e| format!("{what}を実行できませんでした（{e}）"))?;
+    let r =
+        git_in(cwd, args).map_err(|e| crate::t!("proposal.git_spawn", what = what, error = e))?;
     if r.code == Some(0) {
         Ok(r.stdout)
     } else {
-        Err(format!("{what}が失敗しました（終了コード {:?}）", r.code))
+        Err(crate::t!(
+            "proposal.git_failed",
+            what = what,
+            code = format!("{:?}", r.code)
+        ))
     }
 }
 
@@ -304,20 +309,17 @@ fn remove_work_clone(path: &Path, base: &Path) -> Result<()> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or("クローンのパスが不正です")?;
+        .ok_or(crate::t!("proposal.clone_path_invalid"))?;
     let under_proposals = base
         .parent()
         .and_then(Path::file_name)
         .is_some_and(|n| n == "proposals");
     if !name.starts_with("work-") || path.parent() != Some(base) || !under_proposals {
-        return Err(format!(
-            "作業クローンではないため削除しません: {}",
-            path.display()
-        ));
+        return Err(crate::t!("proposal.not_work_clone", path = path.display()));
     }
     // 親（`proposals/<x>`）がリンクなら、その先の `work-*` を消さない。
     if fs::symlink_metadata(base).is_ok_and(|m| is_link(&m)) {
-        return Err(format!("親がリンクのため削除しません: {}", base.display()));
+        return Err(crate::t!("proposal.parent_link", path = base.display()));
     }
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -325,10 +327,7 @@ fn remove_work_clone(path: &Path, base: &Path) -> Result<()> {
         Err(e) => return Err(e.to_string()),
     };
     if is_link(&meta) || !meta.is_dir() {
-        return Err(format!(
-            "リンクまたはディレクトリではないため削除しません: {}",
-            path.display()
-        ));
+        return Err(crate::t!("proposal.link_or_not_dir", path = path.display()));
     }
     if fs::remove_dir_all(path).is_ok() {
         return Ok(());
@@ -391,7 +390,7 @@ pub fn sweep_stale_clones(max_age: Duration) -> usize {
 #[doc(hidden)]
 pub fn prepare_clone(root: &Path, sha: &str, base: &Path) -> Result<CloneGuard> {
     if !is_commit_id(sha) {
-        return Err(format!("コミット ID が不正です: {sha}"));
+        return Err(crate::t!("proposal.commit_id_invalid", sha = sha));
     }
     fs::create_dir_all(base).map_err(|e| e.to_string())?;
     let path = base.join(format!("work-{}", uuid::Uuid::new_v4().simple()));
@@ -416,14 +415,14 @@ pub fn prepare_clone(root: &Path, sha: &str, base: &Path) -> Result<CloneGuard> 
     git_ok(&path, "git remote remove", ["remote", "remove", "origin"])?;
     git_ok(
         &path,
-        "git checkout（フィルターの失敗を含む）",
+        crate::t!("proposal.git_checkout_label"),
         ["checkout", "--quiet", "--detach", sha],
     )?;
     let head = String::from_utf8_lossy(&git_ok(&path, "git rev-parse", ["rev-parse", "HEAD"])?)
         .trim()
         .to_string();
     if head != sha {
-        return Err("クローンの HEAD が対象コミットと一致しません".into());
+        return Err(crate::t!("proposal.clone_head_mismatch").into());
     }
     let status = git_ok(
         &path,
@@ -431,10 +430,7 @@ pub fn prepare_clone(root: &Path, sha: &str, base: &Path) -> Result<CloneGuard> 
         ["status", "--porcelain", "-z", "--untracked-files=all"],
     )?;
     if !status.is_empty() {
-        return Err(
-            "checkout 直後の作業ツリーが clean ではありません（フィルター等の影響）。提案を作成しませんでした"
-                .into(),
-        );
+        return Err(crate::t!("proposal.checkout_dirty").into());
     }
     Ok(guard)
 }
@@ -480,7 +476,7 @@ pub fn propose_with(
     templates: Option<&[LoadedTemplate]>,
 ) -> Result<ProposeOutcome> {
     if !is_commit_id(pushed) {
-        return Err(format!("コミット ID が不正です: {pushed}"));
+        return Err(crate::t!("proposal.commit_id_invalid", sha = pushed));
     }
     let dir = proposals_dir(root);
     if patch_file(&dir, pushed).exists() || finished_meta(&dir, pushed, force) {
@@ -504,7 +500,7 @@ pub fn propose_with(
     // 対象経路・ignore 判定・プロンプトはすべてクローン（push された内容）を基準にする。
     // 利用者の作業ツリー基準だと、未コミット・未追跡の状態が混ざってしまう。
     let scope = maintenance_scope_for(&work, previous, pushed, &kinds)
-        .map_err(|e| format!("保守対象の AGENTS 経路を確認できません（{e}）"))?;
+        .map_err(|e| crate::t!("maint.agents_paths_unknown", error = e))?;
     let deleted: Vec<PathBuf> = if previous.is_empty() {
         Vec::new()
     } else {
@@ -531,7 +527,7 @@ pub fn propose_with(
     let mut reason =
         build_maintenance_reason_with(&work, &scope, &deleted, previous, pushed, &kinds, templates);
     reason.push_str(
-        "なお今回は提案モードです。commit と push は行われず、作業ツリーに残した差分が利用者への更新案として保存されます。",
+        " Note that this run is in propose mode: no commit or push is made, and the diff you leave in the working tree is saved as a proposal for the user.",
     );
 
     // worker に許す変更パス（対象文書の種類ごと）。push モードと共通の `plan_documents`。
@@ -573,14 +569,14 @@ pub fn propose_with(
         .trim()
         .to_string();
     if head != pushed {
-        return Err("worker が HEAD を変更したため提案を作成しませんでした".into());
+        return Err(crate::t!("proposal.worker_moved_head").into());
     }
     let post = worktree_snapshot(&work)?;
     let outside = out_of_scope_changes(&pre, &post, &allowed);
     if !outside.is_empty() {
-        return Err(format!(
-            "worker が対象文書以外を変更したため提案を作成しませんでした: {}",
-            outside.join("、")
+        return Err(crate::t!(
+            "proposal.worker_outside",
+            paths = outside.join(crate::t!("list.separator"))
         ));
     }
     let changed: Vec<String> = post
@@ -592,10 +588,7 @@ pub fn propose_with(
         .iter()
         .find(|(path, fingerprint)| fingerprint.starts_with("!!:") && changed.contains(*path))
     {
-        return Err(format!(
-            "無視されている文書は提案に含められません: {}",
-            ignored.0
-        ));
+        return Err(crate::t!("proposal.ignored_document", path = ignored.0));
     }
 
     // 保守後検査（権限モードに関係なく通る位置）: AGENTS のサイズと、種類ごとの上限・必須見出し。
@@ -671,9 +664,7 @@ pub fn propose_with(
         ],
     )?;
     if let Some(bad) = unsafe_mode_changes(&raw) {
-        return Err(format!(
-            "worker がファイル種別またはモードを変更したため提案を作成しませんでした: {bad}"
-        ));
+        return Err(crate::t!("proposal.worker_mode_change", entry = bad));
     }
     let names = nul_list(&git_ok(
         &work,
@@ -691,9 +682,7 @@ pub fn propose_with(
         .iter()
         .find(|n| !allowed.iter().any(|a| normcase(a) == normcase(n.as_str())))
     {
-        return Err(format!(
-            "worker が対象文書以外を変更したため提案を作成しませんでした: {bad}"
-        ));
+        return Err(crate::t!("proposal.worker_outside", paths = bad));
     }
     if names.is_empty() {
         return Ok(ProposeOutcome::Unchanged);
@@ -870,22 +859,24 @@ fn select(root: &Path, selector: &str) -> Result<ProposalInfo> {
     let all = list(root);
     let selector = selector.trim().to_lowercase();
     if ["", "latest", "最新"].contains(&selector.as_str()) {
-        return all.into_iter().next().ok_or("更新案がありません".into());
+        return all
+            .into_iter()
+            .next()
+            .ok_or(crate::t!("cli.review.none").into());
     }
     if !selector.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(format!(
-            "指定が不正です（latest または sha の前方）: {selector}"
-        ));
+        return Err(crate::t!("proposal.selector_invalid", selector = selector));
     }
     let mut hits: Vec<ProposalInfo> = all
         .into_iter()
         .filter(|p| p.sha.starts_with(&selector))
         .collect();
     match hits.len() {
-        0 => Err(format!("該当する更新案がありません: {selector}")),
+        0 => Err(crate::t!("proposal.selector_none", selector = selector)),
         1 => Ok(hits.remove(0)),
-        _ => Err(format!(
-            "複数の更新案に一致します。もう少し長く指定してください: {selector}"
+        _ => Err(crate::t!(
+            "proposal.selector_ambiguous",
+            selector = selector
         )),
     }
 }
@@ -911,9 +902,9 @@ pub fn review(root: &Path, selector: &str) -> Result<ReviewInfo> {
 pub fn apply(root: &Path, selector: &str) -> Result<ApplyOutcome> {
     let p = select(root, selector)?;
     if p.applied {
-        return Err(format!(
-            "この更新案は適用済みです: {}",
-            &p.sha[..12.min(p.sha.len())]
+        return Err(crate::t!(
+            "proposal.already_applied",
+            sha = &p.sha[..12.min(p.sha.len())]
         ));
     }
     // 対象ファイルはパッチ自身から取る（メタ情報の改変に左右されない）。
@@ -935,7 +926,7 @@ pub fn apply(root: &Path, selector: &str) -> Result<ApplyOutcome> {
         }
     }
     if files.is_empty() {
-        return Err("パッチの対象ファイルを確認できません".into());
+        return Err(crate::t!("proposal.patch_files_unknown").into());
     }
     let mut args = vec![
         o("status"),
@@ -948,9 +939,9 @@ pub fn apply(root: &Path, selector: &str) -> Result<ApplyOutcome> {
     args.extend(files.iter().map(|f| o(f)));
     let dirty = nul_list(&git_ok(root, "git status", args)?);
     if !dirty.is_empty() {
-        return Err(format!(
-            "対象文書に未コミットの変更があるため適用しません（先にコミットまたは退避してください）: {}",
-            files.join("、")
+        return Err(crate::t!(
+            "proposal.dirty_targets",
+            files = files.join(crate::t!("list.separator"))
         ));
     }
     // 保存済みパッチにも、生成時と同じファイル種別・モードの制限をかける（状態フォルダー内のパッチが
@@ -969,9 +960,7 @@ pub fn apply(root: &Path, selector: &str) -> Result<ApplyOutcome> {
                 .strip_prefix("create mode ")
                 .is_some_and(|rest| !rest.starts_with("100644 "));
         if bad {
-            return Err(format!(
-                "更新案にファイル種別またはモードの変更が含まれるため適用しません: {line}"
-            ));
+            return Err(crate::t!("proposal.patch_mode_change", line = line));
         }
     }
     git_ok(
@@ -984,7 +973,7 @@ pub fn apply(root: &Path, selector: &str) -> Result<ApplyOutcome> {
             p.patch_path.as_os_str(),
         ],
     )
-    .map_err(|e| format!("更新案を現在の内容へ適用できません（{e}）"))?;
+    .map_err(|e| crate::t!("proposal.apply_conflict", error = e))?;
     git_ok(
         root,
         "git apply",
@@ -995,14 +984,14 @@ pub fn apply(root: &Path, selector: &str) -> Result<ApplyOutcome> {
         ],
     )?;
     let meta_path = meta_file(&proposals_dir(root), &p.sha);
-    let mut meta = read_meta(&meta_path).ok_or("メタ情報を読めません")?;
+    let mut meta = read_meta(&meta_path).ok_or(crate::t!("proposal.meta_unreadable"))?;
     meta["status"] = json!("applied");
     meta["applied_at"] = json!(chrono::Utc::now().to_rfc3339());
     write_atomic(
         &meta_path,
         &serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?,
     )
-    .map_err(|e| format!("適用しましたが適用済みの記録に失敗しました（{e}）"))?;
+    .map_err(|e| crate::t!("proposal.applied_record_failed", error = e))?;
     Ok(ApplyOutcome { sha: p.sha, files })
 }
 
@@ -1011,7 +1000,7 @@ pub fn discard(root: &Path, selector: &str) -> Result<String> {
     let p = select(root, selector)?;
     let dir = proposals_dir(root);
     let meta_path = meta_file(&dir, &p.sha);
-    let mut meta = read_meta(&meta_path).ok_or("メタ情報を読めません")?;
+    let mut meta = read_meta(&meta_path).ok_or(crate::t!("proposal.meta_unreadable"))?;
     meta["status"] = json!("discarded");
     // 先に記録してから patch を消す（途中で止まっても再作成されない）。
     write_atomic(

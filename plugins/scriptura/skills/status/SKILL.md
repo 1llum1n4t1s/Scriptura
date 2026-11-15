@@ -1,9 +1,11 @@
 ---
 name: status
-description: Scriptura の現在の状態（有効・停止・直近の実行）を表示する。Show Scriptura status.
+description: Show the current Scriptura state (enabled, paused, latest run). Show Scriptura status.
 allowed-tools: Bash(scriptura status *)
 ---
 
 # Scriptura status
 
-読み取り専用です。`scriptura status --json` を実行し、出力 JSON を要約します。見るのは `config.state`（missing / invalid / ok）、`consent`、`repositories`（各 `root`・`mode`・`paused`・`branches`・`proposals.pending`）、`worker`、`proposals` です。`config.state` が `invalid` のときは `config.error` を伝えます。JSON にない事実（直近の実行結果など）は推測しません。
+Read-only. Run `scriptura status --json` and summarize the output JSON. Look at `config.state` (missing / invalid / ok), `consent`, `repositories` (each `root`, `mode`, `paused`, `branches`, `proposals.pending`), `worker` and `proposals`. When `config.state` is `invalid`, report `config.error`. Do not guess facts that are not in the JSON (such as the result of the latest run).
+
+Reply in the language the user is writing in.

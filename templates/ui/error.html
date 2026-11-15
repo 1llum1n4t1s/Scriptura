@@ -1,8 +1,8 @@
 {% extends "ui/base.html" %}
 {% block content %}
 <section class="panel error-page">
-  <h1>操作できませんでした（{{ status }}）</h1>
+  <h1>{{ crate::locale::tr1("ui.error.heading", "status", status) }}</h1>
   <p class="error-text">{{ message }}</p>
-  <p><a class="button" href="{{ back }}">戻る</a></p>
+  <p><a class="button" href="{{ back }}">{{ crate::locale::tr("ui.error.back") }}</a></p>
 </section>
 {% endblock %}

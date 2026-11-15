@@ -1,5 +1,5 @@
 // 利用者向けの CLI コマンド（enable / disable / pause / resume / status / doctor / run-now /
-// review / apply / discard / docs）。プラグインのスキルは `scriptura <cmd> --json` でこれらを呼ぶ薄い層で、
+// review / apply / discard / docs / update / uninstall-setup）。プラグインのスキルは `scriptura <cmd> --json` でこれらを呼ぶ薄い層で、
 // 判断はすべてここ（と config / proposal / maintenance）に置く。
 //
 // 設計上の要点:
@@ -15,7 +15,7 @@
 //   （`ops::enable`）。
 // - 出力に秘密値を入れない（パス・設定の要約・件数だけ）。
 use crate::{
-    app,
+    app, app_update,
     config::{self, CURRENT_CONSENT_VERSION, Config, ConsentSource, Document, Loaded, Mode, Store},
     doctor,
     ops::{self, EnableRequest, RunNow},
@@ -29,8 +29,19 @@ use std::{
 
 /// この CLI が扱うコマンド名。bin 側の分岐が使う。
 pub const COMMANDS: &[&str] = &[
-    "enable", "disable", "pause", "resume", "status", "doctor", "run-now", "review", "apply",
-    "discard", "docs",
+    "enable",
+    "disable",
+    "pause",
+    "resume",
+    "status",
+    "doctor",
+    "run-now",
+    "review",
+    "apply",
+    "discard",
+    "docs",
+    "update",
+    "uninstall-setup",
 ];
 
 pub fn is_command(name: &str) -> bool {
@@ -48,11 +59,7 @@ type R = Result<Value, String>;
 
 /// 同意の説明（1 行）。送信データと費用を明示し、再実行の方法を案内する。
 fn consent_notice() -> String {
-    format!(
-        "同意が必要です。Scriptura は push 後に Claude Code CLI の worker（Sonnet）を起動して文書を保守します。\
-worker が読んだリポジトリの内容は、あなた自身の Claude 認証で Anthropic へ送信され、実行ごとに Claude の利用料金（使用量）が発生します。\
-同意する場合は --accept-consent {CURRENT_CONSENT_VERSION} を付けて再実行してください。"
-    )
+    crate::t!("cli.consent.notice", version = CURRENT_CONSENT_VERSION)
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +87,10 @@ fn spec(command: &str) -> (&'static [&'static str], &'static [&'static str], usi
         "docs" => (&["repo"], &[], 2),
         "doctor" => (&[], &["verify"], 0),
         "review" | "apply" | "discard" => (&["repo"], &[], 1),
+        // update [--check] [--auto on|off]（Setup 版の自動更新の表示・確認・設定）
+        "update" => (&["auto"], &["check"], 0),
+        // uninstall-setup [--apply]（Setup 版の登録の解除。macOS・Linux のアンインストール手順）
+        "uninstall-setup" => (&[], &["apply"], 0),
         _ => (&[], &[], 0),
     }
 }
@@ -112,17 +123,17 @@ fn parse(command: &str, args: &[String]) -> Result<Parsed, String> {
                         args.get(i)
                             .filter(|v| !v.starts_with("--"))
                             .cloned()
-                            .ok_or_else(|| format!("--{name} には値が必要です"))?
+                            .ok_or_else(|| crate::t!("cli.arg.value_required", name = name))?
                     }
                 };
                 parsed.values.insert(name.to_string(), value);
             } else {
-                return Err(format!("不明なオプションです: --{name}"));
+                return Err(crate::t!("cli.arg.unknown_option", name = name));
             }
         } else {
             parsed.positional.push(arg.clone());
             if parsed.positional.len() > max_positional {
-                return Err(format!("余分な引数です: {arg}"));
+                return Err(crate::t!("cli.arg.extra", arg = arg));
             }
         }
         i += 1;
@@ -151,7 +162,9 @@ pub fn run(command: &str, args: &[String]) -> Reply {
             "apply" => apply(&p),
             "discard" => discard(&p),
             "docs" => docs(&p),
-            other => Err(format!("不明なコマンドです: {other}")),
+            "update" => update(&p),
+            "uninstall-setup" => Ok(app_update::uninstall_setup(p.flags.contains("apply"))),
+            other => Err(crate::t!("cli.arg.unknown_command", command = other)),
         }?;
         Ok((p.json, value))
     });
@@ -179,6 +192,83 @@ pub fn run(command: &str, args: &[String]) -> Reply {
             code: 1,
         },
     }
+}
+
+/// `update` の引数を操作へ直して実行する。`--check` と `--auto` は同時に使えない（何が起きたかを曖昧にしないため）。
+fn update(p: &Parsed) -> R {
+    let check = p.flags.contains("check");
+    let action = match (check, p.values.get("auto").map(String::as_str)) {
+        (true, Some(_)) => return Err(crate::t!("cli.update.check_and_auto").into()),
+        (true, None) => app_update::UpdateAction::Check,
+        (false, Some("on")) => app_update::UpdateAction::SetAuto(true),
+        (false, Some("off")) => app_update::UpdateAction::SetAuto(false),
+        (false, Some(other)) => {
+            return Err(crate::t!("cli.update.auto_value", value = other));
+        }
+        (false, None) => app_update::UpdateAction::Show,
+    };
+    app_update::update_command(action)
+}
+
+/// UNIX 秒を人が読む日時（ローカル時刻）にする。未記録は「なし」。
+fn unix_time(value: &Value) -> String {
+    value
+        .as_i64()
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| crate::t!("cli.none").into())
+}
+
+/// `setup` オブジェクト（status / update の表示）を人が読む行にする。
+fn render_setup(setup: &Value) -> Vec<String> {
+    if setup["managed"] != json!(true) {
+        return vec![crate::t!(
+            "cli.setup.unmanaged",
+            auto = if setup["autoUpdate"] == json!(false) {
+                "OFF"
+            } else {
+                "ON"
+            }
+        )];
+    }
+    let mut lines = vec![
+        crate::t!(
+            "cli.setup.managed",
+            version = text(setup, "version"),
+            pack = text(setup, "packId"),
+            executable = text(setup, "executable")
+        ),
+        crate::t!(
+            "cli.setup.auto_update",
+            auto = if setup["autoUpdate"] == json!(false) {
+                "OFF"
+            } else {
+                "ON"
+            },
+            checked = unix_time(&setup["lastCheckedAt"]),
+            failed = unix_time(&setup["lastFailedAt"]),
+        ),
+    ];
+    if let Some(version) = setup["pendingVersion"].as_str() {
+        lines.push(crate::t!("cli.setup.pending", version = version));
+    }
+    match setup["registration"]["claude"].as_str() {
+        Some("plugin") => lines.push(crate::t!("cli.setup.claude_plugin").into()),
+        Some("failed") => lines.push(crate::t!("cli.setup.claude_failed").into()),
+        Some("registered") => lines.push(crate::t!("cli.setup.claude_registered").into()),
+        _ => lines.push(crate::t!("cli.setup.claude_unregistered").into()),
+    }
+    if setup["registration"]["legacyHook"] == json!(true) {
+        lines.push(crate::t!("cli.setup.legacy_hook").into());
+    }
+    if let Some(path) = setup["legacyInstall"].as_str() {
+        lines.push(crate::t!("cli.setup.legacy_install", path = path));
+    }
+    lines
 }
 
 /// 設定の異常理由を 1 行にする。TOML パーサーの説明には設定ファイルの該当行の抜粋が続くため、
@@ -254,9 +344,7 @@ fn parse_documents(raw: &str) -> Result<Vec<Document>, String> {
             Some(d) => d,
             None if config::is_valid_kind_id(&name) => Document::Custom(name.clone()),
             None => {
-                return Err(format!(
-                    "--documents に未対応の文書があります: {name}（AGENTS.md / DESIGN.md / README.md / CHANGELOG.md、または設定に定義したカスタム種類の id）"
-                ));
+                return Err(crate::t!("cli.documents.unsupported", name = name));
             }
         };
         if !out.contains(&doc) {
@@ -264,7 +352,7 @@ fn parse_documents(raw: &str) -> Result<Vec<Document>, String> {
         }
     }
     if out.is_empty() {
-        return Err("--documents が空です".into());
+        return Err(crate::t!("cli.documents.empty").into());
     }
     Ok(out)
 }
@@ -282,26 +370,21 @@ fn enable(p: &Parsed) -> R {
     if accepted != Some(CURRENT_CONSENT_VERSION) {
         return Err(consent_notice());
     }
-    let raw = p
-        .values
-        .get("repo")
-        .ok_or("--repo <リポジトリのパス> が必要です")?;
+    let raw = p.values.get("repo").ok_or(crate::t!("cli.repo.required"))?;
     let root = git_root(raw)?;
     let mode = match p.values.get("mode").map(String::as_str) {
         None | Some("propose") => Mode::Propose,
         Some("push") => Mode::Push,
         Some("off") => Mode::Off,
         Some(other) => {
-            return Err(format!(
-                "--mode は propose / push / off のどれかです: {other}"
-            ));
+            return Err(crate::t!("cli.mode.invalid", value = other));
         }
     };
     let branches_arg = match p.values.get("branches") {
         Some(raw) => {
             let list = split_list(raw);
             if list.is_empty() {
-                return Err("--branches が空です".into());
+                return Err(crate::t!("cli.branches.empty").into());
             }
             Some(list)
         }
@@ -337,7 +420,7 @@ fn enable(p: &Parsed) -> R {
 fn disable(p: &Parsed) -> R {
     // 取り消しは明示の対象だけ。cwd からの暗黙の解除はしない。
     if !p.values.contains_key("repo") {
-        return Err("--repo <リポジトリのパス> が必要です".into());
+        return Err(crate::t!("cli.repo.required").into());
     }
     let root = target_root(p)?;
     let done = ops::disable(&store(), &root, None).map_err(|e| e.to_string())?;
@@ -459,7 +542,7 @@ fn run_now(p: &Parsed) -> R {
         RunNow::Rejected { reason } => Ok(json!({
             "ok": true, "repo": repo, "mode": "propose", "outcome": "rejected",
             "reason": reason,
-            "message": "更新案は作成しませんでした（保守後の検査に違反したため）。この push は処理済みとして位置を進めました。設定の上限などを見直してから、もう一度 run-now を実行できます",
+            "message": crate::t!("cli.run_now.rejected"),
         })),
         RunNow::Created(x) => Ok(json!({
             "ok": true, "repo": repo, "mode": "propose", "outcome": "created",
@@ -468,11 +551,11 @@ fn run_now(p: &Parsed) -> R {
         })),
         RunNow::Unchanged => Ok(json!({
             "ok": true, "repo": repo, "mode": "propose", "outcome": "unchanged",
-            "message": "更新案は作成されませんでした（文書に変更が無い・同じコミットの更新案が既にある・未 push のコミットがある、のいずれかです）",
+            "message": crate::t!("cli.run_now.unchanged"),
         })),
         RunNow::Completed => Ok(json!({
             "ok": true, "repo": repo, "mode": "push", "outcome": "completed",
-            "message": "保守を実行しました（文書に変更があれば commit と push 済みです）",
+            "message": crate::t!("cli.run_now.completed"),
         })),
     }
 }
@@ -575,11 +658,15 @@ fn docs(p: &Parsed) -> R {
     let repo = root.to_string_lossy().into_owned();
     let view = match action {
         Some("list") if p.positional.len() == 1 => None,
-        Some("list") => return Err(format!("docs list に余分な引数です: {}", p.positional[1])),
-        Some("show") => Some(p.positional.get(1).ok_or(
-            "docs show には文書の種類の id が必要です（scriptura docs list で確認できます）",
-        )?),
-        _ => return Err("使い方: scriptura docs list | scriptura docs show <id>".into()),
+        Some("list") => {
+            return Err(crate::t!("cli.docs.list_extra", arg = p.positional[1]));
+        }
+        Some("show") => Some(
+            p.positional
+                .get(1)
+                .ok_or(crate::t!("cli.docs.show_requires_id"))?,
+        ),
+        _ => return Err(crate::t!("cli.docs.usage").into()),
     };
     let overview = ops::docs_overview(&store(), &root)?;
     let mut out = json!({
@@ -606,10 +693,7 @@ fn docs(p: &Parsed) -> R {
             });
             let found = found.ok_or_else(|| {
                 let ids: Vec<&str> = overview.kinds.iter().map(|v| v.kind.id()).collect();
-                format!(
-                    "文書の種類が見つかりません: {id}（定義済み: {}）",
-                    ids.join(", ")
-                )
+                crate::t!("cli.docs.not_found", id = id, defined = ids.join(", "))
             })?;
             out["kind"] = kind_json(found, true);
         }
@@ -638,7 +722,7 @@ fn review(p: &Parsed) -> R {
     let all: Vec<Value> = proposal::list(&root).iter().map(proposal_json).collect();
     if p.positional.is_empty() && all.is_empty() {
         return Ok(
-            json!({"ok": true, "repo": repo, "proposals": [], "message": "更新案はありません"}),
+            json!({"ok": true, "repo": repo, "proposals": [], "message": crate::t!("cli.review.none")}),
         );
     }
     let info = proposal::review(&root, selector(p))?;
@@ -681,7 +765,7 @@ fn list(v: &Value) -> String {
         .filter_map(Value::as_str)
         .collect();
     if items.is_empty() {
-        "なし".into()
+        crate::t!("cli.none").into()
     } else {
         items.join(", ")
     }
@@ -695,13 +779,13 @@ fn short(sha: &str) -> &str {
 fn limits_text(k: &Value) -> String {
     let mut parts = Vec::new();
     if let Some(n) = k["maxChars"].as_u64() {
-        parts.push(format!("{n} 文字"));
+        parts.push(crate::t!("cli.docs.chars", n = n));
     }
     if let Some(n) = k["maxBytes"].as_u64() {
-        parts.push(format!("{n} バイト"));
+        parts.push(crate::t!("cli.docs.bytes", n = n));
     }
     if parts.is_empty() {
-        "なし".into()
+        crate::t!("cli.none").into()
     } else {
         parts.join(" / ")
     }
@@ -711,10 +795,13 @@ fn timing_text(k: &Value) -> String {
     let t = &k["timing"];
     let mut s = text(t, "when").to_string();
     if !t["paths"].as_array().is_some_and(|a| a.is_empty()) {
-        s.push_str(&format!("・パス: {}", list(&t["paths"])));
+        s.push_str(&crate::t!(
+            "cli.docs.timing_paths",
+            paths = list(&t["paths"])
+        ));
     }
     if let Some(h) = t["minIntervalHours"].as_u64().filter(|h| *h > 0) {
-        s.push_str(&format!("・最小間隔 {h} 時間"));
+        s.push_str(&crate::t!("cli.docs.timing_interval", hours = h));
     }
     s
 }
@@ -722,10 +809,18 @@ fn timing_text(k: &Value) -> String {
 fn template_text(k: &Value) -> String {
     let t = &k["template"];
     match text(t, "state") {
-        "builtin" => "組み込み".into(),
-        "ok" => format!("{}（読み込み可・{} バイト）", text(t, "spec"), t["bytes"]),
-        "error" => format!("{}（使えません: {}）", text(t, "spec"), text(t, "error")),
-        _ => "なし".into(),
+        "builtin" => crate::t!("cli.docs.builtin").into(),
+        "ok" => crate::t!(
+            "cli.docs.template_ok",
+            spec = text(t, "spec"),
+            bytes = t["bytes"]
+        ),
+        "error" => crate::t!(
+            "cli.docs.template_error",
+            spec = text(t, "spec"),
+            error = text(t, "error")
+        ),
+        _ => crate::t!("cli.none").into(),
     }
 }
 
@@ -741,7 +836,7 @@ fn paths_text(k: &Value) -> String {
                 if p["exists"] == json!(true) {
                     ""
                 } else {
-                    "（なし）"
+                    crate::t!("cli.docs.path_missing")
                 }
             )
         })
@@ -750,50 +845,59 @@ fn paths_text(k: &Value) -> String {
 }
 
 fn render_docs(v: &Value) -> String {
-    let mut lines = vec![format!(
-        "{}（{}）",
-        text(v, "repo"),
-        if v["registered"] == json!(true) {
-            format!("登録済み・{}", text(v, "mode"))
+    let mut lines = vec![crate::t!(
+        "cli.docs.repo_line",
+        repo = text(v, "repo"),
+        state = if v["registered"] == json!(true) {
+            crate::t!("cli.docs.registered", mode = text(v, "mode"))
         } else {
-            "未登録".into()
+            crate::t!("cli.docs.unregistered").to_string()
         }
     )];
-    if let Some(k) = v.get("kind") {
-        lines.push(format!(
-            "{}（id: {}・{}・{}）",
-            text(k, "name"),
-            text(k, "id"),
-            if k["builtin"] == json!(true) {
-                "組み込み"
-            } else {
-                "カスタム"
-            },
-            if k["enabled"] == json!(true) {
-                "有効"
-            } else {
-                "無効"
-            }
-        ));
-        lines.push(format!("対象: {}", paths_text(k)));
-        if !text(k, "guidance").is_empty() {
-            lines.push(format!("指針: {}", text(k, "guidance")));
+    let enabled = |k: &Value| {
+        if k["enabled"] == json!(true) {
+            crate::t!("cli.docs.enabled")
+        } else {
+            crate::t!("cli.docs.disabled")
         }
-        lines.push(format!("テンプレート: {}", template_text(k)));
-        lines.push(format!("上限: {}", limits_text(k)));
-        lines.push(format!("タイミング: {}", timing_text(k)));
+    };
+    if let Some(k) = v.get("kind") {
+        lines.push(crate::t!(
+            "cli.docs.kind_line",
+            name = text(k, "name"),
+            id = text(k, "id"),
+            origin = if k["builtin"] == json!(true) {
+                crate::t!("cli.docs.builtin")
+            } else {
+                crate::t!("cli.docs.custom")
+            },
+            enabled = enabled(k)
+        ));
+        lines.push(crate::t!("cli.docs.targets", value = paths_text(k)));
+        if !text(k, "guidance").is_empty() {
+            lines.push(crate::t!("cli.docs.guidance", value = text(k, "guidance")));
+        }
+        lines.push(crate::t!("cli.docs.template", value = template_text(k)));
+        lines.push(crate::t!("cli.docs.limits", value = limits_text(k)));
+        lines.push(crate::t!("cli.docs.timing", value = timing_text(k)));
         if let Some(lang) = k["language"].as_str() {
-            lines.push(format!("言語: {lang}"));
+            lines.push(crate::t!("cli.docs.language", value = lang));
         }
         if !k["requiredHeadings"]
             .as_array()
             .is_some_and(|a| a.is_empty())
         {
-            lines.push(format!("必須見出し: {}", list(&k["requiredHeadings"])));
+            lines.push(crate::t!(
+                "cli.docs.required_headings",
+                value = list(&k["requiredHeadings"])
+            ));
         }
         for (label, key) in [
-            ("共通の追加指示", "commonInstructions"),
-            ("追加指示", "instructions"),
+            (
+                crate::t!("cli.docs.common_instructions"),
+                "commonInstructions",
+            ),
+            (crate::t!("cli.docs.instructions"), "instructions"),
         ] {
             if !text(k, key).is_empty() {
                 lines.push(format!("{label}: {}", text(k, key)));
@@ -801,36 +905,34 @@ fn render_docs(v: &Value) -> String {
         }
         if k["changelog"].is_object() {
             let c = &k["changelog"];
-            lines.push(format!(
-                "CHANGELOG: 形式 {} / リリースタグ {} / リリース時 {} / 遡り {}（最大 {} 版・{} コミット）",
-                text(c, "format"),
-                text(c, "releaseTag"),
-                text(c, "onRelease"),
-                text(c, "backfill"),
-                c["backfillMaxReleases"],
-                c["backfillMaxCommits"]
+            lines.push(crate::t!(
+                "cli.docs.changelog",
+                format = text(c, "format"),
+                tag = text(c, "releaseTag"),
+                on_release = text(c, "onRelease"),
+                backfill = text(c, "backfill"),
+                releases = c["backfillMaxReleases"],
+                commits = c["backfillMaxCommits"]
             ));
         }
-        lines.push(format!(
-            "最終完了: {}",
-            k["lastDoneAt"].as_str().unwrap_or("まだありません")
+        lines.push(crate::t!(
+            "cli.docs.last_done",
+            value = k["lastDoneAt"]
+                .as_str()
+                .unwrap_or(crate::t!("cli.docs.not_yet"))
         ));
         return lines.join("\n");
     }
     for k in v["kinds"].as_array().into_iter().flatten() {
-        lines.push(format!(
-            "- {} [{}] 対象: {} / テンプレート: {} / 上限: {} / タイミング: {} / 最終完了: {}",
-            text(k, "id"),
-            if k["enabled"] == json!(true) {
-                "有効"
-            } else {
-                "無効"
-            },
-            paths_text(k),
-            template_text(k),
-            limits_text(k),
-            timing_text(k),
-            k["lastDoneAt"].as_str().unwrap_or("なし"),
+        lines.push(crate::t!(
+            "cli.docs.list_line",
+            id = text(k, "id"),
+            enabled = enabled(k),
+            targets = paths_text(k),
+            template = template_text(k),
+            limits = limits_text(k),
+            timing = timing_text(k),
+            last = k["lastDoneAt"].as_str().unwrap_or(crate::t!("cli.none")),
         ));
     }
     lines.join("\n")
@@ -838,77 +940,121 @@ fn render_docs(v: &Value) -> String {
 
 fn render(command: &str, v: &Value) -> String {
     match command {
-        "enable" => format!(
-            "有効化しました: {}\nモード: {} / ブランチ: {} / 文書: {}\n設定: {}",
-            text(v, "root"),
-            text(v, "mode"),
-            if v["branches"].as_array().is_some_and(|b| b.is_empty()) {
-                "制限なし".into()
+        "enable" => crate::t!(
+            "cli.enable.done",
+            root = text(v, "root"),
+            mode = text(v, "mode"),
+            branches = if v["branches"].as_array().is_some_and(|b| b.is_empty()) {
+                crate::t!("cli.branches.any").into()
             } else {
                 list(&v["branches"])
             },
-            list(&v["documents"]),
-            text(v, "configPath"),
+            documents = list(&v["documents"]),
+            config = text(v, "configPath"),
         ),
-        "disable" => format!("登録を削除しました: {}", text(v, "repo")),
+        "disable" => crate::t!("cli.disable.done", repo = text(v, "repo")),
         "pause" | "resume" => format!(
             "{}: {}{}",
             if v["paused"] == json!(true) {
-                "一時停止しました"
+                crate::t!("cli.pause.done")
             } else {
-                "再開しました"
+                crate::t!("cli.resume.done")
             },
             text(v, "repo"),
             if v["changed"] == json!(false) {
-                "（変更なし）"
+                crate::t!("cli.unchanged")
             } else {
                 ""
             },
         ),
         "status" => {
             let mut lines = vec![
-                format!(
-                    "Scriptura {}（導入: {}）",
-                    text(v, "version"),
-                    if v["installed"] == json!(true) {
-                        "済み"
+                crate::t!(
+                    "cli.status.version",
+                    version = text(v, "version"),
+                    installed = if v["installed"] == json!(true) {
+                        crate::t!("cli.status.installed")
                     } else {
-                        "未導入"
+                        crate::t!("cli.status.not_installed")
                     }
                 ),
-                format!(
-                    "設定: {}（{}）",
-                    text(&v["config"], "path"),
-                    text(&v["config"], "state")
+                crate::t!(
+                    "cli.status.config",
+                    path = text(&v["config"], "path"),
+                    state = text(&v["config"], "state")
                 ),
             ];
             if let Some(e) = v["config"]["error"].as_str() {
-                lines.push(format!("  エラー: {e}"));
+                lines.push(crate::t!("cli.status.config_error", error = e));
             }
-            lines.push(format!("状態 DB: {}", text(v, "stateDb")));
+            lines.push(crate::t!("cli.status.state_db", path = text(v, "stateDb")));
             for r in v["repositories"].as_array().into_iter().flatten() {
-                lines.push(format!(
-                    "- {} [{}{}] ブランチ: {} 更新案: {} 件",
-                    text(r, "root"),
-                    text(r, "mode"),
-                    if r["paused"] == json!(true) {
-                        "・停止中"
+                lines.push(crate::t!(
+                    "cli.status.repo_line",
+                    root = text(r, "root"),
+                    mode = text(r, "mode"),
+                    paused = if r["paused"] == json!(true) {
+                        crate::t!("cli.status.paused")
                     } else {
                         ""
                     },
-                    if r["branches"].as_array().is_some_and(|b| b.is_empty()) {
-                        "制限なし".into()
+                    branches = if r["branches"].as_array().is_some_and(|b| b.is_empty()) {
+                        crate::t!("cli.branches.any").into()
                     } else {
                         list(&r["branches"])
                     },
-                    r["proposals"]["pending"],
+                    pending = r["proposals"]["pending"],
                 ));
             }
             if v["repositories"].as_array().is_some_and(|a| a.is_empty()) {
-                lines.push("登録されたリポジトリはありません".into());
+                lines.push(crate::t!("cli.status.no_repos").into());
+            }
+            if v["setup"].is_object() {
+                lines.extend(render_setup(&v["setup"]));
             }
             lines.join("\n")
         }
+        "update" => match text(v, "action") {
+            "show" => {
+                let mut lines = render_setup(v);
+                if v["managed"] == json!(true) {
+                    lines.push(crate::t!("cli.update.feed", feed = text(v, "feed")));
+                }
+                lines.join("\n")
+            }
+            "auto" => crate::t!(
+                "cli.update.auto_set",
+                value = if v["autoUpdate"] == json!(true) {
+                    "ON"
+                } else {
+                    "OFF"
+                },
+                unchanged = if v["changed"] == json!(false) {
+                    crate::t!("cli.unchanged")
+                } else {
+                    ""
+                }
+            ),
+            _ => text(v, "message").to_string(),
+        },
+        "uninstall-setup" => match text(v, "status") {
+            "unmanaged" => text(v, "reason").to_string(),
+            "planned" => crate::t!(
+                "cli.uninstall.planned",
+                executable = text(v, "executable"),
+                settings = text(v, "settings"),
+                logon = text(v, "logonEntry"),
+                next = text(v, "next")
+            ),
+            _ => {
+                let mut lines = vec![crate::t!("cli.uninstall.done").to_string()];
+                for line in v["results"].as_array().into_iter().flatten() {
+                    lines.push(format!("- {}", line.as_str().unwrap_or("")));
+                }
+                lines.push(text(v, "next").to_string());
+                lines.join("\n")
+            }
+        },
         "doctor" => {
             let mut lines: Vec<String> = v["items"]
                 .as_array()
@@ -924,22 +1070,22 @@ fn render(command: &str, v: &Value) -> String {
                 })
                 .collect();
             lines.push(if v["ok"] == json!(true) {
-                "問題は見つかりませんでした".into()
+                crate::t!("cli.doctor.ok").into()
             } else {
-                "失敗した項目があります".into()
+                crate::t!("cli.doctor.failed").into()
             });
             lines.join("\n")
         }
         "run-now" => match text(v, "outcome") {
-            "created" => format!(
-                "更新案を作成しました（{}）: {}",
-                short(text(v, "sha")),
-                text(v, "patchPath")
+            "created" => crate::t!(
+                "cli.run_now.created",
+                sha = short(text(v, "sha")),
+                patch = text(v, "patchPath")
             ),
-            "rejected" => format!(
-                "更新案を作成しませんでした: {}\n{}",
-                text(v, "reason"),
-                text(v, "message")
+            "rejected" => crate::t!(
+                "cli.run_now.rejected_line",
+                reason = text(v, "reason"),
+                message = text(v, "message")
             ),
             _ => text(v, "message").to_string(),
         },
@@ -949,25 +1095,23 @@ fn render(command: &str, v: &Value) -> String {
                 return text(v, "message").to_string();
             }
             let mut lines = vec![
-                format!("更新案 {}", short(text(v, "sha"))),
-                format!("パッチ: {}", text(v, "patchPath")),
-                format!("対象: {}", list(&v["documents"])),
+                crate::t!("cli.review.title", sha = short(text(v, "sha"))),
+                crate::t!("cli.review.patch", path = text(v, "patchPath")),
+                crate::t!("cli.review.targets", documents = list(&v["documents"])),
                 text(v, "diffstat").to_string(),
             ];
             let others = v["proposals"].as_array().map_or(0, Vec::len);
             if others > 1 {
-                lines.push(format!(
-                    "ほかにも更新案があります（計 {others} 件）。sha を指定して確認できます"
-                ));
+                lines.push(crate::t!("cli.review.others", count = others));
             }
             lines.join("\n")
         }
-        "apply" => format!(
-            "適用しました（{}）: {}（stage はしていません）",
-            short(text(v, "sha")),
-            list(&v["files"])
+        "apply" => crate::t!(
+            "cli.apply.done",
+            sha = short(text(v, "sha")),
+            files = list(&v["files"])
         ),
-        "discard" => format!("破棄しました: {}", short(text(v, "sha"))),
+        "discard" => crate::t!("cli.discard.done", sha = short(text(v, "sha"))),
         _ => pretty(v),
     }
 }

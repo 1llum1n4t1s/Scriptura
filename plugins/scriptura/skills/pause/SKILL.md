@@ -1,10 +1,12 @@
 ---
 name: pause
-description: Scriptura の自動保守を一時停止する。Pause Scriptura.
+description: Pause Scriptura automatic maintenance. Pause Scriptura.
 disable-model-invocation: true
 allowed-tools: Bash(scriptura pause *)
 ---
 
 # Scriptura pause
 
-`scriptura pause --json` を実行し、停止した旨を伝えます。再開は `/scriptura:resume` です。設定は削除しません。
+Run `scriptura pause --json` and tell the user it is paused. Resume with `/scriptura:resume`. Settings are not deleted.
+
+Reply in the language the user is writing in.

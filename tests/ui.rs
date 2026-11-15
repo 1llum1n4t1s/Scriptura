@@ -191,7 +191,12 @@ impl Fx {
         fx
     }
 
-    async fn raw(&self, req: Request<Body>) -> Resp {
+    async fn raw(&self, mut req: Request<Body>) -> Resp {
+        // 既存の期待は日本語の画面文言なので、既定では Accept-Language: ja で要求する
+        // （画面の言語は Cookie → Accept-Language → 英語。言語そのものの検査は tests/localization.rs）。
+        req.headers_mut()
+            .entry(header::ACCEPT_LANGUAGE)
+            .or_insert(header::HeaderValue::from_static("ja"));
         let res = self.app.clone().oneshot(req).await.unwrap();
         let status = res.status();
         let headers = res.headers().clone();
@@ -1562,4 +1567,95 @@ async fn restoring_a_push_registration_is_refused_before_confirmation() {
     assert!(r.body.contains("enable --mode push"), "{}", r.body);
     assert_eq!(fx.config().repository[0].mode, Some(Mode::Propose));
     assert_eq!(fx.config().repository[0].root, root, "登録はそのまま");
+}
+
+// 画面の言語: Cookie（明示の選択）→ Accept-Language → 英語。選択欄は POST /language（CSRF 必須）で、
+// GET は Cookie を書かない。<html lang> は表示言語に合わせる。
+#[tokio::test]
+async fn display_language_follows_cookie_then_accept_language_then_english() {
+    let fx = Fx::new().await;
+    let lang_of = |body: &str| {
+        Regex::new(r#"<html lang="([^"]+)""#)
+            .unwrap()
+            .captures(body)
+            .map(|c| c[1].to_string())
+    };
+    // Accept-Language なし → 英語（Fx::raw は既定で ja を付けるので、ここは直接 Router を呼ぶ）。
+    let plain = |extra: Option<(&'static str, String)>| {
+        let mut req = get("/");
+        req.headers_mut()
+            .insert(header::COOKIE, fx.cookie.parse().unwrap());
+        if let Some((name, value)) = extra {
+            req.headers_mut().insert(
+                header::HeaderName::from_static(name),
+                value.parse().unwrap(),
+            );
+        }
+        req
+    };
+    let body_of = |res: axum::response::Response| async move {
+        String::from_utf8_lossy(&res.into_body().collect().await.unwrap().to_bytes()).into_owned()
+    };
+    let en = body_of(fx.app.clone().oneshot(plain(None)).await.unwrap()).await;
+    assert_eq!(lang_of(&en).as_deref(), Some("en"), "{en}");
+    assert!(en.contains("Overview"), "英語の画面");
+    // Accept-Language（q 値つき）の最良一致。
+    let fr = body_of(
+        fx.app
+            .clone()
+            .oneshot(plain(Some((
+                "accept-language",
+                "it;q=0.9, fr;q=0.8".into(),
+            ))))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(lang_of(&fr).as_deref(), Some("fr"), "{fr}");
+    // 選択欄は全言語と「自動」を持ち、GET は Set-Cookie を出さない。
+    assert!(
+        fr.contains("data-language-selector")
+            && fr.contains("日本語")
+            && fr.contains("Português (Brasil)")
+    );
+    // POST /language は CSRF が要り、Cookie を書いて元の画面へ戻す。
+    let bad = fx
+        .post_exact("/language", &[("language".into(), "de".into())])
+        .await;
+    assert_eq!(bad.status, StatusCode::FORBIDDEN);
+    let set = fx.post("/language", &[("language", "de")]).await;
+    assert_eq!(set.status, StatusCode::SEE_OTHER);
+    let cookie = set
+        .headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        cookie.starts_with("scriptura-language-7468=de;") && cookie.contains("SameSite=Strict"),
+        "{cookie}"
+    );
+    assert_eq!(set.location(), "/");
+    // 未対応の値は拒否する。
+    assert_eq!(
+        fx.post("/language", &[("language", "xx")]).await.status,
+        StatusCode::BAD_REQUEST
+    );
+    // 明示の選択は Accept-Language より優先される。
+    let chosen = format!("{}; scriptura-language-7468=de", fx.cookie);
+    let mut req = get("/");
+    req.headers_mut()
+        .insert(header::COOKIE, chosen.parse().unwrap());
+    req.headers_mut()
+        .insert(header::ACCEPT_LANGUAGE, "ja".parse().unwrap());
+    let de = body_of(fx.app.clone().oneshot(req).await.unwrap()).await;
+    assert_eq!(lang_of(&de).as_deref(), Some("de"), "{de}");
+    // 「自動」で Cookie を消す（Max-Age=0）。
+    let auto = fx.post("/language", &[("language", "auto")]).await;
+    let cleared = auto
+        .headers
+        .get(header::SET_COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(cleared.contains("Max-Age=0"), "{cleared}");
 }

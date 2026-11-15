@@ -11,6 +11,9 @@ description = "Keeps AGENTS.md, DESIGN.md and README.md of your own repositories
 default = ["ui"]
 ui = ["dep:axum", "dep:askama", "dep:tokio", "dep:getrandom"]
 test-support = []
+# 隔離した E2E 検証専用（本番ビルドには入れない）。更新元をローカルフォルダーへ差し替える環境変数
+# `SCRIPTURA_UPDATE_FEED_DIR` と、未署名パッケージの適用を許す `SCRIPTURA_UPDATE_ALLOW_UNSIGNED=1` を有効にする。
+update-feed-test = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -25,7 +28,16 @@ toml = "0.9"
 url = "2"
 wait-timeout = "0.2"
 uuid = { version = "1", features = ["v4"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Storage_FileSystem"] }
+# 署名者検証（app_update::trust）のエラー型。velopack が既に依存しているので新しい crate は増えない。
+anyhow = "1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Diagnostics_ToolHelp", "Win32_Security_WinTrust", "Win32_Security_Cryptography", "Win32_Globalization"] }
+# Setup（Velopack）導入版のフック処理・更新の確認と取得・適用（版は Remnifold・Skilvella と揃える）。
+# 既定の機能を切り、HTTP は velopack 内蔵の ureq（blocking）を使う。tokio を引き込まない（hook の経路の方針）。
+# public-utils は依存を増やさず `velopack::bundle` を公開するだけの機能で、macOS の署名検証で
+# UpdateMac と同じ関数で nupkg を展開するために使う。
+velopack = { version = "=1.2.161", default-features = false, features = ["public-utils"] }
+# 適用前の署名者検証で nupkg（zip）の中身を列挙・取り出す。velopack と同じ版の系列にして重複を避ける。
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # 管理画面（feature "ui"）だけが使う。SSR（askama）+ axum + tokio、乱数は OS の CSPRNG（getrandom）。
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "query"], optional = true }
 askama = { version = "0.16.1", default-features = false, features = ["derive", "std"], optional = true }

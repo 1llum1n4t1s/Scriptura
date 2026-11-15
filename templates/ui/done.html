@@ -1,4 +1,4 @@
 {% extends "ui/base.html" %}
 {% block content %}
-<section class="panel"><h1>終了しました</h1><p>管理画面を終了しました。このタブは閉じてかまいません。もう一度使うときは <code>scriptura ui</code> を実行してください。</p></section>
+<section class="panel"><h1>{{ crate::locale::tr("ui.title.done") }}</h1><p>{{ crate::locale::tr("ui.done.body") }} <code>scriptura ui</code></p></section>
 {% endblock %}

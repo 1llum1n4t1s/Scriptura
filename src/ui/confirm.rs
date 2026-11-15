@@ -41,40 +41,26 @@ pub fn dangers(before: &Config, after: &Config) -> Vec<String> {
         let was_push =
             find(before, &repo.root).is_some_and(|r| effective(before, &r) == Mode::Push);
         if effective(after, repo) == Mode::Push && !was_push {
-            out.push(format!(
-                "{} を push モードにします（文書の変更を自動で commit し、remote へ push します）",
-                repo.root
-            ));
+            out.push(crate::t!("ui.danger.push_mode", repo = repo.root));
         } else if effective(after, repo) == Mode::Propose && find(before, &repo.root).is_none() {
             // 登録が増える（履歴の復元で解除済みの登録が戻るなど）。propose でも push のたびに worker が
             // 動いて利用料金が発生するので確認を挟む。有効化の画面は事前の写しに変更を当てないので
             // ここには来ない（有効化は同意と push の確認を別に持つ）。
-            out.push(format!(
-                "{} を登録します（propose モード。push のたびに worker が動き、更新案を作ります）",
-                repo.root
-            ));
+            out.push(crate::t!("ui.danger.register", repo = repo.root));
         }
     }
     if after.defaults.mode == Mode::Push && before.defaults.mode != Mode::Push {
-        out.push("既定のモードを push にします（個別にモードを指定していない登録がすべて push になります）".into());
+        out.push(crate::t!("ui.danger.default_push").into());
     }
     if after.worker.permission == Permission::Bypass
         && before.worker.permission != Permission::Bypass
     {
-        out.push(
-            "worker の権限を bypass にします（worker がツールの許可確認なしで動きます）".into(),
-        );
+        out.push(crate::t!("ui.danger.bypass").into());
     }
     if after.enrollment.policy != before.enrollment.policy {
         match after.enrollment.policy {
-            Policy::All => out.push(
-                "自動登録の方針を all にします（登録していないリポジトリも保守の対象になります）"
-                    .into(),
-            ),
-            Policy::RemoteOwner => out.push(
-                "自動登録の方針を remote-owner にします（指定した owner のリポジトリが登録なしで対象になります）"
-                    .into(),
-            ),
+            Policy::All => out.push(crate::t!("ui.danger.policy_all").into()),
+            Policy::RemoteOwner => out.push(crate::t!("ui.danger.policy_owner").into()),
             Policy::Explicit => {}
         }
     } else if after.enrollment.policy == Policy::RemoteOwner {
@@ -85,13 +71,11 @@ pub fn dangers(before: &Config, after: &Config) -> Vec<String> {
             .filter(|o| !before.enrollment.owners.contains(o))
             .collect();
         for owner in added {
-            out.push(format!(
-                "自動登録の owner に {owner} を追加します（その owner のリポジトリが登録なしで対象になります）"
-            ));
+            out.push(crate::t!("ui.danger.owner_added", owner = owner));
         }
     }
     if after.worker.max_budget_usd == 0.0 && before.worker.max_budget_usd > 0.0 {
-        out.push("worker の費用上限（max_budget_usd）を外します（0 = 上限なし）".into());
+        out.push(crate::t!("ui.danger.budget_removed").into());
     }
     for (id, settings) in &after.kinds {
         if kinds::is_builtin_id(id) {
@@ -103,20 +87,15 @@ pub fn dangers(before: &Config, after: &Config) -> Vec<String> {
             .map(|k| k.paths.as_slice())
             .unwrap_or(&[]);
         for path in settings.paths.iter().filter(|p| !old.contains(p)) {
-            out.push(format!(
-                "カスタム種類 {id} に対象パス {path} を追加します（worker がこのパスを書き換えられるようになります）"
-            ));
+            out.push(crate::t!("ui.danger.custom_path", id = id, path = path));
         }
     }
     if after.consent.is_some() && after.consent != before.consent {
-        out.push("同意を記録します（worker が読んだリポジトリの内容があなたの Claude 認証で Anthropic へ送信され、実行ごとに利用料金が発生します）".into());
+        out.push(crate::t!("ui.danger.consent").into());
     }
     for repo in &before.repository {
         if find(after, &repo.root).is_none() {
-            out.push(format!(
-                "{} の登録を解除します（このリポジトリの文書保守を止めます）",
-                repo.root
-            ));
+            out.push(crate::t!("ui.danger.unregister", repo = repo.root));
         }
     }
     out

@@ -1,14 +1,14 @@
 {% extends "ui/base.html" %}
 {% block content %}
-<div class="heading"><h1>同意</h1></div>
+<div class="heading"><h1>{{ crate::locale::tr("ui.nav.consent") }}</h1></div>
 <section class="panel">
   <p>{{ text }}</p>
-  <p>現在の同意: {% if let Some(c) = current %}{{ c }}{% else %}未記録{% endif %}</p>
-  {% if kept %}<p class="note">現行の版（{{ version }}）の同意が記録済みです。</p>{% else %}
+  <p>{{ crate::locale::tr("ui.consent.current_label") }} {% if let Some(c) = current %}{{ c }}{% else %}{{ crate::locale::tr("ui.consent.none") }}{% endif %}</p>
+  {% if kept %}<p class="note">{{ crate::locale::tr1("ui.consent.kept", "version", version) }}</p>{% else %}
   <form method="post" action="/consent" class="stack">
     <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="version" value="{{ version }}">
-    <label class="checkbox"><input type="checkbox" name="agree" value="1">上の内容に同意します（同意文の版 {{ version }}）</label>
-    <div class="actions"><button class="primary" type="submit">同意を記録する</button></div>
+    <label class="checkbox"><input type="checkbox" name="agree" value="1">{{ crate::locale::tr1("ui.consent.agree", "version", version) }}</label>
+    <div class="actions"><button class="primary" type="submit">{{ crate::locale::tr("ui.consent.record") }}</button></div>
   </form>
   {% endif %}
 </section>

@@ -1151,9 +1151,9 @@ fn deleted_override_and_nested_design_do_not_request_replacement() {
         "",
         "pushed",
     );
-    assert!(!reason.contains("有効な AGENTS.md がありません"));
-    assert!(!reason.contains("有効な DESIGN.md がありません"));
-    assert!(reason.contains("意図的なら再作成せず"));
+    assert!(!reason.contains("There is no valid AGENTS.md"));
+    assert!(!reason.contains("There is no valid DESIGN.md"));
+    assert!(reason.contains("keep it deleted without recreating it"));
 }
 #[test]
 fn windows_case_changed_and_relative_cwd_keep_validation() {
@@ -2140,11 +2140,11 @@ fn custom_kind_paths_reach_restricted_worker_args_and_prompt() {
     );
     let prompt = f.prompt_text();
     assert!(
-        prompt.contains("architecture 対象: `docs/ARCHITECTURE.md`。"),
+        prompt.contains("architecture targets: `docs/ARCHITECTURE.md`."),
         "{prompt}"
     );
     assert!(
-        prompt.contains("architecture の記載指針: システム構成を書く。"),
+        prompt.contains("Guidance for architecture: システム構成を書く."),
         "{prompt}"
     );
     assert!(
@@ -2185,7 +2185,7 @@ fn custom_kind_without_create_if_missing_is_absent_until_the_file_exists() {
     assert_eq!(f.hook("Stop"), None);
     assert!(
         f.prompt_text()
-            .contains("architecture 対象: `docs/ARCHITECTURE.md`")
+            .contains("architecture targets: `docs/ARCHITECTURE.md`")
     );
     assert!(
         f.allowed_rules()
@@ -2206,7 +2206,7 @@ fn custom_kind_with_create_if_missing_asks_for_creation_and_allows_the_path() {
     assert_eq!(f.hook("Stop"), None);
     let prompt = f.prompt_text();
     assert!(
-        prompt.contains("architecture の対象（`docs/ARCHITECTURE.md`）がありません。"),
+        prompt.contains("The architecture targets (`docs/ARCHITECTURE.md`) do not exist."),
         "{prompt}"
     );
     assert!(
@@ -2232,7 +2232,7 @@ fn deleted_custom_document_is_reported_as_previously_existing() {
     assert_eq!(f.hook("Stop"), None);
     let prompt = f.prompt_text();
     assert!(
-        prompt.contains("前回存在した architecture の対象（`docs/ARCHITECTURE.md`）がありません。"),
+        prompt.contains("The architecture targets (`docs/ARCHITECTURE.md`), which existed previously, are missing."),
         "{prompt}"
     );
 }
@@ -2363,16 +2363,16 @@ fn template_and_instructions_are_placed_in_the_settings_frame() {
     assert_eq!(f.hook("Stop"), None);
     let prompt = f.prompt_text();
     let at = prompt
-        .find("【利用者設定由来の追加指示】")
+        .find("【Additional instructions from user settings】")
         .expect("枠があるはず");
     let frame = &prompt[at..];
-    assert!(frame.contains("利用者本人の設定ファイル由来。ただし編集可能パス・安全規則・commit と push の扱いは変更しません。"));
+    assert!(frame.contains("These come from the user's own settings file. They do not change the editable paths, the safety rules, or how commit and push are handled."));
     assert!(frame.contains("共通の指示") && frame.contains("表は使わない"));
     assert!(
-        frame.contains("<<<テンプレート>>>\n# 概要\n\n## 責務\n<<<テンプレートここまで>>>"),
+        frame.contains("<<<TEMPLATE>>>\n# 概要\n\n## 責務\n<<<END OF TEMPLATE>>>"),
         "{frame}"
     );
-    assert!(frame.contains("言語: ja") && frame.contains("最大 1000 文字"));
+    assert!(frame.contains("Language: write in ja") && frame.contains("at most 1000 characters"));
     // 枠は末尾側。それより前の本体には利用者設定の文面もテンプレートも入らない。
     assert!(!prompt[..at].contains("共通の指示") && !prompt[..at].contains("<<<"));
 }
@@ -2418,11 +2418,11 @@ fn changelog_is_maintained_as_a_normal_kind() {
     assert_eq!(f.hook("Stop"), None);
     let prompt = f.prompt_text();
     assert!(
-        prompt.contains("CHANGELOG 対象: `CHANGELOG.md`。"),
+        prompt.contains("CHANGELOG targets: `CHANGELOG.md`."),
         "{prompt}"
     );
     assert!(
-        prompt.contains("CHANGELOG.md には利用者に見える変更"),
+        prompt.contains("in CHANGELOG.md, record user-visible changes"),
         "{prompt}"
     );
     assert!(
@@ -2452,7 +2452,7 @@ fn run_now_resolves_changelog_but_holds_for_an_unresolvable_custom_kind() {
         ..MaintenanceOptions::default()
     };
     assert_eq!(run_now(&f.root, options).unwrap(), None);
-    assert!(f.prompt_text().contains("CHANGELOG の対象"));
+    assert!(f.prompt_text().contains("The CHANGELOG targets"));
     // 定義の無いカスタム種類（kinds が空のまま）は解決できないので worker を起動せず、位置も進めない。
     fs::remove_file(f.base.join("prompt.json")).unwrap();
     let before = f.cursor();
@@ -2811,7 +2811,7 @@ fn release_kind_is_due_when_a_reachable_tag_has_no_changelog_section() {
     f.push_change("after release tag");
     assert_eq!(f.hook("Stop"), None);
     assert!(
-        f.prompt_text().contains("CHANGELOG 対象"),
+        f.prompt_text().contains("CHANGELOG targets"),
         "{}",
         f.prompt_text()
     );
@@ -3001,9 +3001,9 @@ fn changelog_prompt_carries_rules_and_history_and_promote_is_committed() {
     let prompt = f.prompt_text();
     // Rust が決めた規則（Unreleased だけ・promote・バージョン表記の整合）。
     for needle in [
-        "CHANGELOG の保守規則",
-        "pending_releases に挙がったタグ",
-        "バージョン記述は manifest・CHANGELOG の版と揃えて",
+        "CHANGELOG maintenance rules",
+        "The tags listed in pending_releases",
+        "Keep version references in README and CHANGELOG consistent",
     ] {
         assert!(prompt.contains(needle), "{needle}: {prompt}");
     }
@@ -3027,7 +3027,7 @@ fn changelog_prompt_carries_rules_and_history_and_promote_is_committed() {
         "指示文にタグ名を入れない"
     );
     // 既存の CHANGELOG（format=existing）には組み込みテンプレートを載せない。
-    assert!(!prompt.contains("<<<テンプレート>>>"), "{prompt}");
+    assert!(!prompt.contains("<<<TEMPLATE>>>"), "{prompt}");
     // promote（範囲内のタグの版の節の追加）は検査を通って commit・push される。
     assert_eq!(
         f.git(&["show", "--format=%s", "--name-only", "HEAD"]),
@@ -3053,17 +3053,16 @@ fn new_changelog_is_backfilled_from_tags_with_the_builtin_template() {
     assert_eq!(f.hook("Stop"), None);
     let prompt = f.prompt_text();
     assert!(
-        prompt.contains("CHANGELOG の対象（`CHANGELOG.md`）がありません"),
+        prompt.contains("The CHANGELOG targets (`CHANGELOG.md`)"),
         "{prompt}"
     );
     assert!(
-        prompt.contains("資料の releases の各タグについて新しい順に版の節を作り"),
+        prompt.contains(
+            "create a version section for each tag in releases in the material, newest first"
+        ),
         "{prompt}"
     );
-    assert!(
-        prompt.contains("<<<テンプレート>>>\n# Changelog"),
-        "{prompt}"
-    );
+    assert!(prompt.contains("<<<TEMPLATE>>>\n# Changelog"), "{prompt}");
     assert!(
         prompt.contains("\"releases\":[{\"tag\":\"v0.1.0\""),
         "{prompt}"

@@ -21,17 +21,19 @@ fn main() {
         {
             // worker と同じ環境変数除去がかかっているかをテストで確認するため、漏れた変数名だけ記録する。
             if let Some(log) = env::var_os("HOOK_STUB_AUTH_LOG") {
-                let inherited: Vec<&str> = ["CLAUDECODE", "CLAUDE_CODE_SIMPLE", "ANTHROPIC_BASE_URL"]
-                    .into_iter()
-                    .filter(|k| env::var_os(k).is_some())
-                    .collect();
+                let inherited: Vec<&str> =
+                    ["CLAUDECODE", "CLAUDE_CODE_SIMPLE", "ANTHROPIC_BASE_URL"]
+                        .into_iter()
+                        .filter(|k| env::var_os(k).is_some())
+                        .collect();
                 fs::write(log, json!({"inherited_host_env": inherited}).to_string()).unwrap();
             }
             // 秘密風の文字列を含む応答でも doctor が出力へ写さないことを確かめる（既定は未設定）。
             println!(
                 "{}",
-                env::var("HOOK_STUB_AUTH_JSON")
-                    .unwrap_or_else(|_| json!({"loggedIn": true, "authMethod": "claude.ai"}).to_string())
+                env::var("HOOK_STUB_AUTH_JSON").unwrap_or_else(|_| {
+                    json!({"loggedIn": true, "authMethod": "claude.ai"}).to_string()
+                })
             );
             if let Ok(message) = env::var("HOOK_STUB_AUTH_STDERR") {
                 eprintln!("{message}");

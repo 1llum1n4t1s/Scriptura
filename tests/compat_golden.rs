@@ -6,7 +6,7 @@
 //!
 //! - プロンプトは相対パスだけで組み立てられ、検知 sha は固定文字列を渡すため環境に依存しない。
 //!   ignore 判定だけは実際の `git check-ignore` を使うので、`.gitignore` を置いた使い捨てリポジトリを作る。
-//! - 期待値の再生成は意図した契約変更のときだけ `SCRIPTURA_GOLDEN_UPDATE=1` で行う。
+//! - 期待値の再生成は意図した契約変更のときだけ `SCRIPTURA_GOLDEN_UPDATE=1` で行う（ローカライズで worker のプロンプトを英語に統一したときに 1 回再生成した）。
 //! - fixture の置き場は `SCRIPTURA_TEST_BASE`（未指定なら `validation/`）。固定名のフォルダーを再利用し、
 //!   実行ごとにゴミを増やさない。
 use scriptura::config::{Document, Permission, Worker};

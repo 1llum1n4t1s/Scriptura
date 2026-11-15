@@ -1,14 +1,14 @@
 {% extends "ui/base.html" %}
 {% block head %}{% if running %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
 {% block content %}
-<a class="back" href="/repos/{{ index }}">← リポジトリへ</a>
+<a class="back" href="/repos/{{ index }}">← {{ crate::locale::tr("ui.job.back") }}</a>
 <section class="panel">
   <h1>run-now #{{ id }}</h1>
-  <dl class="facts"><dt>リポジトリ</dt><dd><code>{{ root }}</code></dd><dt>開始</dt><dd>{{ started }}</dd></dl>
-  {% if running %}<p class="notice">実行中です。完了するとこの画面に結果が出ます（3 秒ごとに更新します）。</p>
+  <dl class="facts"><dt>{{ crate::locale::tr("ui.common.repository") }}</dt><dd><code>{{ root }}</code></dd><dt>{{ crate::locale::tr("ui.job.started") }}</dt><dd>{{ started }}</dd></dl>
+  {% if running %}<p class="notice">{{ crate::locale::tr("ui.job.running") }}</p>
   {% else %}
   <p class="notice{% if !ok %} warning{% endif %}">{{ message }}</p>
-  {% if let Some(link) = proposal %}<p><a class="button primary" href="{{ link }}">更新案を見る</a></p>{% endif %}
+  {% if let Some(link) = proposal %}<p><a class="button primary" href="{{ link }}">{{ crate::locale::tr("ui.job.view_proposal") }}</a></p>{% endif %}
   {% endif %}
 </section>
 {% endblock %}

@@ -1,14 +1,14 @@
 {% extends "ui/base.html" %}
 {% block content %}
-<div class="heading"><h1>設定の変更履歴</h1></div>
+<div class="heading"><h1>{{ crate::locale::tr("ui.title.history") }}</h1></div>
 <section class="panel">
   {% if !error.is_empty() %}<p class="error-text">{{ error }}</p>{% endif %}
-  {% if rows.is_empty() %}<p class="note">変更履歴はまだありません（設定を変更すると、変更前の内容がここに残ります。最大 50 件）。</p>{% else %}
+  {% if rows.is_empty() %}<p class="note">{{ crate::locale::tr("ui.history.none") }}</p>{% else %}
   <div class="table-wrap"><table>
-    <thead><tr><th>退避した時刻</th><th>版</th><th>大きさ</th></tr></thead>
-    <tbody>{% for r in rows %}<tr><td><a href="/history/{{ r.id }}">{{ r.saved_at }}</a></td><td><code>{{ r.revision }}</code></td><td>{{ r.size }} バイト</td></tr>{% endfor %}</tbody>
+    <thead><tr><th>{{ crate::locale::tr("ui.history.saved_at") }}</th><th>{{ crate::locale::tr("ui.history.revision") }}</th><th>{{ crate::locale::tr("ui.history.size") }}</th></tr></thead>
+    <tbody>{% for r in rows %}<tr><td><a href="/history/{{ r.id }}">{{ r.saved_at }}</a></td><td><code>{{ r.revision }}</code></td><td>{{ crate::locale::tr1("cli.docs.bytes", "n", r.size) }}</td></tr>{% endfor %}</tbody>
   </table></div>
   {% endif %}
-  <p class="note">実行の記録は各リポジトリの「処理済み位置」と「push モードの進行」に表示します。</p>
+  <p class="note">{{ crate::locale::tr("ui.history.note") }}</p>
 </section>
 {% endblock %}

@@ -56,8 +56,7 @@ fn git_text(root: &Path, args: &[&str]) -> Option<String> {
 
 /// 指定パスを含む Git リポジトリのルート（正規化済み）。Git リポジトリでなければエラー。
 pub fn git_root(raw: &str) -> Result<PathBuf, String> {
-    maintenance::resolve_repo_root(raw)
-        .ok_or_else(|| format!("Git リポジトリではありません: {raw}"))
+    maintenance::resolve_repo_root(raw).ok_or_else(|| crate::t!("ops.not_git", path = raw))
 }
 
 /// 同意をこのまま保つか。現行の版で、利用者本人が明示した同意（CLI・管理画面）なら保つ。
@@ -94,8 +93,8 @@ fn peek(store: &Store, expected: Option<&Revision>) -> OpResult<Option<Config>> 
 
 /// 設定が在り、`root` が登録済みであること。無ければ従来の CLI と同じ文言で拒否する。
 fn require_registered(config: Option<&Config>, root: &str) -> Result<usize, String> {
-    let config = config.ok_or("設定ファイルがありません（未登録です）")?;
-    find_repo(config, root).ok_or_else(|| format!("登録されていないリポジトリです: {root}"))
+    let config = config.ok_or(crate::t!("ops.no_config_unregistered"))?;
+    find_repo(config, root).ok_or_else(|| crate::t!("ops.not_registered", repo = root))
 }
 
 // ---------------------------------------------------------------------------
@@ -191,10 +190,10 @@ pub fn apply_enable(config: &mut Config, plan: &EnablePlan) -> usize {
 pub fn plan_enable(req: &EnableRequest) -> Result<(PathBuf, EnablePlan), String> {
     let root = git_root(&req.repo)?;
     if req.branches.as_ref().is_some_and(|b| b.is_empty()) {
-        return Err("--branches が空です".into());
+        return Err(crate::t!("cli.branches.empty").into());
     }
     if req.documents.as_ref().is_some_and(|d| d.is_empty()) {
-        return Err("--documents が空です".into());
+        return Err(crate::t!("cli.documents.empty").into());
     }
     // 現在のブランチ・upstream の remote・push 先 URL。
     let branch = git_text(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
@@ -208,16 +207,14 @@ pub fn plan_enable(req: &EnableRequest) -> Result<(PathBuf, EnablePlan), String>
     if req.mode == Mode::Push {
         // push モードは文書を実際に push するので、送信先が定まらないものは受け付けない。
         if remotes.is_empty() {
-            return Err(
-                "push モードにはリモート（remote）が必要です。remote が無いので登録しません".into(),
-            );
+            return Err(crate::t!("ops.push_needs_remote").into());
         }
         // --branches を明示しても、現在のブランチの upstream は必須（push 先が定まらない登録を作らない）。
         if branch.is_none() {
-            return Err("detached HEAD のため push モードでは登録できません".into());
+            return Err(crate::t!("ops.push_detached").into());
         }
         if upstream_remote.is_none() {
-            return Err("現在のブランチに upstream（追跡先）がありません。push モードには upstream が必要です".into());
+            return Err(crate::t!("ops.push_needs_upstream").into());
         }
     }
     let branches = match (&req.branches, req.mode) {
@@ -263,8 +260,9 @@ pub fn enable(
     expected: Option<&Revision>,
 ) -> OpResult<Enabled> {
     if req.consent_version != CURRENT_CONSENT_VERSION {
-        return Err(UpdateError::Rejected(format!(
-            "同意の版が現行（{CURRENT_CONSENT_VERSION}）と一致しないため有効化しません"
+        return Err(UpdateError::Rejected(crate::t!(
+            "ops.enable_consent_mismatch",
+            version = CURRENT_CONSENT_VERSION
         )));
     }
     let (root, plan) = plan_enable(req).map_err(UpdateError::Rejected)?;
@@ -273,7 +271,7 @@ pub fn enable(
     apply_enable(&mut trial, &plan);
     trial.validate().map_err(UpdateError::Invalid)?;
     maintenance::baseline(&root)
-        .map_err(|e| UpdateError::Io(format!("起点の記録に失敗しました: {e}")))?;
+        .map_err(|e| UpdateError::Io(crate::t!("ops.baseline_failed", error = e)))?;
     let updated = config::update_in(store, expected, |c, _| Ok(apply_enable(c, &plan)))?;
     Ok(Enabled {
         index: updated.value,
@@ -348,10 +346,7 @@ pub fn set_repository_mode(
     expected: Option<&Revision>,
 ) -> OpResult<Updated<()>> {
     let becomes_push = |c: &Config| mode.unwrap_or(c.defaults.mode) == Mode::Push;
-    let refuse_push = || {
-        "push モードへの変更はここではできません。scriptura enable --mode push（または画面の有効化）で登録し直してください"
-            .to_string()
-    };
+    let refuse_push = || crate::t!("ops.refuse_push").to_string();
     let current = peek(store, expected)?;
     require_registered(current.as_ref(), root).map_err(UpdateError::Rejected)?;
     if current.as_ref().is_some_and(becomes_push) {
@@ -390,8 +385,9 @@ pub fn set_kind(
     expected: Option<&Revision>,
 ) -> OpResult<Updated<()>> {
     if !config::is_valid_kind_id(id) {
-        return Err(UpdateError::Rejected(format!(
-            "文書の種類の id が不正です: {id}"
+        return Err(UpdateError::Rejected(crate::t!(
+            "ops.invalid_kind_id",
+            id = id
         )));
     }
     edit(store, expected, |c| {
@@ -428,8 +424,9 @@ pub fn record_consent(
     expected: Option<&Revision>,
 ) -> OpResult<Updated<()>> {
     if version != CURRENT_CONSENT_VERSION {
-        return Err(UpdateError::Rejected(format!(
-            "同意の版が現行（{CURRENT_CONSENT_VERSION}）と一致しません"
+        return Err(UpdateError::Rejected(crate::t!(
+            "ops.consent_mismatch",
+            version = CURRENT_CONSENT_VERSION
         )));
     }
     edit(store, expected, |c| {
@@ -451,7 +448,7 @@ pub fn record_consent(
 /// 変更履歴の一覧（新しい順）。
 pub fn history(store: &Store) -> OpResult<Vec<HistoryEntry>> {
     config::history_in(store)
-        .map_err(|e| UpdateError::Io(format!("設定の変更履歴を読めません: {e}")))
+        .map_err(|e| UpdateError::Io(crate::t!("ops.history_unreadable", error = e)))
 }
 
 /// 変更履歴 1 件の生のバイト列と解釈結果。
@@ -477,14 +474,16 @@ pub fn restore(store: &Store, id: &str, expected: Option<&Revision>) -> OpResult
     let restored = match loaded {
         Loaded::Ok(c) => c,
         Loaded::Invalid(reason) => {
-            return Err(UpdateError::Invalid(format!(
-                "変更履歴 {id} は今の版では読めないため復元しません: {}",
-                reason.lines().next().unwrap_or("").trim()
+            return Err(UpdateError::Invalid(crate::t!(
+                "ops.restore_unreadable",
+                id = id,
+                reason = reason.lines().next().unwrap_or("").trim()
             )));
         }
         Loaded::Missing => {
-            return Err(UpdateError::Rejected(format!(
-                "変更履歴が見つかりません: {id}"
+            return Err(UpdateError::Rejected(crate::t!(
+                "config.history_not_found",
+                id = id
             )));
         }
     };
@@ -496,8 +495,10 @@ pub fn restore(store: &Store, id: &str, expected: Option<&Revision>) -> OpResult
     let added = added_registrations(&current, &restored);
     for root in &added {
         maintenance::baseline(Path::new(root)).map_err(|e| {
-            UpdateError::Io(format!(
-                "復元で戻る登録 {root} の起点の記録に失敗したため復元しません: {e}"
+            UpdateError::Io(crate::t!(
+                "ops.restore_baseline_failed",
+                repo = root,
+                error = e
             ))
         })?;
     }
@@ -514,9 +515,7 @@ pub fn restore(store: &Store, id: &str, expected: Option<&Revision>) -> OpResult
             .into_iter()
             .find(|r| !baselined.contains(&config::normalize_root(r, windows())))
         {
-            return Err(format!(
-                "復元の準備中に設定が変わり、登録 {root} の起点を記録できていないため復元しません。もう一度操作してください"
-            ));
+            return Err(crate::t!("ops.restore_changed", repo = root));
         }
         *c = restored;
         Ok(())
@@ -555,9 +554,7 @@ pub fn restore_refusal(current: &Config, restored: &Config) -> Option<String> {
 }
 
 fn restore_push_refusal(root: &str) -> String {
-    format!(
-        "この復元では {root} が push モードになるため復元しません。push モードは scriptura enable --mode push（または画面の有効化）で登録してください"
-    )
+    crate::t!("ops.restore_push", repo = root)
 }
 
 // ---------------------------------------------------------------------------
@@ -567,18 +564,12 @@ fn restore_push_refusal(root: &str) -> String {
 /// 判定で見送ったときの利用者向けの説明。
 pub fn skip_message(reason: SkipReason) -> &'static str {
     match reason {
-        SkipReason::NoConsent => {
-            "同意が記録されていないか版が古いため実行しません（scriptura enable で同意してください）"
-        }
-        SkipReason::NotEnrolled => {
-            "このリポジトリは登録されていません（scriptura enable --repo <パス> で登録してください）"
-        }
-        SkipReason::Off => "モードが off のため実行しません",
-        SkipReason::Paused => "一時停止中のため実行しません（scriptura resume で再開してください）",
-        SkipReason::RemoteMismatch => {
-            "登録された remote と現在の push 先が一致しないため実行しません"
-        }
-        SkipReason::BranchNotAllowed => "現在のブランチは許可ブランチではないため実行しません",
+        SkipReason::NoConsent => crate::t!("ops.skip_no_consent"),
+        SkipReason::NotEnrolled => crate::t!("ops.skip_not_enrolled"),
+        SkipReason::Off => crate::t!("ops.skip_off"),
+        SkipReason::Paused => crate::t!("ops.skip_paused"),
+        SkipReason::RemoteMismatch => crate::t!("ops.skip_remote_mismatch"),
+        SkipReason::BranchNotAllowed => crate::t!("ops.skip_branch"),
     }
 }
 
@@ -614,18 +605,15 @@ fn narrow_to_documents(
 ) -> Result<maintenance::MaintenanceOptions, String> {
     for doc in wanted {
         if matches!(doc, Document::Custom(id) if !config.kinds.contains_key(id.as_str())) {
-            return Err(format!(
-                "文書の種類が設定に定義されていません: {}（scriptura docs list で一覧を確認できます）",
-                doc.name()
-            ));
+            return Err(crate::t!("ops.kind_undefined", name = doc.name()));
         }
         if !decision_documents.contains(doc) {
             let enabled: Vec<&str> = decision_documents.iter().map(Document::name).collect();
-            return Err(format!(
-                "このリポジトリで有効ではない文書の種類です: {}（有効: {}）",
-                doc.name(),
-                if enabled.is_empty() {
-                    "なし".to_string()
+            return Err(crate::t!(
+                "ops.kind_not_enabled",
+                name = doc.name(),
+                enabled = if enabled.is_empty() {
+                    crate::t!("cli.none").to_string()
                 } else {
                     enabled.join(", ")
                 }
@@ -638,7 +626,7 @@ fn narrow_to_documents(
         .filter(|k| wanted.contains(&k.document))
         .collect();
     if selected.is_empty() {
-        return Err("指定した文書の種類を解決できませんでした".into());
+        return Err(crate::t!("ops.kind_unresolved").into());
     }
     Ok(timing::narrow_options(&options, &selected))
 }
@@ -686,18 +674,17 @@ pub fn run_now_for(
     let config = match config::load_from(&store.config_file) {
         Loaded::Ok(c) => c,
         Loaded::Missing => {
-            return Err("設定ファイルがありません。scriptura enable で有効化してください".into());
+            return Err(crate::t!("ops.run_no_config").into());
         }
         Loaded::Invalid(reason) => {
-            return Err(format!(
-                "設定ファイルを読めないため実行しません（{}）: {}",
-                store.config_file.display(),
-                reason.lines().next().unwrap_or("").trim()
+            return Err(crate::t!(
+                "ops.run_config_invalid",
+                path = store.config_file.display(),
+                reason = reason.lines().next().unwrap_or("").trim()
             ));
         }
     };
-    let (branch, urls) = maintenance::push_target(root)
-        .ok_or("現在のブランチに upstream が無い（または detached HEAD）ため実行できません")?;
+    let (branch, urls) = maintenance::push_target(root).ok_or(crate::t!("ops.run_no_upstream"))?;
     let decision = config::resolve(&config, root, &urls, &branch);
     if let Some(reason) = decision.skip_reason {
         return Err(skip_message(reason).into());
@@ -711,8 +698,7 @@ pub fn run_now_for(
             let started = timing::now_secs();
             let before: HashSet<String> = proposal::list(root).into_iter().map(|x| x.sha).collect();
             // フックと同じ poll ロックを取り、同時実行を避ける。
-            let lock = maintenance::acquire_poll_lock()?
-                .ok_or("別の文書保守が実行中です。しばらくしてから再実行してください")?;
+            let lock = maintenance::acquire_poll_lock()?.ok_or(crate::t!("ops.run_busy"))?;
             let message = maintenance::poll_repository_with(
                 root,
                 PollOptions {
@@ -867,10 +853,10 @@ pub fn docs_overview(store: &Store, root: &Path) -> Result<DocsOverview, String>
         Loaded::Ok(c) => (c, true),
         Loaded::Missing => (Config::default(), false),
         Loaded::Invalid(reason) => {
-            return Err(format!(
-                "設定ファイルを読めません（{}）: {}",
-                store.config_file.display(),
-                reason.lines().next().unwrap_or("").trim()
+            return Err(crate::t!(
+                "ops.config_invalid",
+                path = store.config_file.display(),
+                reason = reason.lines().next().unwrap_or("").trim()
             ));
         }
     };

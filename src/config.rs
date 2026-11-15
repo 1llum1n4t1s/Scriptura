@@ -153,9 +153,7 @@ impl TryFrom<String> for Document {
             "README.md" | "readme" => Ok(Document::Readme),
             "CHANGELOG.md" | "changelog" => Ok(Document::Changelog),
             _ if is_valid_kind_id(&text) => Ok(Document::Custom(text)),
-            _ => Err(format!(
-                "文書の種類として解釈できません: {text}（AGENTS.md / DESIGN.md / README.md / CHANGELOG.md か、英小文字・数字・ハイフンの id）"
-            )),
+            _ => Err(crate::t!("config.document_invalid", text = text)),
         }
     }
 }
@@ -485,55 +483,62 @@ impl Config {
     /// 値の範囲検証。読み込み時と保存前の両方で使う。
     pub fn validate(&self) -> Result<(), String> {
         if !(MIN_SCHEMA..=CURRENT_SCHEMA).contains(&self.schema) {
-            return Err(format!("未対応の schema です: {}", self.schema));
+            return Err(crate::t!("config.schema_unsupported", schema = self.schema));
         }
         if self.defaults.documents.is_empty() {
-            return Err("defaults.documents が空です".into());
+            return Err(crate::t!("config.empty", field = "defaults.documents"));
         }
         check_globs("defaults.exclude", &self.defaults.exclude)?;
         kinds::validate_instructions("defaults.instructions", &self.defaults.instructions)?;
         kinds::validate_kinds(self)?;
         let w = &self.worker;
         if w.model.trim().is_empty() {
-            return Err("worker.model が空です".into());
+            return Err(crate::t!("config.empty", field = "worker.model"));
         }
         if w.effort.trim().is_empty() || w.effort.contains(char::is_whitespace) {
-            return Err("worker.effort が不正です".into());
+            return Err(crate::t!("config.invalid_value", field = "worker.effort"));
         }
         if !TIMEOUT_RANGE.contains(&w.timeout_secs) {
-            return Err(format!(
-                "worker.timeout_secs は {}..={} の範囲です: {}",
-                TIMEOUT_RANGE.start(),
-                TIMEOUT_RANGE.end(),
-                w.timeout_secs
+            return Err(crate::t!(
+                "config.timeout_range",
+                min = TIMEOUT_RANGE.start(),
+                max = TIMEOUT_RANGE.end(),
+                value = w.timeout_secs
             ));
         }
         if !w.max_budget_usd.is_finite() || w.max_budget_usd < 0.0 {
-            return Err("worker.max_budget_usd は 0 以上の有限値です".into());
+            return Err(crate::t!("config.budget_invalid").into());
         }
         if !w.claude_path.is_empty() && !Path::new(&w.claude_path).is_absolute() {
-            return Err("worker.claude_path は絶対パスです".into());
+            return Err(crate::t!("config.claude_path_absolute").into());
         }
         for owner in &self.enrollment.owners {
             if normalize_owner(owner).is_none() {
-                return Err(format!("enrollment.owners は host/owner 形式です: {owner}"));
+                return Err(crate::t!("config.owner_invalid", owner = owner));
             }
         }
         for (i, repo) in self.repository.iter().enumerate() {
             let at = format!("repository[{i}]");
             if repo.root.trim().is_empty() {
-                return Err(format!("{at}.root が空です"));
+                return Err(crate::t!("config.empty", field = format!("{at}.root")));
             }
             if let Some(remote) = &repo.remote
                 && normalize_remote(remote).is_none()
             {
-                return Err(format!("{at}.remote を解釈できません: {remote}"));
+                return Err(crate::t!(
+                    "config.remote_invalid",
+                    field = format!("{at}.remote"),
+                    remote = remote
+                ));
             }
             if repo.documents.as_ref().is_some_and(|d| d.is_empty()) {
-                return Err(format!("{at}.documents が空です"));
+                return Err(crate::t!("config.empty", field = format!("{at}.documents")));
             }
             if repo.branches.iter().any(|b| b.trim().is_empty()) {
-                return Err(format!("{at}.branches に空の名前があります"));
+                return Err(crate::t!(
+                    "config.branch_empty_name",
+                    field = format!("{at}.branches")
+                ));
             }
             check_globs(&format!("{at}.exclude"), &repo.exclude)?;
         }
@@ -551,9 +556,7 @@ impl Config {
                 if let Document::Custom(id) = doc
                     && !self.kinds.contains_key(id)
                 {
-                    return Err(format!(
-                        "{field} のカスタム種類 {id} は [kinds.{id}] の定義が必要です"
-                    ));
+                    return Err(crate::t!("config.custom_undefined", field = field, id = id));
                 }
             }
         }
@@ -564,7 +567,7 @@ impl Config {
 pub(crate) fn check_globs(field: &str, globs: &[String]) -> Result<(), String> {
     for g in globs {
         if g.trim().is_empty() {
-            return Err(format!("{field} に空のパターンがあります"));
+            return Err(crate::t!("config.glob_empty", field = field));
         }
         // exclude は Claude Code の許可規則 `Read(<pattern>)` / `Edit(<pattern>)` へそのまま埋め込まれる。
         // `)` は規則を途中で閉じ、空白・制御文字は規則の区切り（`--disallowedTools` の空白区切りや
@@ -572,9 +575,7 @@ pub(crate) fn check_globs(field: &str, globs: &[String]) -> Result<(), String> {
         if g.chars()
             .any(|c| c == ')' || c.is_whitespace() || c.is_control())
         {
-            return Err(format!(
-                "{field} のパターンに使えない文字（`)`・空白・制御文字）があります"
-            ));
+            return Err(crate::t!("config.glob_chars", field = field));
         }
     }
     Ok(())
@@ -593,7 +594,7 @@ pub enum Loaded {
 pub fn parse(text: &str) -> Loaded {
     let table: toml::Table = match toml::from_str(text) {
         Ok(t) => t,
-        Err(e) => return Loaded::Invalid(format!("TOML を解釈できません: {e}")),
+        Err(e) => return Loaded::Invalid(crate::t!("config.toml_invalid", error = e)),
     };
     // 新しい版は未知キーを含むはずなので、厳密な型検証より先に schema だけ見て分かりやすく断る。
     match table.get("schema") {
@@ -601,15 +602,13 @@ pub fn parse(text: &str) -> Loaded {
         Some(toml::Value::Integer(n))
             if (i64::from(MIN_SCHEMA)..=i64::from(CURRENT_SCHEMA)).contains(n) => {}
         Some(toml::Value::Integer(n)) if *n > i64::from(CURRENT_SCHEMA) => {
-            return Loaded::Invalid(format!(
-                "この版より新しい schema です: {n}（Scriptura を更新してください）"
-            ));
+            return Loaded::Invalid(crate::t!("config.schema_newer", schema = n));
         }
-        Some(other) => return Loaded::Invalid(format!("schema が不正です: {other}")),
+        Some(other) => return Loaded::Invalid(crate::t!("config.schema_invalid", value = other)),
     }
     let config: Config = match table.try_into() {
         Ok(c) => c,
-        Err(e) => return Loaded::Invalid(format!("設定の内容が不正です: {e}")),
+        Err(e) => return Loaded::Invalid(crate::t!("config.content_invalid", error = e)),
     };
     match config.validate() {
         Ok(()) => Loaded::Ok(config),
@@ -622,10 +621,10 @@ pub fn load_from(path: &Path) -> Loaded {
     match fs::read(path) {
         Ok(bytes) => match String::from_utf8(bytes) {
             Ok(text) => parse(&text),
-            Err(_) => Loaded::Invalid("UTF-8 ではありません".into()),
+            Err(_) => Loaded::Invalid(crate::t!("config.not_utf8").into()),
         },
         Err(e) if e.kind() == io::ErrorKind::NotFound => Loaded::Missing,
-        Err(e) => Loaded::Invalid(format!("読み込めません: {e}")),
+        Err(e) => Loaded::Invalid(crate::t!("config.read_failed", error = e)),
     }
 }
 
@@ -664,10 +663,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "保存先に親フォルダーがありません",
-            )
+            io::Error::new(io::ErrorKind::InvalidInput, crate::t!("config.no_parent"))
         })?;
     fs::create_dir_all(parent)?;
     let name = path
@@ -675,7 +671,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "保存先にファイル名がありません",
+                crate::t!("config.no_file_name"),
             )
         })?
         .to_string_lossy();
@@ -785,7 +781,7 @@ impl std::fmt::Display for Revision {
 impl TryFrom<String> for Revision {
     type Error = String;
     fn try_from(text: String) -> Result<Self, Self::Error> {
-        Self::parse(&text).ok_or_else(|| format!("設定の版として解釈できません: {text}"))
+        Self::parse(&text).ok_or_else(|| crate::t!("config.revision_invalid", text = text))
     }
 }
 
@@ -846,7 +842,7 @@ fn read_raw(path: &Path) -> Result<Option<Vec<u8>>, String> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("読み込めません: {e}")),
+        Err(e) => Err(crate::t!("config.read_failed", error = e)),
     }
 }
 
@@ -856,7 +852,7 @@ fn interpret(bytes: Option<&[u8]>) -> Loaded {
         None => Loaded::Missing,
         Some(b) => match std::str::from_utf8(b) {
             Ok(text) => parse(text),
-            Err(_) => Loaded::Invalid("UTF-8 ではありません".into()),
+            Err(_) => Loaded::Invalid(crate::t!("config.not_utf8").into()),
         },
     }
 }
@@ -906,23 +902,22 @@ pub enum UpdateError {
 impl std::fmt::Display for UpdateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            UpdateError::Conflict { .. } => f.write_str(
-                "設定ファイルが他で変更されたため保存しませんでした。読み込み直してから操作してください",
-            ),
+            UpdateError::Conflict { .. } => f.write_str(crate::t!("config.conflict")),
             // TOML パーサーの説明には設定ファイルの該当行の抜粋が続くため、先頭行だけを使い、
             // 設定ファイルの内容を出力へ写さない（cli::one_line と同じ扱い）。
             UpdateError::Broken { path, reason } => write!(
                 f,
-                "設定ファイルが壊れているため変更しません（{}）: {}",
-                path.display(),
-                reason.lines().next().unwrap_or("").trim()
+                "{}",
+                crate::t!(
+                    "config.broken",
+                    path = path.display(),
+                    reason = reason.lines().next().unwrap_or("").trim()
+                )
             ),
             UpdateError::Rejected(m) | UpdateError::Invalid(m) | UpdateError::Io(m) => {
                 f.write_str(m)
             }
-            UpdateError::Busy => f.write_str(
-                "別の設定変更が実行中です。しばらくしてから再実行してください",
-            ),
+            UpdateError::Busy => f.write_str(crate::t!("config.busy")),
         }
     }
 }
@@ -951,7 +946,8 @@ pub struct Updated<T> {
 /// 設定ロックを取る。戻り値の接続を drop するとロックが外れる（トランザクションは書き込まずに破棄）。
 /// 状態フォルダーが無ければ作る。
 fn acquire_config_lock(store: &Store) -> Result<rusqlite::Connection, UpdateError> {
-    let io = |e: &dyn std::fmt::Display| UpdateError::Io(format!("設定ロックを取れません: {e}"));
+    let io =
+        |e: &dyn std::fmt::Display| UpdateError::Io(crate::t!("config.lock_failed", error = e));
     fs::create_dir_all(&store.state_dir).map_err(|e| io(&e))?;
     let conn = rusqlite::Connection::open(store.lock_path()).map_err(|e| io(&e))?;
     conn.busy_timeout(LOCK_WAIT).map_err(|e| io(&e))?;
@@ -1025,16 +1021,16 @@ pub fn update_in<T>(
         });
     }
     // ④ 直前の版の退避。退避に失敗したら保存しない（復元できない変更を作らない）。
-    let backup =
-        match &bytes {
-            Some(b) => Some(backup_history(store, &previous, b).map_err(|e| {
-                UpdateError::Io(format!("設定の変更履歴を保存できませんでした: {e}"))
-            })?),
-            None => None,
-        };
+    let backup = match &bytes {
+        Some(b) => Some(
+            backup_history(store, &previous, b)
+                .map_err(|e| UpdateError::Io(crate::t!("config.history_save_failed", error = e)))?,
+        ),
+        None => None,
+    };
     // ⑤ アトミック保存。
     let written = write_config(&store.config_file, &config)
-        .map_err(|e| UpdateError::Io(format!("設定を保存できませんでした: {e}")))?;
+        .map_err(|e| UpdateError::Io(crate::t!("config.save_failed", error = e)))?;
     drop(lock);
     // 保存した内容の schema は正規化されているので、返す設定も合わせる。
     config.schema = config.required_schema();
@@ -1188,7 +1184,7 @@ pub fn history_in(store: &Store) -> io::Result<Vec<HistoryEntry>> {
 /// 解釈結果が Invalid でも返す（画面は内容と理由を表示できる。復元は Ok のときだけ許す）。
 pub fn history_read_in(store: &Store, id: &str) -> Result<(Vec<u8>, Loaded), String> {
     if !is_history_id(id) {
-        return Err(format!("変更履歴の id が不正です: {id}"));
+        return Err(crate::t!("config.history_id_invalid", id = id));
     }
     let path = store.history_dir().join(id);
     match read_raw(&path)? {
@@ -1196,7 +1192,7 @@ pub fn history_read_in(store: &Store, id: &str) -> Result<(Vec<u8>, Loaded), Str
             let loaded = interpret(Some(&bytes));
             Ok((bytes, loaded))
         }
-        None => Err(format!("変更履歴が見つかりません: {id}")),
+        None => Err(crate::t!("config.history_not_found", id = id)),
     }
 }
 

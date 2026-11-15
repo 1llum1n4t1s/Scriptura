@@ -1,24 +1,24 @@
 {% extends "ui/base.html" %}
 {% block content %}
-<a class="back" href="/history">← 変更履歴</a>
-<div class="heading"><h1>変更履歴 <code>{{ id }}</code></h1></div>
+<a class="back" href="/history">← {{ crate::locale::tr("ui.history.back") }}</a>
+<div class="heading"><h1>{{ crate::locale::tr("ui.history.entry") }} <code>{{ id }}</code></h1></div>
 <section class="panel">
   <p>{{ state }}</p>
   {% if restorable %}
   <form method="post" action="/history/restore">
     <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="id" value="{{ id }}">
-    <button class="primary" type="submit">この版へ復元する</button>
-    <span class="note">復元前の内容も変更履歴に残ります。コメントや書式は戻らず、整形し直した内容で保存します。</span>
+    <button class="primary" type="submit">{{ crate::locale::tr("ui.history.restore") }}</button>
+    <span class="note">{{ crate::locale::tr("ui.history.restore_note") }}</span>
   </form>
   {% endif %}
 </section>
 <section class="panel">
-  <h2>現在の設定との差分（- 現在 / + この版）</h2>
+  <h2>{{ crate::locale::tr("ui.history.diff") }}</h2>
   <pre class="diff">{% for l in diff %}<span class="{{ l.class }}">{{ l.text }}</span>
 {% endfor %}</pre>
 </section>
 <section class="panel">
-  <h2>内容</h2>
+  <h2>{{ crate::locale::tr("ui.history.content") }}</h2>
   <pre class="diff">{{ content }}</pre>
 </section>
 {% endblock %}

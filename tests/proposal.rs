@@ -713,7 +713,7 @@ fn custom_kind_reaches_the_patch_and_the_meta_records_kinds_and_templates() {
         record["prompt"]
             .as_str()
             .unwrap()
-            .contains("<<<テンプレート>>>\n# 概要")
+            .contains("<<<TEMPLATE>>>\n# 概要")
     );
     // メタ: schema は 1 のまま、kinds と templates（id と SHA-256。本文は無い）が増える。
     let meta = f.meta(&sha);
