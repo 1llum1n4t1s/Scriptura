@@ -314,10 +314,10 @@ echo 'applied 9.0.1'
 
 # ───────────── E. 解除 ─────────────
 step 'E. uninstall-setup'
-plan="$(timeout 60 "$app" uninstall-setup </dev/null)" || fail 'uninstall-setup (plan) failed'
+plan="$(timeout 60 "$app" uninstall-setup --json </dev/null)" || fail 'uninstall-setup (plan) failed'
 [[ "$(json_status "$plan")" = planned && -f "$autostart" && -f "$registration" ]] || fail 'the plan must not change anything'
 assert_stop_hooks present
-removed="$(timeout 60 "$app" uninstall-setup --apply </dev/null)" || fail 'uninstall-setup --apply failed'
+removed="$(timeout 60 "$app" uninstall-setup --apply --json </dev/null)" || fail 'uninstall-setup --apply failed'
 echo "$removed"
 [[ "$(json_status "$removed")" = removed ]] || fail 'uninstall-setup did not report removed'
 [[ ! -e "$autostart" ]] || fail 'the autostart entry was not removed'
