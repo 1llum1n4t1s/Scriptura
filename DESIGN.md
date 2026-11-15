@@ -1,6 +1,50 @@
 # Scriptura 設計メモ
 
-この文書は設計判断の記録です。利用者向けの説明は `README.md`、開発規約は `AGENTS.md` を参照してください。
+この文書は設計判断の記録です。利用者向けの説明は `README.md`、開発規約（契約・検証コマンド・テストの対応）は `AGENTS.md` を参照してください。
+
+## 目的
+
+利用者が登録した自分のリポジトリへの push 後に、`AGENTS.md` / `DESIGN.md` / `README.md`（オプトインで `CHANGELOG.md` と利用者定義のカスタム種類）を AI（Claude Code の worker）で保守する単独アプリ。他人に配る製品として、既定は安全側（オプトイン・`propose`）に倒す。Codex・`~/.codex` には依存しない。
+
+## 主要コンポーネントと責務
+
+| 部品 | 責務 |
+|---|---|
+| `config` / `kinds` / `timing` | 利用者設定の読み書き・検証・判定（`resolve` は I/O を持たない純粋関数）、文書の種類の解決と許可パス、種類ごとのタイミング |
+| `maintenance` | 保守の本体。push 検知、状態 DB、publications、worker の起動、commit と push |
+| `proposal` | `propose` モード。使い捨てクローンで worker を動かし、更新案（パッチ）を保存・確認・適用・破棄する |
+| `changelog` | CHANGELOG 固有の処理（リリース済みエントリ不変の検査、資料の収集、`promote`） |
+| `ops` | 設定を変える操作と読み取り操作の本体。CLI と管理画面が共有する |
+| `cli` / `ui` | 利用者の入口。`cli` は薄い引数層、`ui` は `127.0.0.1` 限定の SSR 管理画面（feature `ui`） |
+| `connect` / `app_update` | Claude Code の Stop hook の登録・解除と、Setup（Velopack）版の導入・自動更新 |
+| `locale` | 9 言語の辞書と言語判定 |
+
+## データフロー
+
+1. Claude Code の Stop hook が `scriptura hook` を呼ぶ。
+2. 利用者の設定ファイルと同意を `config::resolve` で判定する。未登録・同意なし・壊れた設定は何もしない。
+3. push の範囲を検知し、種類ごとの期限（`timing::due_kinds`）で処理する文書を絞る。期限前だけなら worker を起動せず、処理済み位置だけを進める。
+4. 未信頼の資料（コミット件名など）を枠に入れたプロンプトで worker を起動する。権限は `restricted`（許可規則と事後検査）または `bypass`。
+5. Rust が保守後検査（対象外変更・サイズ上限・必須見出し・CHANGELOG のリリース済み節の不変）を行う。違反は commit せず（`push`）、または更新案を `Rejected` にする（`propose`）。
+6. `push` モードは commit と push、`propose` モードは更新案の保存まで行い、利用者が `review` / `apply` で適用する。
+
+管理画面と CLI はいずれも `ops` を通して設定を書き換え、保守エンジンの内部は直接動かさない。
+
+## 重要な不変条件
+
+- 設定・テンプレートは利用者側のファイルだけから読む。リポジトリ内のファイルからは有効化しない（clone しただけで動き出さない）。
+- 設定の書き込みは `config::update_in`（ロック・版照合・履歴の退避・アトミック保存）だけを通す。
+- 検査は権限モードに関係なく Rust が行い、worker に任せない。commit・push の結果が不確実なときは再実行しない。
+- 秘密値を保存・ログ・出力に書かない。worker へ渡す環境変数はホスト由来の中継設定を除く。
+- 状態 DB の版（`STATE_SCHEMA_VERSION`）は 1 のまま。新しい状態は `CREATE TABLE IF NOT EXISTS` の追加で持つ（版を上げると旧版が何もしなくなる）。
+- Velopack 管理外のビルド（開発・プラグイン同梱・単独 `install`）では更新・登録の処理で状態フォルダーへ触れない。
+
+## 設計判断
+
+- **`propose` を既定にする**: 作業ツリー・`.git`・remote を変えずに更新案だけを作れるため、他人に配る製品の既定として安全。`push` は `enable --mode push` を明示したときだけ。
+- **hook の経路で tokio を使わない**: hook・CLI は同期の Rust だけで動かす。tokio は管理画面 `ui::run` の中だけで初期化し、feature `ui` を外したビルドでは axum・askama・tokio をリンクしない。
+- **Setup 版は多プロセス型で、適用をログオン時だけにする**: Velopack の Windows の適用が導入先の他プロセスを強制終了するため、日中に適用しない。確認・取得は hook の後に同期で 1 回、適用前に署名者を検証する。
+- **プラグインのスキルは CLI を呼ぶ薄い層にする**: 判断・検証・書き込みを `scriptura <cmd> --json` に集め、スキルは同意の確認と要約だけにする。
 
 ## ローカライズ
 
