@@ -17,6 +17,8 @@ Scriptura は、利用者が登録した自分のリポジトリへの push 後�
 - `src/doctor.rs` … `doctor` の診断項目（環境・認証・設定・hook の二重登録・`kinds` 項目・`--verify` の同梱物照合）。
 - `src/connect.rs` … Claude Code の `settings.json` への Stop hook の登録（`--apply`）と解除（`--remove`）。
 - `src/app.rs` / `src/paths.rs` / `src/process.rs` … 導入（`install`）、保存場所の決定、子プロセスの期限管理。
+- `src/app_update.rs` と `src/app_update/` … Setup（Velopack）版の起動処理・確認と取得・ログオン時の適用（`update-apply`）・登録（`registration.rs`）・ログオンエントリ（`logon.rs`）・導入先のプロセス検出（`processes.rs`）・署名者検証（`trust.rs`）。
+- `src/locale.rs` と `src/locales/` … 表示言語の判定と 9 言語の辞書（下のローカライズの節）。`src/ui/locale.rs` … 管理画面の言語（Cookie・Accept-Language・選択欄）。
 - `plugins/scriptura/` と `.claude-plugin/` … Claude Code プラグイン（hook とスキル）。`xtask/` … プラグイン配布物の梱包（本体の同梱・`SHA256SUMS`・zip）。
 
 ## 契約
@@ -31,7 +33,7 @@ Scriptura は、利用者が登録した自分のリポジトリへの push 後�
 - CLI の出力（JSON・人が読む形式・doctor）に秘密値を入れない。パス・設定の要約・件数・定型の語だけにする（例外: `docs show` は利用者本人が設定した `guidance` / `instructions` の本文を返す。設定ファイルにある利用者自身の文で、秘密値の置き場ではない）。`claude auth status` は worker と同じ環境変数除去（`maintenance::scrub_host_env`）をかけて実行し、終了コードと `authMethod` だけを見る。
 - 保守の契約（Git の安全確認、状態 DB・publications の整合、commit と push の不確実時に再実行しないこと、worker の起動制御）は `src/maintenance.rs` のテスト（`tests/maintenance.rs`）が正本。propose の契約は `tests/proposal.rs`、設定は `tests/config.rs`、種類の設定・検証・許可パスは `tests/kinds.rs`、タイミングは `tests/timing.rs`、CHANGELOG（不変検査・資料・promote・遡り）は `tests/changelog.rs`、設定を変える操作（版照合・履歴・復元）は `tests/ops.rs`、管理画面（保護・二段階確認・エスケープ）は `tests/ui.rs`、CLI は `tests/cli.rs`、プラグイン骨組みは `tests/plugin_layout.rs`。`tests/compat_golden.rs` は従来 3 種のみの構成で worker へ渡すプロンプトと起動引数を golden（`tests/golden/`。バイト単位で比べるので `.gitattributes` で改行変換しない）で固定し、種類の機能を足しても従来構成が 1 バイトも変わらないことを守る。契約を変える場合は先にテストを更新する。
 - 状態と導入先は `src/paths.rs` が決める（`SCRIPTURA_CONFIG` / `SCRIPTURA_HOME` → OS 標準）。Codex や Claude Code のホームに書き込まない。テストは必ず `SCRIPTURA_DB` / `SCRIPTURA_CONFIG` か `SCRIPTURA_HOME`（CLI テストは加えて `CLAUDE_CONFIG_DIR` / `LOCALAPPDATA`）で隔離し、実環境の設定・状態フォルダーを読み書きしない。fixture の置き場は `SCRIPTURA_TEST_BASE` で変えられる。
-- Claude Code の `settings.json` を書き換えるのは `connect claude-code --apply`（登録）と `connect claude-code --remove --apply`（解除）だけ。既存の別設定を壊さず、壊れた JSON は書き換えず、最初の変更前に退避する。`--remove` は Scriptura の項目だけを消し、`agents-maintenance` には触れない。
+- Claude Code の `settings.json` を書き換えるのは `connect claude-code --apply`（登録）と `connect claude-code --remove --apply`（解除）と、Setup 版の自動登録・解除（`connect::register_for_setup` / `refresh_for_setup` / `unregister_for_setup`。下の Setup の節）だけ。既存の別設定を壊さず、壊れた JSON は書き換えず、最初の変更前に退避する。`--remove` は Scriptura の項目だけを消し、`agents-maintenance` には触れない。
 - 秘密値（API キー・トークン・認証情報）を保存・ログ・コミットに書かない。worker に渡す環境変数はホスト由来の中継設定を除去する（`maintenance::scrub_host_env`）。
 - worker の事後検査（作業ツリーの対象外変更の検出）: propose はクローン全体（無視ファイルを含む）を厳格に比べる。push モードは利用者の実作業ツリーで動くため、全体比較は `restricted` のときだけ行い、無視ファイルは比較から外す（利用者・ビルドの並行変更を違反扱いしない）。`bypass` は従来どおり commit 対象文書のハッシュ検査だけ。`restricted` の許可規則に `git diff` 系は入れない（出力先指定で作業ツリー外へ書けるため）。機密パターン（exclude）は `restricted` の Read/Edit 拒否規則としてだけ効き、`bypass` には適用されない。
 - プラグインのスキルの `allowed-tools` は、そのスキルが使うサブコマンドだけを `Bash(scriptura <sub> *)` の形で事前承認する（`tests/plugin_layout.rs` が検証）。ランチャー `plugins/scriptura/bin/scriptura` は Git Bash（`MINGW*` / `MSYS*` / `CYGWIN*`）では同じディレクトリの `scriptura.exe` へ渡す。
@@ -43,12 +45,37 @@ Scriptura は、利用者が登録した自分のリポジトリへの push 後�
 - 設定履歴の復元（`ops::restore`）は、push モードの登録が増える・push に変わる版を拒否し（`enable --mode push` の remote・upstream 確認を迂回させない）、登録が増える場合は保存前に `maintenance::baseline` で起点を記録する。カスタム種類の id `new` は予約語（管理画面の `/kinds/new` と衝突するため）。
 - リモートリポジトリの作成・push・リリースは、明示の依頼があるまで行わない。
 
+## Setup installer (Velopack)
+
+一般の利用者向けの配布は Velopack の Setup（ユーザー単位・管理者不要・Certum 署名、R2 から自動更新・既定 ON）。共通仕様は `D:\Dev\APP-DISTRIBUTION.md`、参考実装は Remnifold の `native/src/app_update.rs`。プラグイン方式と単独 `install` は残す（どちらを正とするかは本人判断）。
+
+- 恒久の契約（初回配信後に変えない）: packId `ScripturaApp`（`Scriptura` は `%LOCALAPPDATA%\Scriptura` の設定・状態と衝突する）、フィード `https://scriptura-updates.kagayoi.com`（バケット直下、`releases.<channel>.json`）、Velopack CLI 1.2.161 と crate `velopack = "=1.2.161"`（`default-features = false`。HTTP は内蔵の ureq で tokio を引き込まない）、主実行ファイル名 `scriptura(.exe)`。
+- **多プロセス型**: Velopack の Windows の適用は導入先の他プロセスを強制終了するため、日中に適用しない。`main()` の最初（`cli::is_command` より前）で `app_update::startup()` が自動適用を切り、install / updated / uninstall などのフック引数を処理して必ず終了コード 0 で終える。
+- 確認・取得は `hook` の本処理（`maintenance::run()`）の後に同期で 1 回（`app_update::after_hook`。スレッドにしない）。条件は Velopack 管理下・`SCRIPTURA_WORKER` != 1・`auto_update` ON・成功／失敗時刻とも 24 時間経過・`app-update.lock` の try-lock。stdout へは何も書かない（診断は `app-update.log`）。ログオン時の `update-apply` も同じ条件で確認・取得し、失敗しても取得済みの分の適用は続ける。手動の `update --check` は間引きを無視する（取得まで）。
+- 適用はログオン時の `update-apply` だけ: 登録確認 → `auto_update` → 確認・取得 → 保留の有無 → 導入先の他プロセス（あれば `busy`、強制終了しない）→ 署名者検証（Windows はパッケージ内の全 PE が CN `Open Source Developer Yuichiro Shinozaki` の有効な Authenticode で主実行ファイルと updater が 1 つずつ、macOS は codesign + spctl、Linux は置き場の所有者・権限と AppImage 1 つ。不一致は `untrusted` で終了コード 2）→ 再起動なしで適用。
+- ログオンエントリ: Windows HKCU Run `<packId> Update`、macOS LaunchAgent `com.kagayoi.<packId>.update`（`AbandonProcessGroup`）、Linux `$XDG_CONFIG_HOME/autostart/com.kagayoi.<packId>.update.desktop`（`X-Scriptura-Executable=` で所有判定）。packId は manifest から取る（定数を直書きしない。E2E のテスト用 packId で本番名を書かないため）。同名で別の導入先を指すものは上書き・削除しない。
+- settings.json への登録（`app_update/registration.rs` と `connect` の Setup 用関数）: **Scriptura 自身の hook だけ**を置き換え、`agents-maintenance` は置き換えない（案内だけ）。既に自分を指す hook はその位置のまま。**プラグインが有効**（`enabledPlugins` の `scriptura@*` が true）なら登録せず `plugin` を記録し、引数なしの起動・ログオン時に再確認する。さらに、プラグインが有効で settings.json に Scriptura 自身の Stop hook（旧単独導入・Setup 版自身。`is_scriptura_hook_with` で判定）が残っていれば、状態（`registered` / `plugin` / 更新後）にかかわらず `register_for_setup` / `refresh_for_setup` のプラグイン分岐がそれだけを外す（プラグイン自身の hook は settings.json に無く、`agents-maintenance`・他ツールの hook は残す。書き換えは他の登録と同じく退避つき・hook が無ければ書かない）。`registered` でパスと版が同じなら、プラグインが無効のあいだは何もしない（利用者の `--remove` を戻さない）。更新後は自分の hook があるときだけ定義を直す。アンインストールは完全パス一致の hook だけ外す。`is_scriptura_hook` はファイル名 `scriptura(.exe)` に加え `scriptura*.appimage` と、Setup 版の完全パス一致を Scriptura とみなす。
+- 状態はすべて `paths::state_dir()` 配下（`app-update.json` / `.lock` / `.log`、`setup-registration.json` / `.lock`）。Velopack の `current\` には置かない。単独 `install` の記録は `install.json`、以前の `<app_dir>/current.json` は status の読み取りフォールバックだけ（書かない・消さない）。status の既存キーは改名せず `setup` を足す。
+- **管理外のビルド（開発・プラグイン同梱・単独 install）では何もしない**。公開関数は Velopack 管理下と分かる前に状態フォルダーへ触れない（`tests/cli.rs` の `setup_features_do_nothing_in_a_non_velopack_build` と `app_update` の単体テストが正本）。
+- `update-feed-test` feature（本番ビルドに入れない）だけが `SCRIPTURA_UPDATE_FEED_DIR` と `SCRIPTURA_UPDATE_ALLOW_UNSIGNED=1` を読む。
+- 検証で本物の導入・`~/.claude/settings.json`・HKCU Run・Claude Code の登録に触れない。テスト用 packId（例 `ScripturaVelopackTest`）、外部の作業フォルダーへの `--installto`、プロセス単位の `SCRIPTURA_HOME`・`CLAUDE_CONFIG_DIR`・`TEMP`/`TMP` で隔離し、終わったらテスト用の Run 値・アンインストール情報・導入先を外す。レジストリの単体テストは専用のハイブ（`RegLoadAppKeyW`）を使う。macOS・Linux の cfg コードは Windows 上では未コンパイル（実機・CI で確かめる）。
+
+## ローカライズ（9 言語）
+
+- 共通仕様は `D:DevAPP-DISTRIBUTION.md` の 8 節。対応言語は ja・en・zh-CN・zh-TW・ko・es・fr・de・pt-BR。実装は `src/locale.rs`（言語判定・辞書・`t!` マクロ）と `src/locales/<タグ>.json`（`include_str!`）、管理画面の判定は `src/ui/locale.rs`（Cookie `scriptura-language-<port>` → `Accept-Language` → 英語。`POST /language` は他の POST と同じく `guard` を通る）。
+- 人が読む文言（CLI の出力・ヘルプ・エラー・hook の `systemMessage`・Setup 版の案内・管理画面）は辞書のキー（`t!("cli.xxx")`、テンプレートは `crate::locale::tr("...")`）で参照し、直書きしない。**人が読む文言を足したら、9 言語の辞書（`src/locales/*.json`）と整合テスト（`tests/localization.rs`）を更新する**。キーは文字列リテラルで書く（テストがソースを走査する）。プレースホルダーは `{name}` で全言語同じ集合にする。
+- AI が読む文言（worker へのプロンプト・`kinds::settings_frame`・`changelog::prompt_parts`・プラグインの SKILL.md）は**英語に固定**し、辞書に入れない。生成する文書の言語設定（`language`）は文書の言語で、画面の言語とは別（挙動を変えない。`language` が無いとき既存文書の言語に従い、新規作成は日本語）。
+- 分岐に文言を使わない（実行結果が未確定で止めた印は `outcome_unknown_error`、worker のタイムアウトは `WorkerFailure.timed_out`）。旧版が状態 DB に残した日本語の文言との互換だけ `contains` を残している。
+- テストの言語: `.cargo/config.toml` が `SCRIPTURA_LANGUAGE=ja` を渡す（既存テストの期待は日本語）。管理画面のテストは `Accept-Language: ja` を付ける。言語判定そのものは `tests/localization.rs`。
+- **README を変えたら全言語版（`README.md` が英語の正本、`README.ja.md`・`README.zh-CN.md`・`README.zh-TW.md`・`README.ko.md`・`README.es.md`・`README.fr.md`・`README.de.md`・`README.pt-BR.md`）を同時に直す**。先頭の 9 言語の切替行は全ファイルで同じ（自分の言語だけ太字）。AGENTS.md・DESIGN.md・CHANGELOG.md は訳さない。
+
 ## 検証
 
 ```powershell
 cargo test --locked --features test-support -- --test-threads=1
 cargo build --release
 cargo build --release --no-default-features
+cargo build --release --features update-feed-test   # Setup 版の隔離 E2E 用（配布しない）
 git diff --check
 ```
 

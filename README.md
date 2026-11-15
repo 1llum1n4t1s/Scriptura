@@ -1,73 +1,95 @@
+[日本語](README.ja.md) | **English** | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [한국어](README.ko.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [Português (Brasil)](README.pt-BR.md)
+
 # Scriptura
 
-自分のリポジトリへ push したあとに、`AGENTS.md` / `DESIGN.md` / `README.md`（と、オプトインで `CHANGELOG.md` や利用者が定義したカスタムの文書）をバックグラウンドで保守するツールです。Claude Code の Stop hook から起動し、保守の worker には Claude Code CLI（既定は `claude -p --model claude-sonnet-5-5 --effort high`）を使います。Codex には依存しません。
+Scriptura maintains `AGENTS.md` / `DESIGN.md` / `README.md` (and, as opt-ins, `CHANGELOG.md` and user-defined custom documents) in the background after you push to your own repositories. It is launched from a Claude Code Stop hook, and its maintenance worker is the Claude Code CLI (by default `claude -p --model claude-sonnet-5-5 --effort high`). It does not depend on Codex.
 
-- **既定は安全側**です。有効化は利用者本人の明示的な同意とリポジトリ登録が必要で、既定のモードは文書の「更新案（パッチ）」を作るだけの `propose` です。作業ツリー・`.git`・remote は変えません。
-- 文書を自動で commit・push する `push` モードは、`--mode push` を明示したときだけ使えます。
-- 設定は利用者のホーム配下の 1 ファイル（`config.toml`）と、同じフォルダーの `templates/` だけから読みます。リポジトリ内のファイルからの有効化・設定は読みません（他人のリポジトリを clone しただけで自動動作が始まる経路を作らないため）。
-- 設定は `scriptura ui`（ブラウザーの管理画面）でも編集できます（後述）。
+- **Safe by default.** Enabling it requires your explicit consent and repository registration, and the default mode is `propose`, which only produces a document update proposal (a patch). It does not change your working tree, `.git`, or remotes.
+- The `push` mode, which commits and pushes documents automatically, is available only when you pass `--mode push` explicitly.
+- Settings are read only from a single file under the user's home directory (`config.toml`) and the `templates/` folder next to it. Enabling or configuring through files inside a repository is never read (so that merely cloning someone else's repository can never start automatic behavior).
+- Settings can also be edited in `scriptura ui` (the browser-based admin UI, described below).
 
-以前の `agents-maintenance`（CodexHooks）から文書保守の部分だけを独立させたもので、保守の判断・状態管理・公開（commit と push）の契約は同じです。
+This is the document-maintenance part of the former `agents-maintenance` (CodexHooks), split out as a standalone tool. The contracts for maintenance decisions, state management, and publishing (commit and push) are the same.
 
-## 導入
+## Installation
 
-### プラグイン方式（推奨）
+### Plugin (recommended)
 
-Claude Code のプラグインとして入れると、Stop hook と操作用のスキル（`/scriptura:setup` など）が一緒に入ります。`scriptura` の本体はプラグインに同梱されます（Windows は `bin/scriptura.exe`、macOS / Linux は `bin/scriptura` ランチャーが `libexec/` の本体を選びます。Windows でも hook が Git Bash の sh を経由する場合は、同じランチャーが `bin/scriptura.exe` へ渡します）。配布物の作り方は `xtask/`（`cargo run --manifest-path xtask/Cargo.toml --locked -- package`）を参照してください。
+Installing it as a Claude Code plugin brings in the Stop hook and the operation skills (such as `/scriptura:setup`) together. The `scriptura` binary is bundled with the plugin (on Windows it is `bin/scriptura.exe`; on macOS / Linux the `bin/scriptura` launcher selects the binary under `libexec/`. Even on Windows, when the hook goes through Git Bash's sh, the same launcher hands off to `bin/scriptura.exe`). See `xtask/` (`cargo run --manifest-path xtask/Cargo.toml --locked -- package`) for how the distribution is built.
 
-### 単独の `install` / `connect`
+### Setup edition (auto-update)
+
+Running `ScripturaApp-win-Setup.exe` (Windows; `.pkg` on macOS, AppImage on Linux) installs it per user without administrator rights (on Windows the install location is `%LOCALAPPDATA%\ScripturaApp\current\scriptura.exe`). Updates are served from `https://scriptura-updates.kagayoi.com` (Velopack feeds named `releases.<channel>.json`, with channels `win` / `osx` / `linux-x64` / `linux-arm64`), and the Windows distribution is signed with a Certum certificate.
+
+- **Registration is automatic**: at install time (the install hook on Windows; the first launch without arguments after installation on macOS and Linux), the Stop hook in Claude Code's `settings.json` is pointed at the Setup edition's executable. Only Scriptura's own hooks are replaced (a hook pointing at the old standalone install `%LOCALAPPDATA%\Programs\Scriptura\bin\scriptura.exe` is replaced with the Setup edition's, and the old files are not deleted). Existing `agents-maintenance` hooks are not replaced; `status` / `doctor` / a launch without arguments point you to `scriptura connect claude-code --apply`.
+- **Avoiding duplication with the plugin**: if `scriptura@*` is enabled in `enabledPlugins` of `settings.json`, the Setup edition does not register in `settings.json` (maintenance would otherwise run twice). Choose either to keep using the plugin, or to disable the plugin and switch to the Setup edition. After you disable it, registration happens automatically on a launch without arguments or at the next logon.
+- **Auto-update (on by default)**: after a hook's maintenance finishes, it checks for a new version at most once a day (throttled to 24 hours for both successes and failures) and only downloads it. **It is applied only at logon**: `scriptura update-apply`, which runs at logon (on Windows the HKCU Run value `<packId> Update`; on macOS the LaunchAgent `com.kagayoi.<packId>.update`; on Linux the XDG autostart entry `com.kagayoi.<packId>.update.desktop`), verifies that no Scriptura hook or admin UI is running and checks the signer, then applies the update without a restart. If anything is running, it does nothing and leaves the update for the next logon (so a hook in the middle of maintenance is never killed).
+- State lives in the state folder (described below): `app-update.json` (`auto_update` and the last check / failure times), `app-update.log` (for diagnostics), and `setup-registration.json` (the registration result).
+
+```powershell
+scriptura update                 # show the auto-update setting, the last check, and the downloaded version
+scriptura update --check         # ignore throttling and check/download now (applied at the next logon, or by running update-apply manually)
+scriptura update --auto off      # turn auto-update off (on turns it back on)
+scriptura update-apply           # apply a downloaded update (normally runs automatically at logon)
+scriptura uninstall-setup        # preview removing the Setup edition's registration (Stop hook and logon apply)
+scriptura uninstall-setup --apply
+```
+
+macOS and Linux have no uninstaller, so run `scriptura uninstall-setup --apply` before moving the `.app` to the Trash (or deleting the AppImage). On Windows, uninstalling from "Settings > Apps" performs the same removal automatically. In both cases only the hook that points at itself (exact full-path match) and the logon registration are removed; `config.toml` and the state folder are kept.
+
+### Standalone `install` / `connect` (advanced)
 
 ```powershell
 Set-Location D:\Dev\Scriptura
 cargo build --release
-.\target\release\scriptura.exe install                       # 利用者ごとの導入先へ固定パスで置く
-& "$env:LOCALAPPDATA\Programs\Scriptura\bin\scriptura.exe" connect claude-code          # 登録内容のプレビュー
-& "$env:LOCALAPPDATA\Programs\Scriptura\bin\scriptura.exe" connect claude-code --apply  # settings.json へ登録
+.\target\release\scriptura.exe install                       # place it at a fixed per-user path
+& "$env:LOCALAPPDATA\Programs\Scriptura\bin\scriptura.exe" connect claude-code          # preview the registration
+& "$env:LOCALAPPDATA\Programs\Scriptura\bin\scriptura.exe" connect claude-code --apply  # register in settings.json
 ```
 
-`connect claude-code --apply` は Claude Code の `settings.json`（`CLAUDE_CONFIG_DIR` または `~/.claude`）の Stop hook に、導入先の固定パスを登録します。従来の `agents-maintenance` を呼ぶ hook と Scriptura の古い hook だけを hook 単位で置き換え（同じ項目に同居する別の hook は残し）、ほかの設定は保ちます。Scriptura の hook と見なすのは、コマンドが `<実行ファイル> hook` の形で実行ファイル名が `scriptura(.exe)` のものだけで、パスに scriptura を含むだけの別ツールは対象外です。最初の変更前に `settings.json.scriptura-backup` を作り、壊れた JSON は書き換えません。
+`connect claude-code --apply` registers the fixed install path in the Stop hook of Claude Code's `settings.json` (`CLAUDE_CONFIG_DIR` or `~/.claude`). It replaces, hook by hook, only the hooks that call the former `agents-maintenance` and old Scriptura hooks (other hooks sharing the same entry are kept), and leaves all other settings alone. A command counts as a Scriptura hook only when it has the form `<executable> hook` and the executable name is `scriptura(.exe)`; other tools that merely have scriptura in their path are not affected. Before the first change it creates `settings.json.scriptura-backup`, and it does not rewrite broken JSON.
 
-プラグインへ移るときは、二重に動かないよう単独登録を外します（Scriptura の項目だけを取り除き、`agents-maintenance` やほかの設定には触れません）。
+When moving to the plugin, remove the standalone registration so that maintenance does not run twice (this removes only Scriptura's entries and does not touch `agents-maintenance` or other settings).
 
 ```powershell
-scriptura connect claude-code --remove           # プレビュー
-scriptura connect claude-code --remove --apply   # 書き込み
+scriptura connect claude-code --remove           # preview
+scriptura connect claude-code --remove --apply   # write
 ```
 
-worker はデスクトップセッションの中継設定を引き継がないため、事前に単体 CLI で `claude auth login` を済ませてください。CLI は設定の `worker.claude_path`、なければ PATH 上の `claude`（Windows は `claude.exe`）、さらに Windows では Claude デスクトップ同梱の `%LOCALAPPDATA%\Claude-Data\claude_*\claude-code\<版>\<ハッシュ>\claude.exe` の最新を使います。
+The worker does not inherit the desktop session's relay settings, so run `claude auth login` in the standalone CLI beforehand. The CLI used is the `worker.claude_path` setting, otherwise `claude` on PATH (`claude.exe` on Windows), and on Windows additionally the newest `%LOCALAPPDATA%\Claude-Data\claude_*\claude-code\<version>\<hash>\claude.exe` bundled with the Claude desktop app.
 
-## 初回セットアップ
+## First-time setup
 
-保守したいリポジトリで次のどちらかを行います。
+In the repository you want maintained, do one of the following.
 
-- プラグインを入れている場合: Claude Code で `/scriptura:setup`（同意の確認のあと `scriptura enable` を実行します）。
-- コマンドで直接:
+- If you have installed the plugin: run `/scriptura:setup` in Claude Code (after confirming consent, it runs `scriptura enable`).
+- Directly from the command line:
 
 ```powershell
 scriptura enable --repo D:\Dev\MyRepo --accept-consent 1
 ```
 
-`--accept-consent` は同意文書の現行の版（現在は `1`）です。省略したり版が違うと、送信データと費用の説明を出して拒否します。`enable` は登録の前に「現在の push 状態」を処理済みとして記録するので、有効化より前の push は後から処理されません。
+`--accept-consent` is the current version of the consent document (currently `1`). If it is omitted or the version is wrong, the command prints an explanation of the data sent and the costs, and refuses. Before registering, `enable` records the "current push state" as already processed, so pushes made before enabling are never processed afterwards.
 
-## モード
+## Modes
 
-| モード | 動作 |
+| Mode | Behavior |
 | --- | --- |
-| `propose`（既定） | push のたびに worker が使い捨てクローンで文書を更新し、差分を**パッチとして保存**する。作業ツリー・`.git`・remote は変えない。`review` で確認し、`apply` で作業ツリーへ適用する（stage はしない）。 |
-| `push` | worker が文書を更新し、commit と push まで自動で行う。`--mode push` を明示したときだけ。remote と upstream が必要で、`--branches` 省略時は現在のブランチだけが対象。 |
-| `off` | 何もしない（登録は残る）。 |
+| `propose` (default) | On every push, the worker updates documents in a throwaway clone and **saves the diff as a patch**. The working tree, `.git`, and remotes are not changed. Check it with `review` and apply it to the working tree with `apply` (nothing is staged). |
+| `push` | The worker updates the documents and automatically commits and pushes. Only when `--mode push` is given explicitly. A remote and an upstream are required, and when `--branches` is omitted only the current branch is targeted. |
+| `off` | Does nothing (the registration remains). |
 
-## 設定ファイル
+## Configuration file
 
-| OS | 場所 |
+| OS | Location |
 | --- | --- |
 | Windows | `%LOCALAPPDATA%\Scriptura\config.toml` |
 | macOS | `~/Library/Application Support/Scriptura/config.toml` |
-| Linux | `$XDG_CONFIG_HOME/scriptura/config.toml`（既定 `~/.config/scriptura/config.toml`） |
+| Linux | `$XDG_CONFIG_HOME/scriptura/config.toml` (default `~/.config/scriptura/config.toml`) |
 
-`SCRIPTURA_CONFIG`（絶対パスのファイル）または `SCRIPTURA_HOME`（`<SCRIPTURA_HOME>/config.toml`）で上書きできます。通常は `enable` / `disable` / `pause` / `resume` と管理画面が書き換えるので、手で編集する必要はありません。壊れた設定・未知のキー・新しすぎる `schema` は「何もしない」に倒れ、`enable` なども書き換えずに失敗します。
+You can override it with `SCRIPTURA_CONFIG` (an absolute file path) or `SCRIPTURA_HOME` (`<SCRIPTURA_HOME>/config.toml`). It is normally rewritten by `enable` / `disable` / `pause` / `resume` and the admin UI, so you do not need to edit it by hand. A broken config, unknown keys, or a `schema` that is too new fall back to "do nothing", and commands such as `enable` fail without rewriting it.
 
-`schema` は 1 と 2 を読めます。保存は「必要な最小の版」で行い、文書の種類ごとの設定（`[kinds.*]`）・`[defaults] instructions`・`CHANGELOG.md` かカスタム種類を対象に挙げた設定・管理画面での同意を使っていなければ `schema = 1` のまま書きます（旧版の Scriptura でも読めます）。使うと `schema = 2` になり、旧版はそれを読むと「何もしない」に倒れます。
+`schema` can be 1 or 2. Saving uses "the minimum required version": the file stays at `schema = 1` unless you use per-kind settings (`[kinds.*]`), `[defaults] instructions`, a configuration that lists `CHANGELOG.md` or a custom kind as a target, or consent given in the admin UI (so older Scriptura versions can still read it). Using any of these makes it `schema = 2`, and older versions that read it fall back to "do nothing".
 
 ```toml
 schema = 1
@@ -80,117 +102,117 @@ source = "cli"
 [defaults]
 mode = "propose"                                # propose / push / off
 documents = ["AGENTS.md", "DESIGN.md", "README.md"]
-exclude = ["private/**"]                        # 既定の機密パターンに「加算」される（`)`・空白・制御文字を含むパターンは不可）
+exclude = ["private/**"]                        # ADDED to the default sensitive patterns (patterns containing `)`, whitespace, or control characters are not allowed)
 
 [worker]
 model = "claude-sonnet-5-5"
 effort = "high"
-timeout_secs = 1200                             # 60..=1500（Stop hook の 1800 秒より短く）
-max_budget_usd = 0.0                            # 0 で無指定
+timeout_secs = 1200                             # 60..=1500 (shorter than the Stop hook's 1800 seconds)
+max_budget_usd = 0.0                            # 0 means unspecified
 permission = "restricted"                       # restricted / bypass
-claude_path = ""                                # 空なら PATH から探す（指定は絶対パス）
+claude_path = ""                                # empty means search PATH (an absolute path if specified)
 
 [enrollment]
 policy = "explicit"                             # explicit / remote-owner / all
-owners = []                                     # remote-owner のとき "github.com/acme" など
+owners = []                                     # for remote-owner, e.g. "github.com/acme"
 
 [[repository]]
 root = "D:/Dev/MyRepo"
-remote = "github.com/me/myrepo"                 # 期待する push 先（一致しなければ見送る）
+remote = "github.com/me/myrepo"                 # expected push destination (skipped if it does not match)
 mode = "propose"
-branches = ["main"]                             # 空なら制限なし
+branches = ["main"]                             # empty means no restriction
 documents = ["README.md"]
 paused = false
 ```
 
-## 文書の種類
+## Document kinds
 
-保守する文書は「種類」で管理します。
+The documents to maintain are managed as "kinds".
 
-| 種類 | 対象 | 既定 |
+| Kind | Target | Default |
 | --- | --- | --- |
-| `agents` / `design` / `readme` | 従来どおり（`AGENTS.md` と個人 override、スコープ付きの `AGENTS.md` / `DESIGN.md`、ルートの `README.md`） | 有効（`defaults.documents` の既定は、この 3 種のまま） |
-| `changelog` | ルートの `CHANGELOG.md` | **オプトイン**（`documents` に `CHANGELOG.md` を挙げたときだけ） |
-| カスタム（`[kinds.<id>]`） | `paths` に固定パスで挙げた文書（最大 20 種。id は英小文字で始まる英小文字・数字・ハイフンの 32 文字以内） | `documents` に id を挙げたときだけ |
+| `agents` / `design` / `readme` | As before (`AGENTS.md` and the personal override, scoped `AGENTS.md` / `DESIGN.md`, the root `README.md`) | Enabled (the default of `defaults.documents` stays these 3 kinds) |
+| `changelog` | The root `CHANGELOG.md` | **Opt-in** (only when `CHANGELOG.md` is listed in `documents`) |
+| Custom (`[kinds.<id>]`) | Documents listed at fixed paths in `paths` (up to 20 kinds; an id starts with a lowercase letter and consists of lowercase letters, digits, and hyphens, at most 32 characters) | Only when the id is listed in `documents` |
 
-対象の種類は `defaults.documents`（リポジトリごとの `documents` で上書き）に、文書名（`"CHANGELOG.md"`）か id（`"changelog"`、カスタムは id）で挙げます。従来の 3 種だけの構成は、種類ごとの設定を何も書かなければ従来と同じ動作（worker へ渡すプロンプトも同一）です。
+Target kinds are listed in `defaults.documents` (overridden by each repository's `documents`) either by document name (`"CHANGELOG.md"`) or by id (`"changelog"`; for custom kinds, the id). A setup with only the original 3 kinds behaves exactly as before if you write no per-kind settings (the prompt passed to the worker is identical too).
 
-### 種類ごとの設定（`[kinds.<id>]`）
+### Per-kind settings (`[kinds.<id>]`)
 
-利用者の `config.toml` だけから読みます。全項目が省略可で、組み込みの種類は固定の既定に重ねます。未知のキーは拒否されます。
+These are read only from the user's `config.toml`. Every field is optional, and built-in kinds layer on top of fixed defaults. Unknown keys are rejected.
 
-| キー | 内容 |
+| Key | Description |
 | --- | --- |
-| （種類の id） | カスタム種類の id は英小文字で始まり、英小文字・数字・`-` だけの 32 文字以内。予約語 `new` は使えません（管理画面の URL と衝突するため）。 |
-| `paths` | カスタムの対象パス（1〜10 件・必須）。組み込みには書けません。ASCII の英数字と `. _ / -` だけ・相対パス・拡張子は `md` / `markdown` / `mdx` / `txt` / `rst` / `adoc`。`.git` 配下、組み込みの対象と同じ文書（`AGENTS.md` など）、機密パターンや `exclude` に一致するパス、種類間の重複は拒否します。 |
-| `guidance` | 何を書く文書か（カスタムは必須・1000 字以内）。組み込みには書けません。 |
-| `create_if_missing` | 対象が無いとき新規作成してよいか（組み込みは true、カスタムは false）。false なら、対象が無い間は許可パスにもプロンプトにも出しません。 |
-| `template` | `"builtin"` / `"none"` / `"templates/<名前>.md"`。後述。 |
-| `max_chars` / `max_bytes` | 文書の上限（文字数・バイト数）。両方書けば両方適用します。`agents` の `max_bytes` は 29,999 以下にすることだけできます。 |
-| `instructions` | 追加の編集指示（2000 字以内）。`[defaults] instructions`（全種類共通）と 2 段で、プロンプト末尾の「利用者設定由来」の枠にだけ入ります。対象パス・安全規則・commit と push の扱いは変えられません。 |
-| `language` | 文書の言語（`ja` / `en-US` など）。省略時は既存の文書に従います。 |
-| `required_headings` | 保守後に存在を検査する見出し（20 件以内）。 |
-| `timing` | 実行タイミング。後述。 |
-| `changelog` | CHANGELOG の設定（`changelog` 種類だけ）。後述。 |
+| (the kind's id) | A custom kind's id starts with a lowercase letter and consists only of lowercase letters, digits, and `-`, at most 32 characters. The reserved word `new` cannot be used (it would collide with the admin UI's URL). |
+| `paths` | The custom kind's target paths (1 to 10 entries, required). Cannot be written for built-in kinds. Only ASCII alphanumerics and `. _ / -`, relative paths, and the extensions `md` / `markdown` / `mdx` / `txt` / `rst` / `adoc`. Paths under `.git`, the same documents as built-in targets (such as `AGENTS.md`), paths matching sensitive patterns or `exclude`, and duplicates across kinds are rejected. |
+| `guidance` | What the document is for (required for custom kinds, at most 1000 characters). Cannot be written for built-in kinds. |
+| `create_if_missing` | Whether the target may be created when it does not exist (true for built-in kinds, false for custom kinds). When false, the target appears in neither the allowed paths nor the prompt while it does not exist. |
+| `template` | `"builtin"` / `"none"` / `"templates/<name>.md"`. See below. |
+| `max_chars` / `max_bytes` | Limits on the document (characters and bytes). If both are given, both apply. For `agents`, `max_bytes` can only be set to 29,999 or less. |
+| `instructions` | Additional editing instructions (at most 2000 characters). Together with `[defaults] instructions` (shared by all kinds) in two tiers, they go only into the "from user settings" section at the end of the prompt. They cannot change the target paths, safety rules, or how commit and push are handled. |
+| `language` | The language of the document (`ja` / `en-US`, etc.). When omitted, the existing document's language is followed. This is the language of the generated documents and is separate from the language of the screens and output (the worker's prompts are in English, but the `language` behavior is unchanged). |
+| `required_headings` | Headings whose presence is checked after maintenance (at most 20). |
+| `timing` | When to run. See below. |
+| `changelog` | CHANGELOG settings (only for the `changelog` kind). See below. |
 
-**テンプレート**は設定フォルダー配下の `templates/<名前>.md` だけを指定できます（リポジトリ内のファイルや任意の絶対パスは不可。CHANGELOG の `builtin` は Keep a Changelog 形式の埋め込みテンプレート）。実行時に、リンクでない通常ファイル・16 KiB 以内・UTF-8・改行とタブ以外の制御文字なし・`<<<` を含まない・リポジトリの外、を検査し、1 つでも満たさなければ worker を起動せず、処理済み位置も進めずに見送ります（ファイルを直すと次回処理します）。テンプレートは新規作成のときの構成として使い、既存の文書では既存の構成を優先します。
+**Templates** can only be specified as `templates/<name>.md` under the settings folder (files inside the repository and arbitrary absolute paths are not allowed; for CHANGELOG, `builtin` is the embedded Keep a Changelog template). At run time the file is checked to be a regular file (not a link), at most 16 KiB, UTF-8, free of control characters other than newline and tab, free of `<<<`, and outside the repository; if any check fails, the worker is not started, the processed position is not advanced, and the run is skipped (it is processed next time once you fix the file). A template is used as the structure when creating a new document; for existing documents, the existing structure takes precedence.
 
-### 保守後の検査
+### Post-maintenance checks
 
-上限（`max_chars` / `max_bytes`）・`required_headings`・AGENTS の 30,000 バイト未満・CHANGELOG のリリース済みエントリの不変は、worker の権限モード（`restricted` / `bypass`）に関係なく Rust が検査します。違反したとき、`push` モードは commit せず（変更は作業ツリーに残り、次の hook でも同じ検査を通ります）、`propose` モードは更新案を作らずに棄却（`rejected`）して処理済み位置を進めます。同じ push では worker を再実行しません。`propose` の棄却は `run-now` のときだけ作り直せます。
+Limits (`max_chars` / `max_bytes`), `required_headings`, AGENTS being under 30,000 bytes, and the immutability of released CHANGELOG entries are checked by Rust regardless of the worker's permission mode (`restricted` / `bypass`). On a violation, `push` mode does not commit (the changes remain in the working tree, and the next hook runs the same checks), while `propose` mode does not create an update proposal and rejects it (`rejected`), advancing the processed position. The worker is not rerun for the same push. A `propose` rejection can be recreated only with `run-now`.
 
-### タイミング（`[kinds.<id>.timing]`）
+### Timing (`[kinds.<id>.timing]`)
 
-| キー | 内容 |
+| Key | Description |
 | --- | --- |
-| `when` | `push`（既定。push のたび）/ `release`（リリースのタグが出たとき）/ `manual`（`run-now` のときだけ） |
-| `paths` | glob の配列。今回の push 範囲の変更パスのどれかに一致したときだけ対象（省略時は条件なし） |
-| `min_interval_hours` | 前回完了からの最小間隔（0〜720 時間） |
+| `when` | `push` (default; on every push) / `release` (when a release tag appears) / `manual` (only on `run-now`) |
+| `paths` | An array of globs. The kind is a target only when one of the changed paths in this push range matches (no condition when omitted) |
+| `min_interval_hours` | Minimum interval since the last completion (0 to 720 hours) |
 
-対象が存在せず新規作成も許されない CHANGELOG・カスタム種類は判定に入れず、処理する文書が 1 つも無ければ worker を起動せずに処理済み位置だけを進めます（`kind_runs` も記録しません）。worker の失敗などで保守を再開するときは、最初に期限が来た種類（状態に記録）だけで再開します。
+CHANGELOG and custom kinds whose target does not exist and may not be created are left out of the decision, and when there is no document to process, the worker is not started and only the processed position is advanced (`kind_runs` is not recorded either). When maintenance is resumed after a worker failure or similar, it resumes with only the kinds that were due first (recorded in the state).
 
-条件はすべて AND で評価します。`release` は、`release_tag`（CHANGELOG 以外の種類は `v*`）に合うタグが push 位置から到達でき、そのタグに対応する節がまだ `CHANGELOG.md` に無いときです（CHANGELOG 以外の種類も同じ基準なので、リリース手順がタグを打つ前に版の節を書く運用では、それらの種類の `release` は来ません）。期限が来た種類だけを 1 回の worker でまとめて処理し、どの種類も期限前なら worker を起動せず処理済み位置だけを進めます。最終完了時刻は状態 DB の `kind_runs` 表に種類ごとに持ちます（状態 DB の版は変わりません）。
+All conditions are evaluated as AND. `release` applies when a tag matching `release_tag` (`v*` for kinds other than CHANGELOG) is reachable from the pushed position and the section for that tag does not yet exist in `CHANGELOG.md` (kinds other than CHANGELOG use the same criterion, so if your release procedure writes the version's section before tagging, `release` for those kinds never fires). Only the kinds that are due are processed together in a single worker run, and if no kind is due, the worker is not started and only the processed position is advanced. The last completion time is kept per kind in the state DB's `kind_runs` table (the state DB version does not change).
 
-評価するのは新しい push を検知したときと `run-now` のときだけです。そのため最小間隔は「間隔が過ぎたあとの**次の push** で実行する」の意味で、時間が経っただけでは動きません。期限前の push の変更は次回へ持ち越されませんが、worker は push 範囲の差分全体を見て文書を更新します。`run-now` はタイミングを無視して有効な種類をすべて処理します。
+Evaluation happens only when a new push is detected and on `run-now`. The minimum interval therefore means "run on the **next push** after the interval has passed"; it does not fire merely because time has passed. Changes from a push that was too early are not carried over to the next run, but the worker looks at the whole diff of the push range when it updates the documents. `run-now` ignores timing and processes all enabled kinds.
 
-### CHANGELOG の保守（`[kinds.changelog.changelog]`）
+### CHANGELOG maintenance (`[kinds.changelog.changelog]`)
 
-- 既存の形式を踏襲します（新規作成のときだけ Keep a Changelog の組み込みテンプレート）。1 回の push ごとの更新は `Unreleased` 節だけで、worker はリリース済みの節を変更できません。Rust が保守の前後を比べ、リリース済みの節が 1 バイトでも変わっている・消えている・順序が入れ替わっている、リンク参照定義が失われている場合は上の検査に違反として扱います（push モードは commit しない／propose は棄却）。
-- 履歴は `CHANGELOG.md` を最後に変更したコミットから今回の push までを、Rust が集めて**信頼できないデータ**としてプロンプトに渡します（コミット件名・変更パス・範囲内のタグ。全体 48 KiB まで）。restricted の worker は `git log` を実行できないためです。Scriptura 自身の保守コミットは除きます。
-- `on_release = "promote"`（既定）: 範囲内のタグに対応する版の節がまだ無ければ、`Unreleased` の内容をその版の節へ移します。節が既にあれば何もしません（リリース手順が先に書いていても同じ結果になります）。`ignore` は版の節を作りません。
-- `backfill = "tags"`（既定）: `CHANGELOG.md` が無いとき、到達できるタグを新しい順に `backfill_max_releases`（1〜50、既定 20）件まで、隣り合うタグ間のコミットを合計 `backfill_max_commits`（1〜1000、既定 300）件まで遡って版ごとの節を作ります。`none` は遡りません。`format`（`existing` / `keep-a-changelog`）、`release_tag`（既定 `v*`）も指定できます。
-- ファイル名は Git 上の綴りを大文字小文字を区別せずに解決します（`Changelog.md` なども対象）。綴りを 1 つに決められないとき、編集前の内容を Git から読めないときは、検査不能として違反扱いにします。push モードで `CHANGELOG.md` が Git に無視（ignore）されている場合は、worker を起動せずに新しい保守を見送ります。
-- 版とタグの照合は、`release_tag` の固定接頭辞（`v*` の `v`、`release-*` の `release-` など）を除いた版名（`## [1.2.0]`）でも一致とみなします。違反の理由は見出しの文字列を出さず、「n 番目の版の節」のように番号で示します。リリース済みの節のリンク参照定義は、内容と順序が保たれ、既存のラベルが再定義されていないことも検査します。
-- 限界: タグだけの push（`git push --tags`）は検知できません。次のブランチの push か `--follow-tags` で反映されます。push モードで `CHANGELOG.md` を保守する場合、リリース手順が同じファイルを更新すると競合することがあります（`doctor` が注意を出します）。
+- It follows the existing format (the Keep a Changelog embedded template is used only when creating the file). Each push updates only the `Unreleased` section, and the worker cannot change released sections. Rust compares before and after maintenance, and if even one byte of a released section changed, a section disappeared or was reordered, or link reference definitions were lost, it is treated as a violation of the checks above (push mode does not commit; propose rejects).
+- For history, Rust gathers everything from the commit that last changed `CHANGELOG.md` up to this push and passes it to the prompt as **untrusted data** (commit subjects, changed paths, and tags in the range, up to 48 KiB in total). This is because a restricted worker cannot run `git log`. Scriptura's own maintenance commits are excluded.
+- `on_release = "promote"` (default): if there is no section yet for the version corresponding to a tag in the range, the contents of `Unreleased` are moved into that version's section. If the section already exists, nothing happens (the result is the same even if the release procedure wrote it first). `ignore` does not create version sections.
+- `backfill = "tags"` (default): when `CHANGELOG.md` does not exist, it creates per-version sections by going back through reachable tags, newest first, up to `backfill_max_releases` (1 to 50, default 20) tags and up to `backfill_max_commits` (1 to 1000, default 300) commits in total between adjacent tags. `none` does not go back. `format` (`existing` / `keep-a-changelog`) and `release_tag` (default `v*`) can also be specified.
+- The file name is resolved from its spelling in Git case-insensitively (`Changelog.md` and the like are also targets). When the spelling cannot be settled on a single one, or the pre-edit content cannot be read from Git, it is treated as unverifiable and counts as a violation. In push mode, if `CHANGELOG.md` is ignored by Git, new maintenance is skipped without starting the worker.
+- Matching versions with tags also treats the version name without the fixed prefix of `release_tag` (the `v` of `v*`, the `release-` of `release-*`, and so on) as a match (`## [1.2.0]`). Violation reasons do not print heading text and are given by number, such as "the n-th version section". For link reference definitions of released sections, it also checks that their content and order are preserved and that existing labels are not redefined.
+- Limitations: a tag-only push (`git push --tags`) cannot be detected. It is picked up by the next branch push or with `--follow-tags`. When maintaining `CHANGELOG.md` in push mode, a release procedure that updates the same file may conflict (`doctor` points this out).
 
-### 設定例（schema 2）
+### Example configuration (schema 2)
 
 ```toml
 schema = 2
 
 [defaults]
 documents = ["AGENTS.md", "DESIGN.md", "README.md", "CHANGELOG.md", "architecture"]
-instructions = "文体は常体で、推測を書かない"      # 全種類共通の追加指示
+instructions = "Write in a plain, declarative style and never speculate"      # additional instructions shared by all kinds
 
 [kinds.agents]
 max_bytes = 20000
 
 [kinds.changelog]
 max_chars = 40000
-instructions = "利用者に見える変更だけを書く"
+instructions = "Record only user-visible changes"
 [kinds.changelog.timing]
 when = "push"
 [kinds.changelog.changelog]
 on_release = "promote"
 backfill = "tags"
 
-[kinds.architecture]                              # カスタム種類
-guidance = "システム構成・責務・データフローを記載する"
+[kinds.architecture]                              # a custom kind
+guidance = "Describe the system structure, responsibilities, and data flow"
 paths = ["docs/ARCHITECTURE.md"]
 create_if_missing = false
-template = "templates/architecture.md"            # 設定フォルダー配下
+template = "templates/architecture.md"            # under the settings folder
 max_chars = 15000
-required_headings = ["概要"]
+required_headings = ["Overview"]
 [kinds.architecture.timing]
 paths = ["src/**", "Cargo.toml"]
 min_interval_hours = 24
@@ -200,88 +222,106 @@ root = "D:/Dev/MyRepo"
 documents = ["README.md", "CHANGELOG.md"]
 ```
 
-## 設定の書き込みと変更履歴
+## Writing settings and change history
 
-設定の書き込みは、CLI・管理画面・旧利用者の自動移行のどれも同じ経路（`src/ops.rs` と `config::update_in`）を通ります。状態フォルダーの `config-lock.sqlite3` で書き手を直列化し、管理画面は表示時の版（ファイルの SHA-256。ファイルが無ければ `missing`）を照合して、他で変更されていれば保存せずに再読み込みを案内します（CLI は版を照合しません）。保存の直前に、変更前の内容を状態フォルダーの `config-history/` へ退避し（50 件保持）、保存はアトミックです。壊れた設定は書き換えません。内容が変わらない操作は保存も退避もしません。履歴は管理画面の「履歴」から差分の確認と復元ができ、復元前の内容も履歴に残ります。復元で登録が増える場合は、確認画面を挟み、その登録の起点（有効化前の push を処理しないための位置）を記録してから保存します。復元で push モードの登録が増える・push に変わる場合は拒否し、`enable --mode push`（remote と upstream を確認する）へ案内します。
+All settings writes, whether from the CLI, the admin UI, or the automatic migration of legacy users, go through the same path (`src/ops.rs` and `config::update_in`). Writers are serialized with `config-lock.sqlite3` in the state folder, and the admin UI compares the version it displayed (the file's SHA-256, or `missing` if the file does not exist) and, if the file was changed elsewhere, does not save and tells you to reload (the CLI does not compare versions). Immediately before saving, the previous content is set aside in `config-history/` in the state folder (50 entries are kept), and the save is atomic. A broken config is not rewritten. An operation that changes nothing neither saves nor sets anything aside. From "History" in the admin UI you can inspect diffs and restore; the content from before a restore is also kept in the history. When a restore would add registrations, a confirmation screen is shown, and the starting point of each registration (the position that prevents processing pushes from before enabling) is recorded before saving. A restore that would add push-mode registrations or change registrations to push is refused and directed to `enable --mode push` (which checks the remote and upstream).
 
-## 管理画面（`scriptura ui`）
+## Admin UI (`scriptura ui`)
 
 ```powershell
 scriptura ui [--port <n>] [--no-open]
 ```
 
-設定・更新案・診断をブラウザーで扱う画面です（日本語のみ）。常駐はせず、起動したコマンドが画面の「終了」・Ctrl+C・60 分の無操作のいずれかで終わります。hook は画面の有無を見ません。cargo feature `ui`（既定で有効）で、`--no-default-features` でビルドすると含まれません（`scriptura ui` は拒否して終了します）。
+A browser-based screen for handling settings, update proposals, and diagnostics. It is available in 9 languages (ja, en, zh-CN, zh-TW, ko, es, fr, de, pt-BR). The language is chosen in this order: the language selector at the top of the screen (saved in a cookie) → the browser's `Accept-Language` → English. It is not resident: the command that launched it ends when you choose "Quit" on the screen, press Ctrl+C, or after 60 minutes of inactivity. Hooks do not look at whether the screen is open. It is controlled by the cargo feature `ui` (enabled by default) and is not included when built with `--no-default-features` (`scriptura ui` then refuses and exits).
 
-- **待ち受け**: `127.0.0.1` だけ（既定のポートは 7468、`--port 0` で空きポート）。ポートが使用中なら終了します。
-- **保護**: 起動ごとの使い捨て鍵の URL（`/auth?key=…`）を一度だけ使えるセッション Cookie（`HttpOnly; SameSite=Strict`）へ交換します（Cookie が無ければ 401）。Host は `127.0.0.1:<port>` か `localhost:<port>` だけ、Origin があれば同一オリジンだけ、POST は同一オリジン（`Origin` か `Sec-Fetch-Site`）に加えて CSRF トークンが必須です。CSP・`nosniff`・`no-store` などの応答ヘッダーを付け、秘密値は表示しません。Cookie はブラウザーの仕様上ポートで分離されないため、同じ PC の 127.0.0.1 の別ポートで動くサービスにも送られます（同じ利用者のプロセスは元々設定ファイルを触れるので、問題になるのは権限の違うローカルサービスだけです）。
-- **競合**: 保存は表示時の版を照合し、他で変更されていれば再読み込みを案内します。
-- **確認画面**: push モード化、権限 `bypass` 化、自動登録の方針を `all` / `remote-owner` にする変更、費用上限（`max_budget_usd`）を外す変更、カスタム種類の対象パスの追加、同意の記録、登録の解除、更新案の適用、push モードの `run-now`（と、これらを含む版への履歴の復元）は、1 回目の送信では書き込まず、変更点の一覧を見せて 1 回限りの確認（10 分で失効）を求めます。
-- **画面**: 概要 / リポジトリ（登録・有効化・一時停止・再開・解除・モードと対象の文書・`run-now`）/ 文書の種類（種類の追加・編集・削除、`templates/` のテンプレート編集）/ 更新案（差分の確認・適用・破棄）/ worker / 全般 / 同意 / 履歴（変更履歴・差分・復元）/ 診断。`run-now` は時間がかかるためバックグラウンドで実行し、画面で状態を確認できます。
+- **Listening**: only on `127.0.0.1` (the default port is 7468; `--port 0` picks a free port). If the port is in use, it exits.
+- **Protection**: the disposable key URL generated at each launch (`/auth?key=…`) is exchanged once for a session cookie (`HttpOnly; SameSite=Strict`) (without the cookie, the response is 401). Host must be only `127.0.0.1:<port>` or `localhost:<port>`; if an Origin is present it must be same-origin; and a POST requires same-origin (`Origin` or `Sec-Fetch-Site`) plus a CSRF token. Response headers such as CSP, `nosniff`, and `no-store` are added, and secret values are never displayed. Because browsers do not isolate cookies by port, the cookie is also sent to services running on other 127.0.0.1 ports on the same PC (processes of the same user can already touch the settings file, so the only concern is a local service with different privileges).
+- **Conflicts**: a save compares the version it displayed and, if the file was changed elsewhere, tells you to reload.
+- **Confirmation screen**: switching to push mode, switching the permission to `bypass`, changing the enrollment policy to `all` / `remote-owner`, removing the cost cap (`max_budget_usd`), adding a custom kind's target path, recording consent, removing a registration, applying an update proposal, and `run-now` in push mode (and restoring history to a version that includes any of these) do not write on the first submission; they show a list of the changes and ask for a one-time confirmation (valid for 10 minutes).
+- **Screens**: Overview / Repositories (register, enable, pause, resume, remove, mode and target documents, `run-now`) / Document kinds (add, edit, and delete kinds; edit templates in `templates/`) / Update proposals (inspect diffs, apply, discard) / Worker / General / Consent / History (change history, diffs, restore) / Diagnostics. `run-now` takes time, so it runs in the background and you can check its status on the screen.
 
-## コマンド
+## Language of output
 
-`ui` 以外のコマンドに `--json`（機械可読の JSON を 1 つ出力）を付けられます。成功は終了コード 0、利用者の誤り・拒否は 1 です。出力に秘密値は含まれません。
+The CLI, hook, and installer guidance output is available in 9 languages (ja, en, zh-CN, zh-TW, ko, es, fr, de, pt-BR). The language is chosen in this order: `SCRIPTURA_LANGUAGE` → `LC_ALL` → `LC_MESSAGES` → `LANG` → the OS display language → English. The admin UI uses its own selection order (described above). JSON keys and values meant for machines (such as `status`, `outcome`, and `doctor`'s `id`) are not translated.
 
-| コマンド | 内容 |
+## Commands
+
+All commands except `ui` accept `--json` (prints a single machine-readable JSON object). Success is exit code 0, and a user error or refusal is 1. The output contains no secret values.
+
+| Command | Description |
 | --- | --- |
-| `enable --repo <path> --accept-consent <版> [--mode propose\|push\|off] [--branches a,b] [--documents AGENTS.md,README.md]` | リポジトリを登録して有効化する。`--documents` には組み込み 4 種（`CHANGELOG.md` を含む。大文字小文字は問わない）と、設定に定義したカスタム種類の id を挙げられる。 |
-| `disable --repo <path>` | 登録を削除する。 |
-| `pause [--repo <path>]` / `resume [--repo <path>]` | 一時停止 / 再開（`--repo` 省略時は cwd のリポジトリ）。 |
-| `status` | 導入状態・設定・同意・登録・worker 設定・更新案の件数を表示する。 |
-| `doctor [--verify]` | 環境と設定を診断する（後述）。 |
-| `run-now [--repo <path>] [--documents <id,...>]` | push を待たず、いま 1 回保守を実行する（登録済み・同意済みのリポジトリだけ。タイミングは無視して有効な種類をすべて処理する）。`--documents` で処理する種類を絞れる（未定義・このリポジトリで無効な種類は worker を起動せず拒否）。**注意**: 絞った `run-now` も処理済み位置を進め、更新案はコミットごとに 1 つなので、絞り込みの外の種類はその push について保守されない。保守後の検査に違反した propose は `outcome` が `rejected`（`reason` つき。失敗ではなく、その push は処理済みになる）で返る。 |
-| `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | 文書の種類（組み込み・カスタム）の一覧と 1 件の詳細を表示する（有効・無効、対象パスと存在、上限、タイミング、テンプレートの状態、最終完了時刻。`show` は設定した指針・追加指示の本文も出す。読み取り専用で、文書の内容は出さない）。 |
-| `ui [--port <n>] [--no-open]` | 管理画面を起動する（前述）。`--json` は使えない。 |
-| `review [sha\|latest] [--repo <path>]` | 更新案の diffstat・パッチのパス・対象文書を確認する。 |
-| `apply [sha\|latest] [--repo <path>]` | 更新案を作業ツリーへ適用する。対象文書に未コミットの変更があれば拒否する。 |
-| `discard [sha\|latest] [--repo <path>]` | 更新案を破棄する。 |
-| `connect claude-code [--apply] [--executable <絶対パス>]` / `--remove [--apply]` | settings.json の Stop hook を登録（旧保守 hook は hook 単位で置換）/ Scriptura の hook だけ解除する。`--apply` を付けるまでプレビュー。 |
-| `install` / `hook` | 導入先へ置く / Stop hook として動く（通常は直接呼ばない）。 |
+| `enable --repo <path> --accept-consent <version> [--mode propose\|push\|off] [--branches a,b] [--documents AGENTS.md,README.md]` | Registers and enables a repository. `--documents` accepts the 4 built-in kinds (including `CHANGELOG.md`; case-insensitive) and the ids of custom kinds defined in the settings. |
+| `disable --repo <path>` | Removes the registration. |
+| `pause [--repo <path>]` / `resume [--repo <path>]` | Pause / resume (the cwd's repository when `--repo` is omitted). |
+| `status` | Shows the installation state, settings, consent, registrations, worker settings, the number of update proposals, and the Setup edition's information (`setup`: whether it is managed, packId, version, executable, auto-update, the last check / failure times, the downloaded version, the registration result, and any leftover old standalone install). `installedVersion` comes from the standalone `install` record (`install.json`, or an earlier version's `current.json` if absent). |
+| `doctor [--verify]` | Diagnoses the environment and settings (described below). |
+| `run-now [--repo <path>] [--documents <id,...>]` | Runs maintenance once right now without waiting for a push (only for registered, consented repositories; timing is ignored and all enabled kinds are processed). `--documents` narrows the kinds to process (an undefined kind, or one that is disabled for this repository, is refused without starting the worker). **Note**: a narrowed `run-now` also advances the processed position, and since there is one update proposal per commit, kinds outside the narrowing are not maintained for that push. A propose that violates the post-maintenance checks returns an `outcome` of `rejected` (with a `reason`; this is not a failure, and that push counts as processed). |
+| `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | Lists the document kinds (built-in and custom) and shows the details of one (enabled or disabled, target paths and whether they exist, limits, timing, template status, last completion time; `show` also prints the configured guidance and additional instructions. Read-only, and it does not print document contents). |
+| `ui [--port <n>] [--no-open]` | Launches the admin UI (described above). `--json` cannot be used. |
+| `review [sha\|latest] [--repo <path>]` | Inspects an update proposal's diffstat, patch path, and target documents. |
+| `apply [sha\|latest] [--repo <path>]` | Applies an update proposal to the working tree. Refused if the target documents have uncommitted changes. |
+| `discard [sha\|latest] [--repo <path>]` | Discards an update proposal. |
+| `connect claude-code [--apply] [--executable <absolute path>]` / `--remove [--apply]` | Registers the settings.json Stop hook (replacing old maintenance hooks hook by hook) / removes only Scriptura's hook. A preview until you pass `--apply`. |
+| `update [--check] [--auto on\|off]` | Shows the Setup edition's auto-update state / checks and downloads now (does not apply) / switches auto-update. |
+| `update-apply` | Applies a downloaded update only when no other Scriptura process is running, after verifying the signer (started automatically at logon. The result is one JSON line whose `status` is `unmanaged` / `disabled` / `nothingPending` / `busy` / `untrusted` (exit code 2) / `applied`). |
+| `uninstall-setup [--apply]` | Removes the Setup edition's registration (the Stop hook pointing at itself and the logon apply). A preview until you pass `--apply`. |
+| `install` / `hook` | Places it at the install location (the traditional advanced path; recorded in `install.json` in the state folder) / runs as the Stop hook (normally not called directly). |
 
-## 安全性
+## Safety
 
-- **オプトイン**: 同意（版つき）とリポジトリの登録がなければ何も動かず、状態フォルダーも作りません。登録は利用者本人の設定ファイルにだけ置きます。
-- **作業ツリーを変えない（propose）**: push されたコミットを状態フォルダー配下の使い捨てクローンへ展開し、そこだけで worker を動かします。クローンは push されたコミットから作るので、利用者の未追跡・無視ファイル（`.env` など）はクローンに存在しません。ただしこれは「クローンにファイルが無い」という事実で、`restricted` の許可規則（`Read(./**)` と機密パターンの拒否）がクローンの外の読み取りを禁じる保証ではありません（規則がクローンの外を拒否するかは未確認です）。クローンの `origin` は外すので、worker が push しても利用者のリポジトリへ届きません。
-- **機密パターン**: `.env*` / `*.pem` / `*.key` / `*.p12` / `*.pfx` / `id_rsa*` / `id_ed25519*` / `**/secrets/**` / `.git/config` を、`restricted` のときの worker の Read / Edit 拒否規則（`--disallowedTools`）として適用します。`exclude` で加算はできますが、置き換えて外すことはできません。`bypass`（旧動作互換。権限確認を全て省略）ではこの規則は適用されません。
-- **事後検査**: worker が対象文書（と `.gitignore`）以外を変更した場合は成果を採用しません。propose は使い捨てクローンの全体（無視ファイルの増加を含む）を比べます。push モードは利用者の実作業ツリーで動くため、`restricted` のときだけ作業ツリーの追跡・未追跡ファイルを worker の前後で比べ（`target/` など無視ファイルの変化は並行する利用者の作業と区別できないので対象外）、`bypass` は従来どおり commit 対象文書のハッシュ検査だけです。push モードでは commit と push の不確実な状態を再実行せず、状態 DB で整合を取ります。上限・必須見出し・CHANGELOG のリリース済みエントリの不変は、権限モードに関係なく検査します（前述）。
-- **環境の衛生**: worker に渡す環境変数から、親セッション（デスクトップ等）由来の中継設定を取り除きます。
+- **Opt-in**: without consent (versioned) and repository registration, nothing runs and no state folder is even created. Registrations are kept only in the user's own settings file.
+- **Does not change the working tree (propose)**: the pushed commit is expanded into a throwaway clone under the state folder, and the worker runs only there. Because the clone is built from the pushed commit, the user's untracked and ignored files (such as `.env`) do not exist in the clone. However, this is only the fact that "the files are not in the clone"; it is not a guarantee that the `restricted` permission rules (`Read(./**)` and the denial of sensitive patterns) forbid reading outside the clone (whether the rules deny paths outside the clone has not been verified). The clone's `origin` is removed, so even if the worker pushes, nothing reaches the user's repository.
+- **Sensitive patterns**: `.env*` / `*.pem` / `*.key` / `*.p12` / `*.pfx` / `id_rsa*` / `id_ed25519*` / `**/secrets/**` / `.git/config` are applied as the worker's Read / Edit deny rules (`--disallowedTools`) when `restricted`. You can add to them with `exclude`, but you cannot replace them to remove any. With `bypass` (legacy-compatible; skips all permission prompts), these rules are not applied.
+- **Post-run checks**: if the worker changed anything other than the target documents (and `.gitignore`), its result is not adopted. Propose compares the whole throwaway clone (including any growth in ignored files). Push mode runs in the user's real working tree, so only under `restricted` does it compare the working tree's tracked and untracked files before and after the worker (changes to ignored files such as `target/` are excluded because they cannot be told apart from the user's concurrent work), while `bypass` does only the hash check of the documents to be committed, as before. In push mode, uncertain commit and push states are not rerun and are reconciled through the state DB. Limits, required headings, and the immutability of released CHANGELOG entries are checked regardless of permission mode (see above).
+- **Environment hygiene**: relay settings originating from the parent session (such as the desktop app) are removed from the environment variables passed to the worker.
 
-## 費用とデータ送信
+## Cost and data transmission
 
-保守の worker（既定は Sonnet）は、**あなた自身の Claude 認証**で動きます。worker が読んだリポジトリの内容は Anthropic へ送信され、実行ごとに Claude の利用料金（使用量）が発生します。push 1 回につき worker は最大 1 回、`worker.timeout_secs` を上限に動きます。`worker.max_budget_usd` で予算の上限も指定できます。
+The maintenance worker (Sonnet by default) runs with **your own Claude authentication**. The repository contents the worker reads are sent to Anthropic, and Claude usage charges (consumption) are incurred on every run. The worker runs at most once per push, with `worker.timeout_secs` as its upper bound. You can also specify a budget cap with `worker.max_budget_usd`.
 
-## 診断（doctor）
+## Diagnostics (doctor)
 
-`scriptura doctor [--verify] [--json]` は項目ごとに `{id, status, detail}`（status は `ok` / `warn` / `fail` / `info`）を返します。`fail` があると終了コードは 1 です。
+`scriptura doctor [--verify] [--json]` returns `{id, status, detail}` for each item (status is `ok` / `warn` / `fail` / `info`). If there is any `fail`, the exit code is 1.
 
-対応プラットフォーム、`git`、`claude`（実行ファイルの解決）、`claude auth status`（worker と同じ環境で実行し、終了コードと `authMethod` だけを見ます）、`gh`（push モードの GitHub リポジトリがあるときだけ）、設定と同意、状態フォルダーへの書き込み可否、hook の二重登録、`allowManagedHooksOnly` / `disableAllHooks`、旧 `agents-maintenance` の残存登録を確認します。`kinds` 項目は、文書の種類のテンプレートが読めるか（場所とサイズ）を確認し、上限が既存の文書の現在の大きさより小さいとき（次の保守が棄却されうる）と、push モードで `CHANGELOG.md` を保守するリポジトリがあるとき（リリース手順との競合）に `info` を出します。`--verify` はプラグイン同梱の `SHA256SUMS` に載る本体（`bin/scriptura.exe`・`libexec/scriptura-*`）の SHA-256 だけを照合します（ランチャー・hooks・skills は対象外。プラグイン外の実行ファイルも対象外）。
+It checks the supported platform, `git`, `claude` (executable resolution), `claude auth status` (run in the same environment as the worker, looking only at the exit code and `authMethod`), `gh` (only when there is a push-mode GitHub repository), settings and consent, whether the state folder is writable, duplicate hook registrations, `allowManagedHooksOnly` / `disableAllHooks`, and leftover registrations of the old `agents-maintenance`. For the Setup edition, it also reports duplicate registration between the plugin and the Setup edition (`setupPlugin`), whether the Setup edition's hook exists (`setupHook`), a leftover old standalone install (`legacyInstall`), and the auto-update state (`autoUpdate`) (for a non-Setup edition, only a single `info` item, `setup`). The `kinds` item checks whether the document kinds' templates can be read (location and size), and reports `info` when a limit is smaller than an existing document's current size (the next maintenance may be rejected) and when there is a repository that maintains `CHANGELOG.md` in push mode (a conflict with the release procedure). `--verify` checks only the SHA-256 of the binaries listed in the plugin's bundled `SHA256SUMS` (`bin/scriptura.exe` and `libexec/scriptura-*`) (launchers, hooks, and skills are not covered; executables outside the plugin are not covered either).
 
-## 状態と保存場所
+## State and storage locations
 
-| 場所 | Windows | macOS | Linux |
+| Location | Windows | macOS | Linux |
 | --- | --- | --- | --- |
-| 導入先（固定の実行ファイル `bin\scriptura(.exe)`） | `%LOCALAPPDATA%\Programs\Scriptura` | `~/Library/Application Support/Scriptura/app` | `$XDG_DATA_HOME/scriptura`（既定 `~/.local/share/scriptura`） |
-| 状態（DB・ロック・publications・更新案・設定の変更履歴 `config-history/`） | `%LOCALAPPDATA%\Scriptura\state` | `~/Library/Application Support/Scriptura/state` | `$XDG_STATE_HOME/scriptura`（既定 `~/.local/state/scriptura`） |
+| Install location (the fixed executable `bin\scriptura(.exe)`) | `%LOCALAPPDATA%\Programs\Scriptura` | `~/Library/Application Support/Scriptura/app` | `$XDG_DATA_HOME/scriptura` (default `~/.local/share/scriptura`) |
+| State (DB, locks, publications, update proposals, the settings change history `config-history/`) | `%LOCALAPPDATA%\Scriptura\state` | `~/Library/Application Support/Scriptura/state` | `$XDG_STATE_HOME/scriptura` (default `~/.local/state/scriptura`) |
 
-`SCRIPTURA_HOME` を絶対パスで設定すると、状態は `<SCRIPTURA_HOME>/state`、導入先は `<SCRIPTURA_HOME>/app`、設定は `<SCRIPTURA_HOME>/config.toml` になります。`SCRIPTURA_DB` で状態 DB だけを別の場所にもできます。テンプレートは設定ファイルと同じフォルダーの `templates/` に置きます。Codex や Claude Code のホームには書き込みません（`connect claude-code --apply` / `--remove` が `settings.json` を書き換える場合を除く）。
+Setting `SCRIPTURA_HOME` to an absolute path puts state in `<SCRIPTURA_HOME>/state`, the install location in `<SCRIPTURA_HOME>/app`, and settings in `<SCRIPTURA_HOME>/config.toml`. `SCRIPTURA_DB` can also move just the state DB elsewhere. Templates go in `templates/` in the same folder as the settings file. Nothing is written to the Codex or Claude Code home (except when `connect claude-code --apply` / `--remove`, the Setup edition's automatic registration, and `uninstall-setup --apply` rewrite `settings.json`). The Setup edition's install location (Windows `%LOCALAPPDATA%\ScripturaApp`) is managed by Velopack and replaced on updates, so no state or settings are kept there.
 
-## 旧利用者の自動移行
+## Automatic migration of legacy users
 
-旧版の Scriptura（設定ファイルを持たなかった版）で動かしていて状態 DB が残っている利用者が、設定ファイル無しで hook を実行すると、従来と同じ動作（全リポジトリ・`push` モード・権限バイパス）の設定を一度だけ自動で作り、その旨を通知します。同意の出所は `legacy-migration` として記録されます。新規の利用者には何も作りません。対象を絞りたいときは `enable` で登録し直し、`policy = "explicit"` にしてください。旧 `agents-maintenance`（`~/.codex/hooks/state`）の状態は引き継がず、空の状態から始めます。
+A user who ran an older Scriptura (a version that had no settings file) and still has a state DB, when running a hook without a settings file, gets a settings file automatically created exactly once with the same behavior as before (all repositories, `push` mode, permission bypass), and is notified of this. The origin of the consent is recorded as `legacy-migration`. Nothing is created for new users. If you want to narrow the targets, register again with `enable` and set `policy = "explicit"`. The state of the old `agents-maintenance` (`~/.codex/hooks/state`) is not carried over; it starts from an empty state.
 
-## 未対応・未検証
+## Not supported / not verified
 
-- macOS / Linux は実機で未検証です（Windows で開発・検証しています）。macOS Intel は対象外です。
-- 非 Windows では、worker 実行中に中断した保守の再開を見送ります（終了確認の手段が無いため）。
-- branch + PR での公開は後続です。カスタム種類は固定パスのみ（glob・サブディレクトリの走査は後続）で、種類ごとのモデル・effort の上書き、リポジトリごとの種類設定（`[repository.kinds]`）、テンプレートの強制適用、CLI からの設定編集（`set`）、管理画面のトレイ常駐・自動起動・英語表示も後続です。
-## 検証
+- macOS / Linux are not verified on real hardware (development and verification are done on Windows). macOS Intel is out of scope. The Setup edition's code for macOS and Linux (LaunchAgent, XDG autostart, process detection, and signature and location checks) is a port of Remnifold's implementation, and it has not even been confirmed to compile on Windows.
+- Switching auto-update in the admin UI (`ui`) is not supported (use `scriptura update --auto on|off`).
+- On Windows, the logon Run value does not inherit `SCRIPTURA_HOME` (the macOS LaunchAgent and the Linux autostart entry do).
+- On non-Windows platforms, resuming maintenance that was interrupted while the worker was running is skipped (there is no way to confirm the worker has ended).
+- Publishing via branch + PR is planned for later. Custom kinds are limited to fixed paths (globs and subdirectory scanning come later), and per-kind overrides of model and effort, per-repository kind settings (`[repository.kinds]`), forced template application, editing settings from the CLI (`set`), and the admin UI's tray residency and auto-start are also planned for later.
+
+## Verification
 
 ```powershell
 Set-Location D:\Dev\Scriptura
 cargo test --locked --features test-support -- --test-threads=1
 cargo build --release
-cargo build --release --no-default-features   # 管理画面（ui feature）を含まないビルド
+cargo build --release --no-default-features   # a build without the admin UI (the ui feature)
 git diff --check
 ```
 
-テストはローカルの隔離 Git リポジトリとネイティブスタブを使い、実際の Claude CLI や外部リポジトリを呼びません。`validation` フォルダー（または `SCRIPTURA_TEST_BASE` で指定した場所）は自動削除しないので、出力された絶対パスを確認して Prunlet で清掃してください。`hook-test-stub` は `test-support` feature 専用で、配置しません。
+Verification of the Setup edition (Velopack) is isolated as follows so that it never touches the real installation, `~/.claude/settings.json`, or the HKCU Run value.
+
+- Use a test packId (for example `ScripturaVelopackTest`; do not use `ScripturaApp`) and an `--installto` under an external working folder.
+- Point `SCRIPTURA_HOME`, `CLAUDE_CONFIG_DIR`, and `TEMP`/`TMP` at the working folder on a per-process basis (on macOS and Linux, also `HOME` and `XDG_CONFIG_HOME`).
+- Build the executable with `cargo build --release --features update-feed-test`. Only builds with this feature read `SCRIPTURA_UPDATE_FEED_DIR` (makes the update source a local folder) and `SCRIPTURA_UPDATE_ALLOW_UNSIGNED=1` (allows applying unsigned packages). Never include it in production builds.
+- When finished, remove the test Run value (`<test packId> Update`), the uninstall information, and the install location.
+- The registry unit tests use a dedicated hive confined to a file (`RegLoadAppKeyW`), not the real Run key.
+
+The tests use local isolated Git repositories and native stubs, and do not call the real Claude CLI or any external repository. The `validation` folder (or the location given by `SCRIPTURA_TEST_BASE`) is not deleted automatically, so check the absolute path that is printed and clean it up with Prunlet. `hook-test-stub` is exclusive to the `test-support` feature and is not deployed.

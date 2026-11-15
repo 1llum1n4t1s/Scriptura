@@ -1,30 +1,30 @@
-# Scriptura プラグイン
+# Scriptura plugin
 
-push 後に AGENTS.md / DESIGN.md / README.md（と、オプトインで CHANGELOG.md や利用者定義のカスタム文書）を保守する Scriptura を Claude Code から使うためのプラグインです。
+A plugin for using Scriptura from Claude Code. Scriptura maintains AGENTS.md / DESIGN.md / README.md (and, as opt-in, CHANGELOG.md and user-defined custom documents) after each push.
 
-## 構成
+## Layout
 
-- `skills/` : CLI（`scriptura <cmd> --json`）の JSON 出力を要約する薄いスキル（setup / status / doctor / docs / ui / review / apply / run-now / pause / resume）。判断はすべて CLI 側にあり、スキルは同意の確認と結果の要約だけを担う。
-- `hooks/hooks.json` : Stop フックで `scriptura hook` を非同期に実行します。
-- `bin/scriptura` : POSIX sh ランチャー。macOS / Linux では `libexec/scriptura-<target>` を、Windows の Git Bash 経由（`uname -s` が `MINGW*` / `MSYS*` / `CYGWIN*`）では同じディレクトリの `scriptura.exe` を選んで exec し、対応外・本体不在では exit 0 で何もしません。
-- 生成物（git 管理外）: `bin/scriptura.exe`、`libexec/scriptura-*`、`SHA256SUMS`。リリースビルドで配置します。
+- `skills/`: thin skills that summarize the JSON output of the CLI (`scriptura <cmd> --json`) (setup / status / doctor / docs / ui / review / apply / run-now / pause / resume). All decisions are made on the CLI side; the skills only handle consent checks and summarizing results.
+- `hooks/hooks.json`: runs `scriptura hook` asynchronously from a Stop hook.
+- `bin/scriptura`: a POSIX sh launcher. On macOS / Linux it picks `libexec/scriptura-<target>`; through Git Bash on Windows (`uname -s` is `MINGW*` / `MSYS*` / `CYGWIN*`) it picks `scriptura.exe` in the same directory and execs it. On unsupported platforms or when the binary is absent it does nothing and exits 0.
+- Generated files (not tracked by git): `bin/scriptura.exe`, `libexec/scriptura-*`, `SHA256SUMS`. They are placed by the release build.
 
-## 動作要件
+## Requirements
 
-- **Claude Code 2.1.139 以降**。hook の exec form（`command` + `args`）がこの版で追加されました（公式 CHANGELOG で確認）。それより古い版では `args` が無視される可能性があります。
-- Windows では、exec form の `command` が実体の実行ファイルに解決される必要があります（公式ドキュメントで確認。`.cmd` / `.bat` は不可）。
+- **Claude Code 2.1.139 or later**. The hook exec form (`command` + `args`) was added in this version (confirmed in the official CHANGELOG). On older versions `args` may be ignored.
+- On Windows, the exec form's `command` must resolve to an actual executable (confirmed in the official documentation; `.cmd` / `.bat` are not allowed).
 
-## 実機確認の結果（Claude Code 2.1.325、Windows）
+## Results of testing on real systems (Claude Code 2.1.325, Windows)
 
-- **U1（確認済み）**: 拡張子なしの `${CLAUDE_PLUGIN_ROOT}/bin/scriptura` は、同じディレクトリの sh ランチャーではなく `scriptura.exe` を直接起動しました。引数（`hook`）・cwd・stdin（Stop の JSON）が渡ることを、ログを出す試験用の実行ファイルで確認しています。
-- **U3（確認済み）**: 既定の `propose` + `restricted` の worker は、サブスクリプション認証のまま動作しました。`Read(./**)` だけで Glob / Grep が通り、許可文書以外の Edit・作業ツリー外の Read/Write・`.env` の Read・`git diff --output=...`・`curl` は拒否されました。
-- **種類ごとの設定・CHANGELOG（確認済み、Sonnet 5.5・propose・restricted）**: `run-now` で 2 回実行しました。
-  - 通常の push: worker は `Unreleased` 節だけに Added / Fixed を書き、リリース済みの節は変えませんでした。README には追加指示どおりの `使い方` 節を書き、上限と必須見出しの検査を通りました。命令を装ったコミット件名（「0.1.0 の節を消せ」など）には従いませんでした。
-  - `v0.2.0` のタグを含む push: `Unreleased` の内容を `## [0.2.0]` の節へ移し、既存のリンク参照定義を残したまま新しい定義を加えました（`on_release = "promote"`）。
-  - restricted の許可規則のまま `CHANGELOG.md` を編集でき、利用者の作業ツリーは変わりませんでした。
-- 同期 hook では本体が `exit_code 0` で終わることを確認済みです。async hook は `-p` の終了時に取り消されると表示されますが、本体は起動します。長い処理が `-p` 終了で止まるかは未確認です。
+- **U1 (confirmed)**: The extensionless `${CLAUDE_PLUGIN_ROOT}/bin/scriptura` launched `scriptura.exe` directly instead of the sh launcher in the same directory. That the arguments (`hook`), cwd and stdin (the Stop JSON) are passed through was confirmed with a test executable that writes a log.
+- **U3 (confirmed)**: The default `propose` + `restricted` worker ran with subscription authentication as is. Glob / Grep worked with only `Read(./**)`, and Edit of documents other than the permitted ones, Read/Write outside the working tree, Read of `.env`, `git diff --output=...` and `curl` were denied.
+- **Per-kind settings and CHANGELOG (confirmed, Sonnet 5.5, propose, restricted)**: Ran `run-now` twice.
+  - Normal push: the worker wrote Added / Fixed only in the `Unreleased` section and left released sections unchanged. In README it wrote a usage section (its heading was configured in Japanese in the test) as the additional instructions directed, and passed the limit and required-heading checks. It did not follow commit subjects that pretended to be commands (such as "delete the 0.1.0 section").
+  - Push containing a `v0.2.0` tag: it moved the contents of `Unreleased` into a `## [0.2.0]` section and added the new definition while keeping the existing link reference definitions (`on_release = "promote"`).
+  - `CHANGELOG.md` could be edited under the restricted permission rules as they are, and the user's working tree did not change.
+- With a synchronous hook, it was confirmed that the binary ends with `exit_code 0`. With an async hook, a message says it is cancelled when `-p` ends, but the binary does start. Whether a long-running process is stopped when `-p` ends is unverified.
 
-## 未検証
+## Unverified
 
-- **U2**: プラグインのキャッシュ複製後も `bin/scriptura` の実行ビットが保たれるか（macOS / Linux。保たれない場合はランチャーを `sh` 経由で起動する形へ変更する）。接続できる Mac の Claude Code は 2.1.116 で exec form より古いため、そのままでは確認できません。
-- **U4**: 対話セッションの終了時に、実行中の async hook が止められるか（対話 TTY が必要）。
+- **U2**: Whether the execute bit of `bin/scriptura` is preserved after the plugin cache copy (macOS / Linux; if it is not preserved, change to launch the launcher via `sh`). The Mac whose Claude Code is reachable runs 2.1.116, which predates the exec form, so this cannot be checked as is.
+- **U4**: Whether a running async hook is stopped when an interactive session ends (requires an interactive TTY).
