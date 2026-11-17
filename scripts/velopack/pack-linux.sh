@@ -5,9 +5,11 @@
 #   <id>-<channel>.AppImage（固定名。最新版を指す）、<id>-<版>-<channel>.AppImage（版付きの不変名）、
 #   <id>-<版>-<channel>-full.nupkg、releases.<channel>.json、assets.<channel>.json、RELEASES-<channel>
 # channel は x86_64 が linux-x64、aarch64 が linux-arm64。配信は scripts/velopack/publish-r2.ps1 -Channel <channel>
-# が行う（実行は本人の明示の依頼があるときだけ）。共通仕様は D:\Dev\APP-DISTRIBUTION.md。
+# が行う。配信元は GitHub Actions の ubuntu-24.04 / ubuntu-24.04-arm ランナー（.github/workflows/release-velopack.yml の
+# linux-installer。glibc 2.39 以下に固定するため ubuntu-24.04 を使う）。手元の Linux でも実行できる（実行は本人の明示の
+# 依頼があるときだけ）。共通仕様は D:\Dev\APP-DISTRIBUTION.md。
 #
-# 使い方（梱包するのと同じ CPU の Linux で実行する。GitHub の ubuntu-latest / ubuntu-24.04-arm を想定）:
+# 使い方（梱包するのと同じ CPU の Linux で実行する。GitHub の ubuntu-24.04 / ubuntu-24.04-arm を想定）:
 #   pack-linux.sh <空の絶対パスの作業フォルダー> [--pack-id <id>] [--version <x.y.z>] [--binary <path>]
 #
 #   検証用（本番では使わない）:

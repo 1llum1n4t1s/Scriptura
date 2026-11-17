@@ -19,7 +19,7 @@ Scriptura 會在你 push 到自己的儲存庫之後，於背景維護 `AGENTS.m
 
 ### Setup 版（自動更新）
 
-執行 `ScripturaApp-win-Setup.exe`（Windows；macOS 為 `.pkg`，Linux 為 AppImage）即可以每位使用者為單位安裝，不需要系統管理員權限（在 Windows 上的安裝位置為 `%LOCALAPPDATA%\ScripturaApp\current\scriptura.exe`）。更新由 `https://scriptura-updates.kagayoi.com` 提供（Velopack 的摘要來源檔名為 `releases.<channel>.json`，頻道有 `win` / `osx` / `linux-x64` / `linux-arm64`），Windows 版本以 Certum 憑證簽署。
+執行 `ScripturaApp-win-Setup.exe`（Windows）、`ScripturaApp-osx-Setup.pkg`（macOS）或 AppImage `ScripturaApp-linux-x64.AppImage` / `ScripturaApp-linux-arm64.AppImage`（Linux x64 / arm64）即可以每位使用者為單位安裝，不需要系統管理員權限（在 Windows 上的安裝位置為 `%LOCALAPPDATA%\ScripturaApp\current\scriptura.exe`）。更新由 `https://scriptura-updates.kagayoi.com` 提供（Velopack 的摘要來源檔名為 `releases.<channel>.json`，頻道有 `win` / `osx` / `linux-x64` / `linux-arm64`）。Windows 版本以 Certum 憑證簽署，macOS 版本以 Developer ID 簽署並已公證。執行需求：macOS 11 以上的 Apple Silicon（不支援 Intel）；Linux 需要 glibc 2.39 以上。
 
 - **自動註冊**：安裝時（Windows 為安裝 hook；macOS 與 Linux 為安裝後第一次不帶參數的啟動），Claude Code `settings.json` 中的 Stop hook 會被指向 Setup 版的執行檔。只會取代 Scriptura 自己的 hook（指向舊版單機安裝 `%LOCALAPPDATA%\Programs\Scriptura\bin\scriptura.exe` 的 hook 會被換成 Setup 版的，舊檔案不會被刪除）。既有的 `agents-maintenance` hook 不會被取代；`status` / `doctor` / 不帶參數的啟動會提示你使用 `scriptura connect claude-code --apply`。
 - **避免與外掛程式重複**：若 `settings.json` 的 `enabledPlugins` 中啟用了 `scriptura@*`，Setup 版就不會註冊到 `settings.json`（否則維護會執行兩次）。請擇一：繼續使用外掛程式，或停用外掛程式並改用 Setup 版。停用之後，會在不帶參數的啟動或下一次登入時自動完成註冊。
@@ -302,7 +302,7 @@ CLI、hook 與安裝程式的指引輸出提供 9 種語言（ja、en、zh-CN、
 
 ## 不支援／未驗證
 
-- macOS / Linux 尚未在實機上驗證（開發與驗證都在 Windows 上進行）。macOS Intel 不在支援範圍內。Setup 版針對 macOS 與 Linux 的程式碼（LaunchAgent、XDG autostart、處理程序偵測，以及簽署與位置檢查）是 Remnifold 實作的移植，甚至還沒有在 Windows 上確認過是否能編譯。
+- 尚未在實機上驗證任何項目（開發與驗證都在 Windows 上進行）。已設定在 GitHub 提供的執行器上以 CI 檢查：Linux（x64 / arm64）執行 Setup 版的隔離 E2E，macOS 進行建置、測試、簽署與公證；在 macOS 上套用更新尚未驗證。macOS Intel 不在支援範圍內。Setup 版針對 macOS 與 Linux 的程式碼（LaunchAgent、XDG autostart、處理程序偵測，以及簽署與位置檢查）是 Remnifold 實作的移植，甚至還沒有在 Windows 上確認過是否能編譯（僅在 CI 中確認）。
 - 不支援在管理介面（`ui`）中切換自動更新（請使用 `scriptura update --auto on|off`）。
 - 在 Windows 上，登入時的 Run 值不會繼承 `SCRIPTURA_HOME`（macOS 的 LaunchAgent 與 Linux 的 autostart 項目則會）。
 - 在非 Windows 平台上，恢復在 worker 執行中被中斷的維護時會被略過（沒有辦法確認 worker 已結束）。

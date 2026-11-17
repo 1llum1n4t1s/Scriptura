@@ -19,7 +19,7 @@ Claude Code 플러그인으로 설치하면 Stop hook과 운영용 스킬(`/scri
 
 ### Setup 판(자동 업데이트)
 
-`ScripturaApp-win-Setup.exe`(Windows. macOS는 `.pkg`, Linux는 AppImage)를 실행하면 관리자 권한 없이 사용자 단위로 설치됩니다(Windows의 설치 위치는 `%LOCALAPPDATA%\ScripturaApp\current\scriptura.exe`입니다). 업데이트는 `https://scriptura-updates.kagayoi.com`에서 제공되며(`releases.<channel>.json`이라는 이름의 Velopack 피드이고 채널은 `win` / `osx` / `linux-x64` / `linux-arm64`), Windows 배포물은 Certum 인증서로 서명되어 있습니다.
+`ScripturaApp-win-Setup.exe`(Windows), `ScripturaApp-osx-Setup.pkg`(macOS) 또는 AppImage `ScripturaApp-linux-x64.AppImage` / `ScripturaApp-linux-arm64.AppImage`(Linux x64 / arm64)를 실행하면 관리자 권한 없이 사용자 단위로 설치됩니다(Windows의 설치 위치는 `%LOCALAPPDATA%\ScripturaApp\current\scriptura.exe`입니다). 업데이트는 `https://scriptura-updates.kagayoi.com`에서 제공되며(`releases.<channel>.json`이라는 이름의 Velopack 피드이고 채널은 `win` / `osx` / `linux-x64` / `linux-arm64`), Windows 배포물은 Certum 인증서로 서명되어 있고 macOS 배포물은 Developer ID로 서명되어 공증을 마쳤습니다. 요구 사항: Apple Silicon의 macOS 11 이상(Intel은 지원하지 않음), glibc 2.39 이상의 Linux.
 
 - **등록은 자동입니다**: 설치 시점(Windows에서는 install hook, macOS와 Linux에서는 설치 후 인수 없이 처음 실행할 때)에 Claude Code `settings.json`의 Stop hook이 Setup 판의 실행 파일을 가리키도록 설정됩니다. Scriptura 자신의 hook만 교체합니다(이전 단독 설치 `%LOCALAPPDATA%\Programs\Scriptura\bin\scriptura.exe`를 가리키는 hook은 Setup 판의 것으로 교체되며, 이전 파일은 삭제하지 않습니다). 기존 `agents-maintenance` hook은 교체하지 않으며, `status` / `doctor` / 인수 없는 실행에서 `scriptura connect claude-code --apply`를 안내합니다.
 - **플러그인과의 중복 방지**: `settings.json`의 `enabledPlugins`에서 `scriptura@*`가 활성화되어 있으면 Setup 판은 `settings.json`에 등록하지 않습니다(등록하면 유지 관리가 두 번 실행되기 때문입니다). 플러그인을 계속 사용하거나, 플러그인을 비활성화하고 Setup 판으로 전환하는 것 중 하나를 선택하십시오. 비활성화한 뒤에는 인수 없는 실행 또는 다음 로그온 시 자동으로 등록됩니다.
@@ -302,7 +302,7 @@ CLI, hook, 설치 프로그램의 안내 출력은 9개 언어(ja, en, zh-CN, zh
 
 ## 지원하지 않음 / 검증하지 않음
 
-- macOS / Linux는 실제 하드웨어에서 검증되지 않았습니다(개발과 검증은 Windows에서 수행합니다). macOS Intel은 대상이 아닙니다. Setup 판의 macOS와 Linux용 코드(LaunchAgent, XDG autostart, 프로세스 감지, 서명 및 위치 검사)는 Remnifold 구현을 이식한 것이며 Windows에서 컴파일되는지조차 확인되지 않았습니다.
+- 실제 하드웨어에서는 아무것도 검증하지 않았습니다(개발과 검증은 Windows에서 수행합니다). GitHub 제공 러너의 CI에서 Linux(x64 / arm64)는 Setup 판의 격리 E2E로, macOS는 빌드·테스트·서명·공증으로 확인하도록 구성했습니다. macOS에서의 업데이트 적용은 검증하지 않았습니다. macOS Intel은 대상이 아닙니다. Setup 판의 macOS와 Linux용 코드(LaunchAgent, XDG autostart, 프로세스 감지, 서명 및 위치 검사)는 Remnifold 구현을 이식한 것이며 Windows에서 컴파일되는지조차 확인되지 않았습니다(CI에서만 확인합니다).
 - 관리 화면(`ui`)에서 자동 업데이트를 전환하는 것은 지원하지 않습니다(`scriptura update --auto on|off`를 사용하십시오).
 - Windows에서 로그온 Run 값은 `SCRIPTURA_HOME`을 상속하지 않습니다(macOS의 LaunchAgent와 Linux의 autostart 항목은 상속합니다).
 - Windows 이외의 플랫폼에서는, worker가 실행 중이던 도중에 중단된 유지 관리의 재개는 건너뜁니다(worker가 종료되었는지 확인할 방법이 없습니다).

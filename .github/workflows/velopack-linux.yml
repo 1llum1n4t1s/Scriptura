@@ -42,7 +42,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # glibc の下限が黙って上がらないよう、ubuntu-latest ではなく ubuntu-24.04（glibc 2.39）に固定する
+          # （release-velopack.yml の linux-installer と同じ）。
+          - os: ubuntu-24.04
             arch: x64
           - os: ubuntu-24.04-arm
             arch: arm64
@@ -124,7 +126,7 @@ jobs:
 
       - name: Test on Linux
         env:
-          # x64 のランナー（ubuntu-latest）は空きが少なく、テスト用バイナリ約 13 本のデバッグ情報で
+          # x64 のランナー（ubuntu-24.04）は空きが少なく、テスト用バイナリ約 13 本のデバッグ情報で
           # ディスクが尽きて「No space left on device」でジョブごと落ちた。デバッグ情報を作らず、
           # 増分ビルドの中間物も残さない（テストの判定には不要）。
           CARGO_PROFILE_DEV_DEBUG: '0'

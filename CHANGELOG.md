@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- macOS（Apple Silicon、11 以降）と Linux（x64・arm64、glibc 2.39 以降）向けの Setup を配信する。macOS は Developer ID で署名して公証した `.pkg`、Linux は AppImage で、Windows と同じ自動更新の仕組みで配信する。
+
 ## [1.0.0] - 2026-11-18
 
 ### Removed

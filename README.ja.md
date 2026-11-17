@@ -19,7 +19,7 @@ Claude Code のプラグインとして入れると、Stop hook と操作用の�
 
 ### Setup 版（自動更新）
 
-`ScripturaApp-win-Setup.exe`（Windows。macOS は `.pkg`、Linux は AppImage）を実行すると、管理者権限なしで利用者ごとに導入されます（Windows の導入先は `%LOCALAPPDATA%\ScripturaApp\current\scriptura.exe`）。配信元は `https://scriptura-updates.kagayoi.com`（Velopack のフィード `releases.<channel>.json`、チャネルは `win` / `osx` / `linux-x64` / `linux-arm64`）で、Windows の配布物は Certum の署名付きです。
+Windows は `ScripturaApp-win-Setup.exe`、macOS は `ScripturaApp-osx-Setup.pkg`、Linux（x64 / arm64）は AppImage の `ScripturaApp-linux-x64.AppImage` / `ScripturaApp-linux-arm64.AppImage` を実行すると、管理者権限なしで利用者ごとに導入されます（Windows の導入先は `%LOCALAPPDATA%\ScripturaApp\current\scriptura.exe`）。配信元は `https://scriptura-updates.kagayoi.com`（Velopack のフィード `releases.<channel>.json`、チャネルは `win` / `osx` / `linux-x64` / `linux-arm64`）です。Windows の配布物は Certum の署名付き、macOS の配布物は Developer ID で署名して公証済みです。動作要件は、macOS が 11 以降の Apple Silicon（Intel は非対応）、Linux が glibc 2.39 以降です。
 
 - **登録は自動**: 導入時（Windows はインストールのフック、macOS・Linux は導入後の引数なしの起動）に、Claude Code の `settings.json` の Stop hook を Setup 版の実行ファイルへ向けます。置き換えるのは Scriptura 自身の hook だけです（旧単独導入 `%LOCALAPPDATA%\Programs\Scriptura\bin\scriptura.exe` を指す hook は Setup 版へ置き換わり、旧ファイルは消しません）。従来の `agents-maintenance` の hook は置き換えず、`status` / `doctor` / 引数なしの起動で `scriptura connect claude-code --apply` を案内します。
 - **プラグインとの重複を避ける**: `settings.json` の `enabledPlugins` で `scriptura@*` が有効なら、Setup 版は `settings.json` へ登録しません（二重に保守が動くため）。プラグインを使い続けるか、プラグインを無効にして Setup 版へ切り替えるかを選んでください。無効にした後は、引数なしの起動か次回ログオンで自動的に登録します。
@@ -302,7 +302,7 @@ CLI・hook・インストーラー案内の出力は 9 言語（ja・en・zh-CN�
 
 ## 未対応・未検証
 
-- macOS / Linux は実機で未検証です（Windows で開発・検証しています）。macOS Intel は対象外です。Setup 版の macOS・Linux 向けのコード（LaunchAgent・XDG autostart・プロセス検出・署名と置き場の検査）は Remnifold の実装を移植したもので、Windows 上ではコンパイルも確かめていません。
+- 実機では何も検証していません（Windows で開発・検証しています）。GitHub 提供のランナー上の CI で、Linux（x64 / arm64）は Setup 版の隔離 E2E、macOS はビルド・テスト・署名・公証を確かめる構成にしています。macOS での更新の適用は未検証です。macOS Intel は対象外です。Setup 版の macOS・Linux 向けのコード（LaunchAgent・XDG autostart・プロセス検出・署名と置き場の検査）は Remnifold の実装を移植したもので、Windows 上ではコンパイルも確かめていません（CI でだけ確かめます）。
 - 管理画面（`ui`）での自動更新の切り替えは未対応です（`scriptura update --auto on|off` を使います）。
 - Windows のログオン時の Run 値は `SCRIPTURA_HOME` を引き継ぎません（macOS の LaunchAgent と Linux の autostart は引き継ぎます）。
 - 非 Windows では、worker 実行中に中断した保守の再開を見送ります（終了確認の手段が無いため）。

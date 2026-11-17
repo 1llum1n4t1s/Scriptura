@@ -4,13 +4,14 @@
 # （Setup・releases.<channel>.json・full nupkg など）。アプリの自動更新は releases.<channel>.json と
 # full nupkg を読むため、Setup だけでなくこれらも置く必要がある。
 #
-# 実行環境: PowerShell 7.2+（Windows の手元、または GitHub Actions の windows-latest）。.NET 同梱の HttpClient だけを使う。
+# 実行環境: PowerShell 7.2+（Windows の手元、または GitHub Actions の windows-latest・macos-15・ubuntu-24.04・
+# ubuntu-24.04-arm。release-velopack.yml の 4 つの job がそれぞれ自分のチャネルを配信する）。.NET 同梱の HttpClient だけを使う。
 # 方式は同じ Velopack 1.2.161 で R2 配信している Remnifold / Skilvella / Shisui / Edictora に合わせる
 # （同梱の R2Distribution.Common.ps1 / R2Transfer.Core.cs は同一のコピー。Node.js・Wrangler 不要）。
 # - バケット直下へ置く（プレフィックスなし。Scriptura は Velopack 専用のバケットで、他の配信物と共存しない）。
 # - 版付きの成果物（*.nupkg、版番号を含む名前）は「新規作成のみ」で配信し、既存オブジェクトを上書きしない。
 #   同じ名前が既にあれば内容のハッシュを照合し、一致しなければ失敗する。
-# - 固定名（<packId>-<channel>-Setup.exe、releases.<channel>.json、assets.<channel>.json、RELEASES*）は最新を指すため
+# - 固定名（<packId>-<channel>-Setup.exe・-Setup.pkg・<channel>.AppImage、releases.<channel>.json、assets.<channel>.json、RELEASES*）は最新を指すため
 #   置き換える。クライアントから未配信の nupkg が見える時間を作らないよう、manifest は最後に置く。
 # - Setup は GitHub Release に添付しない（配布の正本は R2 のみ）。
 # - 認証: CI（Environment r2-release）は R2_RELEASE_ACCESS_KEY_ID / R2_RELEASE_SECRET_ACCESS_KEY と

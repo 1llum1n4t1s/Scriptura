@@ -1,0 +1,153 @@
+name: Velopack macOS
+
+# macOS（Apple Silicon）の Setup（Velopack の .pkg）版を、GitHub 提供のランナー（macos-15）でビルドして検証する。
+# R2 へは書かない。Environment も Secrets も使わない（checkout は自動発行の読み取り専用トークンだけを使う）。
+# 署名・公証・配信は release-velopack.yml の macos-installer が行う（ここでは未署名の検証用の一式を作るだけ）。
+#
+# 中身:
+#   1. cargo test --locked --features test-support -- --test-threads=1（macOS で走るもの）と
+#      cargo check --locked --no-default-features --bin scriptura。
+#   2. scripts/velopack/pack-macos.sh で、未署名・テスト用 packId（ScripturaVelopackTest）の 9.0.0 を梱包する
+#      （既定の機能でビルドし、.pkg・nupkg の構成と、nupkg の展開検査まで通す。署名・公証の検査は --sign のときだけ）。
+#   3. 配信の job が使う pwsh（7.2 以上）と R2 の転送コード（Add-Type）が動くこと、Gatekeeper の状態を確かめる。
+# 実行可能な Actions は使わず git で checkout する。Node.js は使わない。
+# macOS 上での Setup 版の導入・更新の E2E（Linux の e2e-linux.sh 相当）は無く、更新の適用は未検証。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      # askama がコンパイル時に読むテンプレート、include_str! で埋め込む資材、tests/plugin_layout.rs が読む
+      # プラグイン、テストの言語を固定する .cargo/config.toml も、変えたらテストを走らせる。
+      - 'templates/**'
+      - 'assets/**'
+      - 'plugins/**'
+      - '.claude-plugin/**'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'scripts/velopack/**'
+      - '.github/workflows/velopack-macos.yml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: velopack-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macos (arm64)
+    runs-on: macos-15
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    env:
+      # 動作要件（macOS 11 以降）に合わせる。release-velopack.yml の macos-installer と同じ。
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+      # vpk 1.2.161 を、ランナーにある新しい .NET でも動かす（ランナーに合う版が無い場合に備える）。
+      DOTNET_ROLL_FORWARD: Major
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+    steps:
+      - name: Check out exact source commit without executable Actions
+        env:
+          CHECKOUT_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo 'Unexpected commit id.' >&2; exit 1; }
+          git init .
+          git config core.autocrlf false
+          git config core.eol lf
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          authorization="$(printf 'x-access-token:%s' "$CHECKOUT_TOKEN" | base64 | tr -d '\r\n')"
+          printf '::add-mask::%s\n' "$authorization"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.https://github.com/.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $authorization"
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          unset GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_0 GIT_CONFIG_COUNT CHECKOUT_TOKEN authorization
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Configure isolated work directories
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/scriptura-velopack-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-osx"
+          test ! -e "$root"
+          mkdir -p "$root"/{tmp,tools,dotnet-home,nuget,validation}
+          {
+            printf 'CI_ROOT=%s\n' "$root"
+            printf 'DOTNET_CLI_HOME=%s/dotnet-home\nNUGET_PACKAGES=%s/nuget\n' "$root" "$root"
+          } >> "$GITHUB_ENV"
+
+      - name: Install locked Rust toolchain
+        run: |
+          set -euo pipefail
+          test "$(uname -s)-$(uname -m)" = 'Darwin-arm64'
+          rustup toolchain install 1.100.0 --profile minimal --target aarch64-apple-darwin
+          rustup default 1.100.0
+
+      - name: Install Velopack CLI 1.2.161 into the work folder
+        run: |
+          set -euo pipefail
+          # dotnet が無いランナーでは、作業フォルダーへ入れる（ランナーの全体には入れない）。
+          if ! command -v dotnet >/dev/null; then
+            curl -fsSL https://dot.net/v1/dotnet-install.sh -o "$CI_ROOT/tools/dotnet-install.sh"
+            bash "$CI_ROOT/tools/dotnet-install.sh" --channel 8.0 --install-dir "$CI_ROOT/tools/dotnet"
+            printf '%s\n' "$CI_ROOT/tools/dotnet" >> "$GITHUB_PATH"
+            printf 'DOTNET_ROOT=%s\n' "$CI_ROOT/tools/dotnet" >> "$GITHUB_ENV"
+            export PATH="$CI_ROOT/tools/dotnet:$PATH" DOTNET_ROOT="$CI_ROOT/tools/dotnet"
+          fi
+          dotnet --version
+          dotnet tool install vpk --version 1.2.161 --tool-path "$CI_ROOT/tools/vpk"
+          printf '%s\n' "$CI_ROOT/tools/vpk" >> "$GITHUB_PATH"
+          # 出力を変数に取ってから照合する（パイプで grep -q が先に終わると、pipefail で誤って失敗になるため）。
+          help="$("$CI_ROOT/tools/vpk/vpk" --skip-updates --help 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g')"
+          grep -q 'Velopack CLI 1\.2\.161' <<<"$help" || { printf '%s\n' "$help"; exit 1; }
+
+      - name: Check whitespace and script syntax
+        run: |
+          set -euo pipefail
+          # 空ツリー（4b825dc…）との比較にして、追跡している全ファイルの行末の空白などを実際に検査する。
+          git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD
+          bash -n scripts/velopack/pack-macos.sh
+          bash -n scripts/velopack/pack-linux.sh
+          bash -n scripts/velopack/e2e-linux.sh
+
+      - name: Check PowerShell, the R2 transfer code, and Gatekeeper
+        run: |
+          set -euo pipefail
+          pwsh -NoProfile -Command '
+            $ErrorActionPreference = "Stop"
+            if ($PSVersionTable.PSVersion -lt [version]"7.2") { throw "PowerShell 7.2 or later is required." }
+            . ./scripts/velopack/R2Distribution.Common.ps1
+            if (-not ("Kagayoi.R2.Transfer" -as [type])) { throw "The R2 transfer code did not load." }
+            Write-Host "PowerShell $($PSVersionTable.PSVersion); the R2 transfer code compiled."'
+          # 署名・公証済みの検査（release-velopack.yml）には Gatekeeper の評価が有効なことが要る。状態を記録する（ここでは変えない）。
+          spctl --status || true
+
+      - name: Test on macOS
+        run: |
+          set -euo pipefail
+          # テストが利用者の設定・状態へ書かないよう、保存場所を作業フォルダーへ隔離する。
+          export SCRIPTURA_HOME="$CI_ROOT/validation/scriptura-home"
+          export NO_PROXY=127.0.0.1,localhost,::1
+          cargo test --locked --features test-support -- --test-threads=1
+
+      - name: Check the build without the management screen
+        # AGENTS.md の検証にある --no-default-features（管理画面 = feature "ui" を含まないビルド）。
+        run: cargo check --locked --no-default-features --bin scriptura
+
+      - name: Pack an unsigned test package (9.0.0)
+        # 本番と同じ構成（既定の機能。update-feed-test なし）でビルドして梱包する。未署名なので配信しない。
+        run: |
+          set -euo pipefail
+          work="$CI_ROOT/pack-9.0.0"
+          mkdir "$work"
+          bash scripts/velopack/pack-macos.sh "$work" --pack-id ScripturaVelopackTest --version 9.0.0 --cargo-target-dir "$CI_ROOT/build"

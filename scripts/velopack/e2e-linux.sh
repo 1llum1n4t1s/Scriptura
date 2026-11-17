@@ -4,7 +4,7 @@
 # 使い方:
 #   e2e-linux.sh <空の絶対パスの作業フォルダー> --old <9.0.0 の packages フォルダー> --new <9.0.1 の packages フォルダー>
 # packages フォルダーは scripts/velopack/pack-linux.sh --pack-id ScripturaVelopackTest --binary <update-feed-test 付き>
-# の出力。実行環境は Linux（x86_64 / aarch64。GitHub の ubuntu-latest / ubuntu-24.04-arm を想定）、bash・python3・
+# の出力。実行環境は Linux（x86_64 / aarch64。GitHub の ubuntu-24.04 / ubuntu-24.04-arm を想定）、bash・python3・
 # coreutils・FUSE（無ければ展開して実行へ切り替える）。
 #
 # 本物の利用者環境に触れないよう、テスト用 packId 以外は受け付けず、HOME・XDG_CONFIG_HOME・SCRIPTURA_HOME・
