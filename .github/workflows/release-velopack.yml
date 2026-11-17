@@ -1,7 +1,5 @@
 name: Release Velopack
 
-# 【未実行の定義】書いただけで、一度も実行していない（CI 実行・R2 書き込み・push は本人の許可が要る）。
-#
 # Scriptura の Windows 版 Setup（Velopack、ユーザー単位）を梱包・署名し、Cloudflare R2 のバケット scriptura-updates
 # （直下。公開 URL https://scriptura-updates.kagayoi.com/）へ配信する。Setup は GitHub Release に添付しない。
 # macOS（scripts/velopack/pack-macos.sh）と Linux（pack-linux.sh と velopack-linux.yml）は、このワークフローの対象外
@@ -11,8 +9,9 @@ name: Release Velopack
 # - 実行可能な Actions を使わない。checkout は git のコマンドで行い、Sigilune はタグを固定して git で取得して導入する。
 #   成果物の受け渡しに upload-artifact が要らないよう、梱包・署名と配信は同じジョブで行う。
 # - 署名の Secrets と R2 の Secrets は、それぞれ使う step だけへ渡す（梱包・ビルド・テストの step には渡さない）。
-# - 手動起動（workflow_dispatch）だけで、release/* ブランチ上でだけ動く（Environment の deployment branch policy も
-#   release/* に限る）。push では起動しない: 公開バケットへの書き込みを、意図しない push で起こさないため。
+# - release/<版> ブランチの push で起動する（リリース手順が release/<版> を作って push したときだけ配信する）。
+#   workflow_dispatch は、push 起点の run が出なかったときの再実行用に残す。どちらも release/* 上でだけ動く
+#   （Environment の deployment branch policy も release/* に限る）。main など他のブランチの push では動かない。
 #   版は release/<版> と Cargo.toml の版の一致で確認する。Scriptura には ci.yml が無いため、配信の前にこのジョブ内で
 #   テスト（cargo test --locked --features test-support -- --test-threads=1）も通す。
 # - 本人が事前に用意するもの（リポジトリの設定。値はここに書かない）:
@@ -23,6 +22,8 @@ name: Release Velopack
 #     署名の Secrets を配信の Secrets から分けたい場合は、署名用の Environment を別に作り、ジョブを分けて
 #     成果物を受け渡す形に変える（その場合は upload-artifact 相当の受け渡し方法を決める必要がある）。
 on:
+  push:
+    branches: ['release/**']
   workflow_dispatch:
 
 permissions:
@@ -35,7 +36,7 @@ concurrency:
 jobs:
   windows-installer:
     name: windows-installer
-    if: github.repository == '1llum1n4t1s/scriptura' && github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/release/')
+    if: github.repository == '1llum1n4t1s/scriptura' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/heads/release/')
     runs-on: windows-latest
     environment: r2-release
     timeout-minutes: 60
