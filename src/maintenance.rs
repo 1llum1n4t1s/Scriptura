@@ -2828,6 +2828,7 @@ pub fn worktree_snapshot_with(
 /// worker の前後の差のうち、許可パス（`allowed`）以外のものを返す。
 /// 事前に変更済みだったパスは、worker が触らなければ指紋が変わらないので対象外になる。
 pub(crate) fn out_of_scope_changes(
+    root: &Path,
     pre: &BTreeMap<String, String>,
     post: &BTreeMap<String, String>,
     allowed: &[String],
@@ -2835,9 +2836,49 @@ pub(crate) fn out_of_scope_changes(
     let keys: BTreeSet<&String> = pre.keys().chain(post.keys()).collect();
     keys.into_iter()
         .filter(|k| pre.get(*k) != post.get(*k))
-        .filter(|k| !allowed.iter().any(|a| normcase(a) == normcase(k)))
+        .filter(|k| !is_allowed_path(root, allowed, k))
         .cloned()
         .collect()
+}
+
+/// `name`（Git 上の綴り）が許可パスのどれかと同じ文書か。`normcase` の一致に加えて、大文字小文字だけが
+/// 違う綴りが実ファイルシステム上で同じファイルを指すとき（macOS 既定の APFS など）も一致とする。
+pub(crate) fn is_allowed_path(root: &Path, allowed: &[String], name: &str) -> bool {
+    allowed
+        .iter()
+        .any(|a| normcase(a) == normcase(name) || same_file_ignoring_case(root, a, name))
+}
+
+/// 大文字小文字を無視して等しい 2 つの相対パスが、作業ツリー上で同じファイルか。
+/// 両方が実在する通常ファイル（シンボリックリンクは辿らず不一致）で、リンク数が 1、dev と inode が一致するときだけ真。
+/// 判定できない（どちらかが無い・Unix 以外）ときは偽（fail-closed）。大文字小文字を区別する
+/// ファイルシステムでは別ファイルなので偽になる。
+pub(crate) fn same_file_ignoring_case(root: &Path, a: &str, b: &str) -> bool {
+    if a.to_lowercase() != b.to_lowercase() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let (Ok(ma), Ok(mb)) = (
+            fs::symlink_metadata(root.join(a)),
+            fs::symlink_metadata(root.join(b)),
+        ) else {
+            return false;
+        };
+        // ハードリンク（リンク数 2 以上）は、大文字小文字を区別するファイルシステムで別名の新しいパスを
+        // 許可パスと同一に見せられるので一致としない。
+        ma.is_file()
+            && mb.is_file()
+            && ma.nlink() == 1
+            && ma.dev() == mb.dev()
+            && ma.ino() == mb.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        false
+    }
 }
 
 pub fn save_publication(path: &Path, state: &mut Value) -> Result<()> {
@@ -3323,7 +3364,7 @@ pub fn publish_locked_with(
             .map(|_| worktree_snapshot_with(root, false));
         match (pre_snapshot, post_snapshot) {
             (Some(pre_snapshot), Some(Ok(post))) => {
-                let bad = out_of_scope_changes(&pre_snapshot, &post, &allowed);
+                let bad = out_of_scope_changes(root, &pre_snapshot, &post, &allowed);
                 if !bad.is_empty() {
                     let record: serde_json::Map<String, Value> = bad
                         .iter()
@@ -3602,5 +3643,107 @@ pub fn publish_locked_with(
                 crate::t!("maint.publish_failed", operation = operation),
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod case_tests {
+    use super::{is_allowed_path, out_of_scope_changes, same_file_ignoring_case};
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("scriptura-case-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 実行環境のファイルシステムが大文字小文字を区別しないか（実際に調べる）。
+    fn insensitive(dir: &Path) -> bool {
+        fs::write(dir.join("Probe.txt"), "x").unwrap();
+        dir.join("probe.txt").exists()
+    }
+
+    #[test]
+    fn differently_cased_name_matches_only_when_it_is_the_same_file() {
+        let dir = scratch("same");
+        let insensitive = insensitive(&dir);
+        fs::write(dir.join("Changelog.md"), "x").unwrap();
+        // 区別しない環境では同じファイル（unix では dev と inode で確かめる）、区別する環境では別物（実在しない）。
+        assert_eq!(
+            same_file_ignoring_case(&dir, "CHANGELOG.md", "Changelog.md"),
+            insensitive && cfg!(unix)
+        );
+        // 綴りが大文字小文字以外で違えば、実在しても一致しない。
+        fs::write(dir.join("other.md"), "x").unwrap();
+        assert!(!same_file_ignoring_case(&dir, "CHANGELOG.md", "other.md"));
+        // 許可パスの判定と差分の判定にも反映される（Windows は `normcase` 側で一致する）。
+        let allowed = vec!["CHANGELOG.md".to_string()];
+        let expect = cfg!(windows) || (insensitive && cfg!(unix));
+        assert_eq!(is_allowed_path(&dir, &allowed, "Changelog.md"), expect);
+        let post = BTreeMap::from([("Changelog.md".to_string(), "M:1".to_string())]);
+        let bad = out_of_scope_changes(&dir, &BTreeMap::new(), &post, &allowed);
+        assert_eq!(bad.is_empty(), expect);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_or_distinct_files_never_match() {
+        let dir = scratch("distinct");
+        // どちらも無い（消された）ときは判定できないので不一致。
+        assert!(!same_file_ignoring_case(
+            &dir,
+            "CHANGELOG.md",
+            "Changelog.md"
+        ));
+        // 大文字小文字を区別しない環境では両方を別々に作れないので、区別する環境だけで確かめる。
+        if !insensitive(&dir) {
+            fs::write(dir.join("CHANGELOG.md"), "a").unwrap();
+            fs::write(dir.join("Changelog.md"), "b").unwrap();
+            assert!(!same_file_ignoring_case(
+                &dir,
+                "CHANGELOG.md",
+                "Changelog.md"
+            ));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_not_followed_as_the_same_file() {
+        let dir = scratch("link");
+        fs::write(dir.join("CHANGELOG.md"), "a").unwrap();
+        std::os::unix::fs::symlink("CHANGELOG.md", dir.join("Changelog.link")).unwrap();
+        // 名前が大文字小文字違いでなくても、リンクは辿らない。
+        assert!(!same_file_ignoring_case(
+            &dir,
+            "CHANGELOG.md",
+            "Changelog.link"
+        ));
+        // 大文字小文字だけ違う名前でも、リンク自体は通常ファイルではないので一致しない。
+        std::os::unix::fs::symlink("CHANGELOG.md", dir.join("Link.md")).unwrap();
+        assert!(!same_file_ignoring_case(&dir, "Link.md", "link.md"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_links_are_not_treated_as_the_same_file() {
+        let dir = scratch("hardlink");
+        fs::write(dir.join("CHANGELOG.md"), "a").unwrap();
+        // 大文字小文字を区別する環境では、別名のハードリンクで新しいパスを許可パスに見せかけられる。
+        if !insensitive(&dir) {
+            fs::hard_link(dir.join("CHANGELOG.md"), dir.join("changelog.md")).unwrap();
+            assert!(!same_file_ignoring_case(
+                &dir,
+                "CHANGELOG.md",
+                "changelog.md"
+            ));
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }

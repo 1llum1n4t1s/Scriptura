@@ -33,9 +33,9 @@
 use crate::config::Permission;
 use crate::kinds::LoadedTemplate;
 use crate::maintenance::{
-    MaintenanceOptions, agents_size_error, build_maintenance_reason_with, maintenance_scope_for,
-    normcase, out_of_scope_changes, publication_paths, run_maintenance_worker_with, safe_relative,
-    state_db_path, with_ancestor_gitignores, worktree_snapshot,
+    MaintenanceOptions, agents_size_error, build_maintenance_reason_with, is_allowed_path,
+    maintenance_scope_for, out_of_scope_changes, publication_paths, run_maintenance_worker_with,
+    safe_relative, state_db_path, with_ancestor_gitignores, worktree_snapshot,
 };
 use crate::process::{Output, capture, command};
 use serde_json::{Value, json};
@@ -567,7 +567,7 @@ pub fn propose_with(
         return Err(crate::t!("proposal.worker_moved_head").into());
     }
     let post = worktree_snapshot(&work)?;
-    let outside = out_of_scope_changes(&pre, &post, &allowed);
+    let outside = out_of_scope_changes(&work, &pre, &post, &allowed);
     if !outside.is_empty() {
         return Err(crate::t!(
             "proposal.worker_outside",
@@ -675,7 +675,7 @@ pub fn propose_with(
     )?);
     if let Some(bad) = names
         .iter()
-        .find(|n| !allowed.iter().any(|a| normcase(a) == normcase(n.as_str())))
+        .find(|n| !is_allowed_path(&work, &allowed, n.as_str()))
     {
         return Err(crate::t!("proposal.worker_outside", paths = bad));
     }
