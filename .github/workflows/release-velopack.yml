@@ -430,7 +430,8 @@ jobs:
           mkdir -m 700 "$dir"
           printf '%s' "$APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64" | base64 --decode > "$dir/application.p12"
           printf '%s' "$APPLE_DEVELOPER_ID_INSTALLER_P12_BASE64" | base64 --decode > "$dir/installer.p12"
-          printf '%s' "$APPLE_NOTARY_API_KEY_P8_BASE64" | base64 --decode > "$dir/notary-key.p8"
+          # Windows で保存した p8 は改行が CRLF のことがあり、notarytool は CR の混じった PEM を invalidAsn1 で拒否する。
+          printf '%s' "$APPLE_NOTARY_API_KEY_P8_BASE64" | base64 --decode | tr -d '\r' > "$dir/notary-key.p8"
           keychain_password="$(openssl rand -hex 24)"
           printf '::add-mask::%s\n' "$keychain_password"
           keychain="$dir/scriptura-signing.keychain-db"
