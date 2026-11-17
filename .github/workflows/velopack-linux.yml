@@ -16,6 +16,13 @@ on:
     paths:
       - 'src/**'
       - 'tests/**'
+      # askama がコンパイル時に読むテンプレート、include_str! で埋め込む資材、tests/plugin_layout.rs が読む
+      # プラグイン、テストの言語を固定する .cargo/config.toml も、変えたらテストを走らせる。
+      - 'templates/**'
+      - 'assets/**'
+      - 'plugins/**'
+      - '.claude-plugin/**'
+      - '.cargo/**'
       - 'Cargo.toml'
       - 'scripts/velopack/**'
       - '.github/workflows/velopack-linux.yml'
@@ -108,8 +115,11 @@ jobs:
       - name: Check whitespace and script syntax
         run: |
           set -euo pipefail
-          git diff --check
+          # クリーンな checkout では作業ツリーと index に差が無く、引数なしの `git diff --check` は常に空になる。
+          # 空ツリー（4b825dc…）との比較にして、追跡している全ファイルの行末の空白などを実際に検査する。
+          git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD
           bash -n scripts/velopack/pack-linux.sh
+          bash -n scripts/velopack/pack-macos.sh
           bash -n scripts/velopack/e2e-linux.sh
 
       - name: Test on Linux
@@ -128,6 +138,14 @@ jobs:
           df -h / "$CI_ROOT" || true
           cargo test --locked --features test-support -- --test-threads=1
           df -h / "$CI_ROOT" || true
+
+      - name: Check the build without the management screen
+        # AGENTS.md の検証にある `--no-default-features`（管理画面 = feature "ui" を含まないビルド）。
+        # コンパイルの可否だけを見るので、ディスクを使う成果物は作らない `cargo check` にする。
+        env:
+          CARGO_PROFILE_DEV_DEBUG: '0'
+          CARGO_INCREMENTAL: '0'
+        run: cargo check --locked --no-default-features --bin scriptura
 
       - name: Build the test executable and pack 9.0.0 / 9.0.1
         run: |

@@ -54,6 +54,8 @@ vpk_help="$(vpk --skip-updates --help 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g')"
 grep -q 'Velopack CLI 1\.2\.161' <<<"$vpk_help" || { echo 'Velopack CLI 1.2.161 is required.' >&2; exit 1; }
 command -v mksquashfs >/dev/null || { echo 'mksquashfs is required (sudo apt install squashfs-tools).' >&2; exit 1; }
 command -v file >/dev/null || { echo 'file is required.' >&2; exit 1; }
+# 版の取り出し（--version 省略時）と nupkg の検査に python3 を使う。ビルドと梱包の後で初めて落ちないよう、先に確かめる。
+command -v python3 >/dev/null || { echo 'python3 is required.' >&2; exit 1; }
 
 case "$(uname -m)" in
   x86_64) target=x86_64-unknown-linux-gnu; channel=linux-x64; machine='x86-64' ;;
