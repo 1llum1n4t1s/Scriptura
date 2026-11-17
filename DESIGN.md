@@ -15,7 +15,7 @@
 | `proposal` | `propose` モード。使い捨てクローンで worker を動かし、更新案（パッチ）を保存・確認・適用・破棄する |
 | `changelog` | CHANGELOG 固有の処理（リリース済みエントリ不変の検査、資料の収集、`promote`） |
 | `ops` | 設定を変える操作と読み取り操作の本体。CLI と管理画面が共有する |
-| `cli` / `ui` | 利用者の入口。`cli` は薄い引数層、`ui` は `127.0.0.1` 限定の SSR 管理画面（feature `ui`） |
+| `cli` / `ui` | 利用者の入口。`cli` は薄い引数層、`ui` は `127.0.0.1` 限定の SSR 管理画面（feature `ui`）。`ui --tray` でタスクトレイ（Windows）・メニューバー（macOS）に常駐できる |
 | `connect` / `app_update` | Claude Code の Stop hook の登録・解除と、Setup（Velopack）版の導入・自動更新 |
 | `locale` | 9 言語の辞書と言語判定 |
 
@@ -44,6 +44,8 @@
 - **`propose` を既定にする**: 作業ツリー・`.git`・remote を変えずに更新案だけを作れるため、他人に配る製品の既定として安全。`push` は `enable --mode push` を明示したときだけ。
 - **hook の経路で tokio を使わない**: hook・CLI は同期の Rust だけで動かす。tokio は管理画面 `ui::run` の中だけで初期化し、feature `ui` を外したビルドでは axum・askama・tokio をリンクしない。
 - **Setup 版は多プロセス型で、適用をログオン時だけにする**: Velopack の Windows の適用が導入先の他プロセスを強制終了するため、日中に適用しない。確認・取得は hook の後に同期で 1 回、適用前に署名者を検証する。
+- **管理画面の常駐は OS の API を直接使い、既定を OFF にする**: トレイ用の crate を足さず（Windows は `Shell_NotifyIconW`、macOS は `NSStatusItem`）、依存と対応のずれを減らす。Linux はデスクトップごとにトレイの仕様が違うため対応しない。常駐は無操作で終了しない代わりに 60 分でセッションを失効させ、「開く」のたびに使い捨て鍵を発行し直すので、常駐が長くても開きっぱなしのタブは使えなくなる。ログオン時の常駐は Setup 版だけの任意機能で、ログオンエントリは増やさず `update-apply` の後に起動する（先に常駐すると更新の適用が `busy` で止まるため）。
+- **worker の費用上限（`max_budget_usd`）は持たない**: worker の使用量はタイムアウトとモデル・effort の設定で調整する（既定は Sonnet の high、1200 秒）。廃止したキーは他の未知キーと同じく拒否し、設定全体を無効にして保守を止める。
 - **プラグインのスキルは CLI を呼ぶ薄い層にする**: 判断・検証・書き込みを `scriptura <cmd> --json` に集め、スキルは同意の確認と要約だけにする。
 
 ## ローカライズ
