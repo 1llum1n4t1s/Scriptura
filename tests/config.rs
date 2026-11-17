@@ -52,7 +52,6 @@ fn defaults_are_safe() {
     assert_eq!(c.worker.model, "claude-sonnet-5-5");
     assert_eq!(c.worker.effort, "high");
     assert_eq!(c.worker.timeout_secs, 1200);
-    assert_eq!(c.worker.max_budget_usd, 0.0);
     assert_eq!(c.worker.permission, Permission::Restricted);
     assert_eq!(c.enrollment.policy, Policy::Explicit);
     // 同意が無ければ全リポジトリ off。
@@ -108,8 +107,9 @@ fn rejects_unknown_keys_and_bad_values() {
         parse("[worker]\nclaude_path = \"relative/claude\""),
         Loaded::Invalid(_)
     ));
+    // 廃止した費用上限（max_budget_usd）は、他の未知キーと同じく拒否する。
     assert!(matches!(
-        parse("[worker]\nmax_budget_usd = -1"),
+        parse("[worker]\nmax_budget_usd = 0.0"),
         Loaded::Invalid(_)
     ));
 }
@@ -184,12 +184,12 @@ fn schema_two_round_trips_and_schema_one_stays_one() {
             .unwrap()
             .contains("schema = 2")
     );
-    let mut ui = ok("schema = 1\n");
-    ui.consent = Some(Consent {
-        version: 1,
-        accepted_at: "2026-01-01T00:00:00Z".into(),
-        source: ConsentSource::Ui,
-    });
+    // 管理画面での同意（設定ファイル上の綴り `source = "ui"`）は、読み取りで ConsentSource::Ui になり、
+    // 保存時に必要な schema を 2 にする。綴りの固定もここで見る。
+    let ui = ok(
+        "schema = 2\n[consent]\nversion = 1\naccepted_at = \"2026-01-01T00:00:00Z\"\nsource = \"ui\"\n",
+    );
+    assert_eq!(ui.consent.as_ref().unwrap().source, ConsentSource::Ui);
     assert_eq!(ui.required_schema(), 2);
 }
 

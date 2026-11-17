@@ -23,5 +23,5 @@
 {% if let Some(reason) = layout.broken %}<p class="notice warning" role="alert">{{ crate::locale::tr1("ui.base.broken", "reason", reason) }}</p>{% endif %}
 {% block content %}{% endblock %}
 </main>
-<footer>{{ crate::locale::tr("ui.base.footer") }}</footer>
+<footer>{% if layout.resident %}{{ crate::locale::tr("ui.base.footer_resident") }}{% else %}{{ crate::locale::tr("ui.base.footer") }}{% endif %}</footer>
 </body></html>

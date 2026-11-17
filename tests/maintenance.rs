@@ -100,6 +100,8 @@ fn uncertain_commit_or_push_from_stop_is_never_automatically_repeated() {
         f.git(&["commit", "-m", "new"]);
         f.git(&["push"]);
         f.stub_git();
+        // 不確実な操作の後に、git スタブが孫（pipe-grandchild）を残す。
+        f.stubs(&["pipe-grandchild"]);
         f.helper_environment();
         f.writes(json!({f.root.join("AGENTS.md").to_str().unwrap():"maintained"}));
         unsafe {
@@ -218,6 +220,7 @@ fn graphql_falsey_errors_match_python_without_skipping_shape_checks() {
 #[test]
 fn null_stdio_with_inherited_windows_handles_still_has_deadline() {
     let f = Fixture::new();
+    f.stubs(&["null-parent", "pipe-grandchild"]);
     f.helper_environment();
     let c = scriptura::process::command(
         f.base
@@ -347,16 +350,10 @@ impl Fixture {
         fs::create_dir_all(&bin).unwrap();
         // 本物の git は、PATH へスタブを足す前に PATH から探す。
         let real = find_real_git();
-        for name in [
-            &exe("claude"),
-            &exe("gh"),
-            &exe("pipe-parent"),
-            &exe("pipe-grandchild"),
-            &exe("managed-host"),
-            &exe("detached-parent"),
-            &exe("null-parent"),
-            &exe("filter"),
-        ] {
+        // 常に置くのは worker（claude）と gh だけ。スタブ 1 本は約 2.6MB あり、全テストで 8 本ずつ
+        // コピーすると `validation/` が膨らむため、残りの役割は使うテストが `stubs` で置く。
+        // 置き忘れは「実行ファイルが無い」で即失敗するので、検査が黙って空洞化することはない。
+        for name in [&exe("claude"), &exe("gh")] {
             fs::copy(env!("CARGO_BIN_EXE_hook-test-stub"), bin.join(name)).unwrap();
         }
         let old_path = env::var_os("PATH").unwrap_or_default();
@@ -492,6 +489,18 @@ impl Fixture {
     }
     fn writes(&self, value: Value) {
         unsafe { env::set_var("HOOK_STUB_WRITES", value.to_string()) }
+    }
+    /// 指定した役割のスタブを `bin/` へ置く（役割はファイル名の file_stem で決まる）。
+    /// `pipe-parent` / `detached-parent` / `null-parent` / `managed-host` は孫として
+    /// `pipe-grandchild` を同じ場所から起動するので、呼び出し側で併せて指定する。
+    fn stubs(&self, roles: &[&str]) {
+        for role in roles {
+            fs::copy(
+                env!("CARGO_BIN_EXE_hook-test-stub"),
+                self.base.join("bin").join(exe(role)),
+            )
+            .unwrap();
+        }
     }
     fn stub_git(&self) {
         fs::copy(
@@ -1054,6 +1063,7 @@ fn malformed_payload_binary_is_fail_open_without_secrets() {
 #[test]
 fn managed_job_closes_inherited_descendant_pipes() {
     let f = Fixture::new();
+    f.stubs(&["pipe-parent", "pipe-grandchild"]);
     unsafe {
         env::set_var("HOOK_CHILD_PID", f.base.join("child.pid"));
     }
@@ -1074,6 +1084,7 @@ fn managed_job_closes_inherited_descendant_pipes() {
 #[test]
 fn managed_job_timeout_kills_descendants() {
     let f = Fixture::new();
+    f.stubs(&["pipe-parent", "pipe-grandchild"]);
     unsafe {
         env::set_var("HOOK_CHILD_PID", f.base.join("child.pid"));
         env::set_var("HOOK_PARENT_SLEEP", "1");
@@ -1192,6 +1203,7 @@ fn oversized_worker_output_is_not_committed() {
 #[test]
 fn clean_filter_expansion_is_retained_without_push() {
     let f = Fixture::new();
+    f.stubs(&["filter"]);
     let mut state = f.checkpoint("ready");
     fs::write(f.root.join("AGENTS.md"), "tiny edited").unwrap();
     state["after"]["AGENTS.md"] = json!(document_hash(&f.root, "AGENTS.md").unwrap());
@@ -1310,6 +1322,7 @@ fn casefold_collisions_are_ambiguous_in_index() {
 #[test]
 fn parent_death_closes_worker_job() {
     let f = Fixture::new();
+    f.stubs(&["managed-host", "pipe-parent", "pipe-grandchild"]);
     unsafe {
         env::set_var("HOOK_CHILD_PID", f.base.join("child.pid"));
         env::set_var("HOOK_PARENT_SLEEP", "1")
@@ -1531,6 +1544,7 @@ fn external_pr_created_before_push_retains_pending_commit() {
 fn unmanaged_pipe_deadline_preserves_helper_after_parent_exit_or_timeout() {
     for parent_running in [false, true] {
         let f = Fixture::new();
+        f.stubs(&["pipe-parent", "pipe-grandchild"]);
         f.helper_environment();
         if parent_running {
             unsafe { env::set_var("HOOK_PARENT_SLEEP", "1") }
@@ -1555,6 +1569,7 @@ fn unmanaged_pipe_deadline_preserves_helper_after_parent_exit_or_timeout() {
 #[test]
 fn unmanaged_success_does_not_kill_detached_helper() {
     let f = Fixture::new();
+    f.stubs(&["detached-parent", "pipe-grandchild"]);
     let exit = f.base.join("child-exit");
     unsafe {
         env::set_var("HOOK_CHILD_PID", f.base.join("child.pid"));
@@ -1921,7 +1936,6 @@ fn restricted_worker_argument_contract_and_settings() {
             model: "model-x".into(),
             effort: "low".into(),
             timeout_secs: 300,
-            max_budget_usd: 2.5,
             permission: Permission::Restricted,
             claude_path: alt.join(exe("claude")).to_string_lossy().into_owned(),
         },
@@ -1973,7 +1987,6 @@ fn restricted_worker_argument_contract_and_settings() {
         ("--effort", "low"),
         ("--permission-mode", "dontAsk"),
         ("--tools", "Read,Edit,Write,Glob,Grep,Bash"),
-        ("--max-budget-usd", "2.5"),
         ("--output-format", "text"),
     ] {
         assert!(pair(args, flag, value), "{flag} {value}");
@@ -2017,20 +2030,9 @@ fn restricted_worker_argument_contract_and_settings() {
     assert_eq!(p["oauth_token_kept"], true);
     assert_eq!(p["worker_env"], "1");
 }
+// bypass の引数一式と費用上限を渡さないことは `compat_golden.rs` の golden が固定している。
 #[test]
-fn worker_args_omit_budget_when_zero_and_keep_bypass_contract() {
-    let worker = Worker {
-        permission: Permission::Bypass,
-        ..Worker::default()
-    };
-    let args = worker_args(&worker, &[], &[]);
-    assert!(!args.iter().any(|a| a == "--max-budget-usd"));
-    assert!(args.iter().any(|a| a == "--dangerously-skip-permissions"));
-    assert!(
-        !args
-            .iter()
-            .any(|a| a == "--safe-mode" || a == "--allowedTools")
-    );
+fn worker_args_never_put_unsafe_paths_into_permission_rules() {
     // 規則として安全に書けないパスは許可規則に出さない。
     let restricted = Worker {
         permission: Permission::Restricted,
@@ -2396,6 +2398,8 @@ fn limit_violation_keeps_ready_and_never_commits_in_any_permission_mode() {
         let state = f.state();
         assert_eq!(state["phase"], "ready", "{permission:?}");
         assert!(state["error"].as_str().unwrap().contains("上限"));
+        // 失敗した保守は種類ごとの最終完了時刻（kind_runs）を記録しない。
+        assert!(f.kind_runs().is_empty(), "{permission:?}");
     }
 }
 
@@ -2894,19 +2898,6 @@ fn unfinished_publication_resumes_with_every_kind_when_some_kind_is_due() {
         "{message}"
     );
     assert_eq!(f.head(), head);
-    assert_eq!(f.state()["phase"], "ready");
-    assert!(f.kind_runs().is_empty());
-}
-
-#[test]
-fn failed_maintenance_does_not_record_kind_runs() {
-    let config = kinds_config(|c| arch(c).max_chars = Some(10));
-    let f = Fixture::with_config(Some(config));
-    f.commit_push_file("docs/ARCHITECTURE.md", "short");
-    f.hook("UserPromptSubmit");
-    f.push_change("limit");
-    f.writes(json!({f.arch_path(): "x".repeat(20)}));
-    assert!(f.hook("Stop").is_some());
     assert_eq!(f.state()["phase"], "ready");
     assert!(f.kind_runs().is_empty());
 }

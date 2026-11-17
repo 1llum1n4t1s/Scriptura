@@ -117,12 +117,6 @@ fn is_maintenance_hook(hook: &Value, own: Option<&Path>) -> bool {
     is_legacy_hook(hook) || is_scriptura_hook_with(hook, own)
 }
 
-/// settings の Stop hook に (Scriptura の登録, 旧 agents-maintenance の登録) があるか。
-pub fn scan_stop_hooks(settings: &Value) -> (bool, bool) {
-    let scan = scan_settings(settings, None);
-    (scan.scriptura_hook, scan.legacy_hook)
-}
-
 /// settings.json の要約（status・doctor・引数なし起動の案内と、Setup 版の登録判断に使う）。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SettingsScan {
@@ -165,11 +159,6 @@ pub fn read_settings_scan(path: &Path, own: Option<&Path>) -> SettingsScan {
     read_settings(path)
         .map(|settings| scan_settings(&settings, own))
         .unwrap_or_default()
-}
-
-/// settings.json で scriptura プラグインが有効か。読めないときは false。
-pub fn plugin_enabled_at(path: &Path) -> bool {
-    read_settings_scan(path, None).plugin_enabled
 }
 
 /// settings から Scriptura 自身の Stop hook だけを取り除き、取り除いた個数を返す（冪等）。
@@ -548,10 +537,11 @@ pub fn run(args: &[String]) -> Result<Value, String> {
             "ok":true,"tool":"claude-code","applied":apply,"remove":true,"settings":path,
             "event":EVENT,"removed":removed,"changed":settings != before
         });
-        if apply && settings != before {
-            if let Some(backup) = write_settings(&path, &settings)? {
-                result["backup"] = json!(backup);
-            }
+        if apply
+            && settings != before
+            && let Some(backup) = write_settings(&path, &settings)?
+        {
+            result["backup"] = json!(backup);
         }
         return Ok(result);
     }
@@ -573,10 +563,11 @@ pub fn run(args: &[String]) -> Result<Value, String> {
         "ok":true,"tool":"claude-code","applied":apply,"executable":executable,"settings":path,
         "event":EVENT,"command":hook_command(&executable)?,"changed":settings != before
     });
-    if apply && settings != before {
-        if let Some(backup) = write_settings(&path, &settings)? {
-            result["backup"] = json!(backup);
-        }
+    if apply
+        && settings != before
+        && let Some(backup) = write_settings(&path, &settings)?
+    {
+        result["backup"] = json!(backup);
     }
     Ok(result)
 }

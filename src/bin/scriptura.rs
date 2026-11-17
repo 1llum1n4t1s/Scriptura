@@ -37,12 +37,17 @@ fn main() -> ExitCode {
         }
         // ログオン時に起動する（HKCU Run・LaunchAgent・XDG autostart）。保留中の更新を、導入先で他の
         // Scriptura が動いていないときだけ、署名者を検証してから再起動なしで適用する。結果は JSON 1 行。
+        // 適用を依頼しなかったときは、設定（Setup 版の `ui --autostart on`）に従って管理画面の常駐を起動する。
         Some("update-apply") => match app_update::update_apply() {
             Ok(outcome) => {
+                if !matches!(outcome, app_update::ApplyOutcome::Applied(_)) {
+                    app_update::start_resident_after_logon_apply();
+                }
                 println!("{}", outcome.to_json());
                 ExitCode::from(outcome.exit_code())
             }
             Err(e) => {
+                app_update::start_resident_after_logon_apply();
                 println!("{}", serde_json::json!({"status":"error","error":e}));
                 ExitCode::from(1)
             }
@@ -65,7 +70,8 @@ fn main() -> ExitCode {
             }
             Err(e) => fail(&e),
         },
-        // 管理画面。常駐はせず、Ctrl+C・画面の「終了」・60 分無操作で終わる。
+        // 管理画面。既定では常駐せず、Ctrl+C・画面の「終了」・60 分無操作で終わる。`--tray` を付けると
+        // タスクトレイ（Windows）・メニューバー（macOS）に常駐する。
         // cli::run は「処理してから出力をまとめて返す」形なので、待ち続けるサーバーはここで直接起動する。
         Some("ui") => ui_command(&args[1..]),
         Some("--version") | Some("-V") => {
@@ -73,7 +79,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         // 引数なしの起動（Setup 直後の初回起動・スタートメニュー・AppImage の直接起動）。Setup 版なら登録を
-        // 同期で確かめて日本語の案内を出す。管理外なら従来の使い方を表示する。
+        // 同期で確かめて案内を出し、対話の起動なら管理画面を常駐させて開く。管理外なら従来の使い方を表示する。
         None if app_update::welcome(startup.first_run) => ExitCode::SUCCESS,
         _ => {
             println!("{}", scriptura::t!("cli.help", version = app::VERSION));

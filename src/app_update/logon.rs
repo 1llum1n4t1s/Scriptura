@@ -250,9 +250,7 @@ mod xdg {
 
     pub fn register_in(dir: &Path, app_id: &str, executable: &Path) -> io::Result<Registration> {
         let path = desktop_path(dir, app_id);
-        let home = std::env::var_os("SCRIPTURA_HOME")
-            .map(PathBuf::from)
-            .filter(|home| home.is_absolute());
+        let home = crate::app_update::scriptura_home();
         let desired = desktop_body(app_id, executable, home.as_deref()).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -491,9 +489,7 @@ mod macos {
 
     pub fn register_in(dir: &Path, app_id: &str, executable: &Path) -> io::Result<Registration> {
         let path = plist_path(dir, app_id);
-        let home = std::env::var_os("SCRIPTURA_HOME")
-            .map(PathBuf::from)
-            .filter(|home| home.is_absolute());
+        let home = crate::app_update::scriptura_home();
         let desired = plist_body(app_id, executable, home.as_deref());
         match read_existing(&path)? {
             None => {
@@ -753,8 +749,10 @@ mod windows {
                 return Ok(Some(String::new()));
             }
             let units: Vec<u16> = buffer[..length as usize]
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
                 .take_while(|unit| *unit != 0)
                 .collect();
             Ok(Some(String::from_utf16_lossy(&units)))

@@ -21,6 +21,7 @@
 //!   違反: 更新案は作らず `Rejected` として
 //!   メタに `status=rejected` と理由だけを残す。処理済み位置は進める（同じ push では worker を再実行しない）。
 //!   run-now（`propose_with` の `force`）のときだけ、棄却済みを無視して作り直す。
+//!
 //! push モードの publication 状態（commit / push の進行記録）には触れない。propose は commit も push も
 //! しないため、その状態機械と競合しない。
 //!
@@ -34,7 +35,7 @@ use crate::kinds::LoadedTemplate;
 use crate::maintenance::{
     MaintenanceOptions, agents_size_error, build_maintenance_reason_with, maintenance_scope_for,
     normcase, out_of_scope_changes, publication_paths, run_maintenance_worker_with, safe_relative,
-    state_db_path, worktree_snapshot,
+    state_db_path, with_ancestor_gitignores, worktree_snapshot,
 };
 use crate::process::{Output, capture, command};
 use serde_json::{Value, json};
@@ -212,6 +213,7 @@ where
 /// - 追加: 新モードが通常ファイル（100644）
 /// - 変更: 旧モードと新モードが同じで、通常ファイル（100644 / 100755）
 /// - 削除: 常に可（削除はリンクやサブモジュールの作成にならない）
+///
 /// シンボリックリンク（120000）・サブモジュール（160000）・種別の入れ替えは、追加・変更とも拒否する。
 fn unsafe_mode_changes(raw: &[u8]) -> Option<String> {
     let mut fields = raw.split(|&b| b == 0).filter(|s| !s.is_empty());
@@ -545,17 +547,10 @@ pub fn propose_with(
         .collect();
 
     // 許可パス = 対象文書 + 各階層の .gitignore（ignore 訂正のため）。相対・`/` 区切り。
+    // 候補集合の生成は push モードと共通。順序は相対文字列のバイト順（BTreeSet<String>）に保つ。
     let mut allowed: BTreeSet<String> = BTreeSet::new();
-    for doc in &docs {
-        allowed.insert(safe_relative(&work, doc)?);
-        let mut parent = doc.parent();
-        while let Some(d) = parent {
-            if !d.starts_with(&work) {
-                break;
-            }
-            allowed.insert(safe_relative(&work, &d.join(".gitignore"))?);
-            parent = d.parent();
-        }
+    for path in with_ancestor_gitignores(&work, &docs) {
+        allowed.insert(safe_relative(&work, &path)?);
     }
     let allowed: Vec<String> = allowed.into_iter().collect();
 
@@ -778,7 +773,6 @@ fn meta_record(
             "effort": options.worker.effort,
             "permission": permission_name(options.worker.permission),
             "timeout_secs": options.worker.timeout_secs,
-            "max_budget_usd": options.worker.max_budget_usd,
         },
         "status": status,
         "applied_at": Value::Null,

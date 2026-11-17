@@ -13,6 +13,8 @@ pub struct Output {
     pub stderr: Vec<u8>,
 }
 pub fn command(program: &str) -> Command {
+    // `mut` は Windows の `creation_flags` 呼び出しにだけ必要。
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut cmd = Command::new(program);
     #[cfg(windows)]
     {
@@ -53,12 +55,12 @@ pub fn capture(
     let deadline = Instant::now() + timeout;
     let mut child = cmd.spawn()?;
     #[cfg(windows)]
-    if let Some(job) = &job {
-        if let Err(e) = job.attach(&child) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e);
-        }
+    if let Some(job) = &job
+        && let Err(e) = job.attach(&child)
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(e);
     }
     let out = child.stdout.take();
     let diagnostic = child.stderr.take();
@@ -140,47 +142,49 @@ pub fn capture(
         }
         Ok(status)
     })();
-    if let Err(error) = work {
-        if !managed {
-            // 正常な Git/SSH helper を終了させず、結果不明として呼出元へ戻す。
-            // 残る pipe thread は、この単発 hook process の終了で解放する。
-            if child.try_wait().ok().flatten().is_none() {
-                let _ = child.kill();
+    let status = match work {
+        Ok(status) => status,
+        Err(error) => {
+            if !managed {
+                // 正常な Git/SSH helper を終了させず、結果不明として呼出元へ戻す。
+                // 残る pipe thread は、この単発 hook process の終了で解放する。
+                if child.try_wait().ok().flatten().is_none() {
+                    let _ = child.kill();
+                }
+                return Err(io::Error::other("process result unconfirmed"));
             }
-            return Err(io::Error::other("process result unconfirmed"));
-        }
-        #[cfg(windows)]
-        if let Some(job) = &job {
-            job.terminate();
-        }
-        let _ = child.kill();
-        let teardown = Instant::now() + Duration::from_secs(15);
-        let reaped = child
-            .wait_timeout(Duration::from_secs(15))
-            .ok()
-            .flatten()
-            .is_some();
-        while completed < count {
-            match rx.recv_timeout(teardown.saturating_duration_since(Instant::now())) {
-                Ok(_) => completed += 1,
-                Err(_) => break,
+            #[cfg(windows)]
+            if let Some(job) = &job {
+                job.terminate();
             }
+            let _ = child.kill();
+            let teardown = Instant::now() + Duration::from_secs(15);
+            let reaped = child
+                .wait_timeout(Duration::from_secs(15))
+                .ok()
+                .flatten()
+                .is_some();
+            while completed < count {
+                match rx.recv_timeout(teardown.saturating_duration_since(Instant::now())) {
+                    Ok(_) => completed += 1,
+                    Err(_) => break,
+                }
+            }
+            #[cfg(windows)]
+            let empty = job.as_ref().is_none_or(|j| j.wait_empty(teardown));
+            #[cfg(not(windows))]
+            let empty = true;
+            if !reaped || completed < count || !empty {
+                return Err(io::Error::other("process termination unconfirmed"));
+            }
+            let _ = reader.join();
+            let _ = diagnostic.join();
+            if let Some(writer) = writer {
+                let _ = writer.join();
+            }
+            return Err(error);
         }
-        #[cfg(windows)]
-        let empty = job.as_ref().is_none_or(|j| j.wait_empty(teardown));
-        #[cfg(not(windows))]
-        let empty = true;
-        if !reaped || completed < count || !empty {
-            return Err(io::Error::other("process termination unconfirmed"));
-        }
-        let _ = reader.join();
-        let _ = diagnostic.join();
-        if let Some(writer) = writer {
-            let _ = writer.join();
-        }
-        return Err(error);
-    }
-    let status = work.unwrap();
+    };
     let _ = reader.join();
     let _ = diagnostic.join();
     if let Some(writer) = writer {

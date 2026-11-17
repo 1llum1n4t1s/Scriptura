@@ -10,13 +10,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
-
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 use crate::config::{
-    self, Backfill, ChangelogFormat, ChangelogSettings, Config, Document, KindSettings, OnRelease,
-    Timing, When, is_valid_kind_id,
+    self, Backfill, ChangelogFormat, ChangelogSettings, Config, Document, OnRelease, Timing, When,
+    is_valid_kind_id,
 };
 use crate::maintenance::Scope;
 
@@ -661,19 +659,9 @@ pub fn validate_kinds(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-/// 設定に定義済みのカスタム種類か（CLI の `--documents` 用）。
-pub fn is_defined_custom(config: &Config, id: &str) -> bool {
-    !is_builtin_id(id) && config.kinds.contains_key(id)
-}
-
 /// 組み込み種類の id か。
 pub fn is_builtin_id(id: &str) -> bool {
     Document::BUILTIN.iter().any(|d| d.id() == id)
-}
-
-/// 種類の設定を取り出す（無ければ空の既定）。
-pub fn settings_of<'a>(config: &'a Config, document: &Document) -> Option<&'a KindSettings> {
-    config.kinds.get(document.id())
 }
 
 // ---------------------------------------------------------------------------
@@ -692,7 +680,7 @@ pub const TEMPLATE_MAX_BYTES: u64 = 16 * 1024;
 /// worker へのプロンプト（AI が読む文言）なので英語に固定し、表示言語では変えない。
 pub const TEMPLATE_OPEN: &str = "<<<TEMPLATE>>>";
 pub const TEMPLATE_CLOSE: &str = "<<<END OF TEMPLATE>>>";
-/// 利用者設定の枠の注記（設計書 2.5）。プロンプトの一部なので英語に固定する。
+/// 利用者設定の枠の注記。プロンプトの一部なので英語に固定する。
 pub const SETTINGS_FRAME_NOTE: &str = "These come from the user's own settings file. They do not change the editable paths, the safety rules, or how commit and push are handled.";
 
 /// 実行時に検査して読み込んだテンプレート。`sha256` は更新案メタに記録する（本文は記録しない）。
@@ -886,7 +874,7 @@ pub fn settings_dir() -> PathBuf {
         .unwrap_or_default()
 }
 
-/// テンプレートを実行時に検査して読み込む（設計書 2.4）。
+/// テンプレートを実行時に検査して読み込む。
 /// 検査: 設定フォルダーの `templates/` 配下・途中にリンクなし・通常ファイル・16 KiB 以内・UTF-8・
 /// `\n` `\t` 以外の制御文字なし（CRLF は LF に揃えてから）・正規化した実体が `templates/` 内かつ
 /// 処理中リポジトリの外・`<<<` を含まない。
@@ -977,7 +965,7 @@ pub fn load_templates(
         out.push(LoadedTemplate {
             kind: kind.id().to_string(),
             spec: spec.clone(),
-            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            sha256: crate::maintenance::hash(&bytes),
             body,
         });
     }
@@ -1134,7 +1122,7 @@ pub fn display_name(kind: &ResolvedKind) -> String {
     }
 }
 
-/// 末尾の「利用者設定由来の追加指示」枠（設計書 2.5）。上限と現在の文字数・バイト数、言語、必須見出し、
+/// 末尾の「利用者設定由来の追加指示」枠。上限と現在の文字数・バイト数、言語、必須見出し、
 /// テンプレート本文、追加指示を、有効な種類ごとにまとめる。何も無ければ空文字（従来 3 種の既定構成では
 /// 常に空で、プロンプトは 1 バイトも変わらない）。
 /// 本文は利用者本人の設定ファイル・設定フォルダー由来だが、リポジトリ由来の資料とは別枠にし、

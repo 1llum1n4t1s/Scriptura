@@ -146,7 +146,7 @@ fn documents_without_sections_must_keep_their_existing_body() {
     // 既存の本文全体（前後の空白を除く）が残っていれば、その前後への追記は可。
     let kept = "# Changelog\n\n- 古い記録 1\n- 古い記録 2\n\n## [Unreleased]\n\n- 新しい記録\n";
     assert_eq!(released_entries_error(Some(before), Some(kept), &[]), None);
-    // 本文の途中に節を差し込むと部分文字列として残らないので違反（設計書の規則 5 のとおり厳密）。
+    // 本文の途中に節を差し込むと部分文字列として残らないので違反（本文が部分文字列として残るかを厳密に見る規則）。
     let inserted = "# Changelog\n\n## [Unreleased]\n\n- 新しい記録\n\n- 古い記録 1\n- 古い記録 2\n";
     assert!(released_entries_error(Some(before), Some(inserted), &[]).is_some());
     let rewritten = "# Changelog\n\n## [Unreleased]\n\n- 古い記録 1 を書き直した\n";
@@ -167,7 +167,13 @@ fn builtin_template_is_keep_a_changelog_with_a_hash_of_the_lf_body() {
     assert!(t.body.contains("## [Unreleased]"));
     assert!(t.body.contains("### Added") && t.body.contains("### Security"));
     use sha2::{Digest, Sha256};
-    assert_eq!(t.sha256, format!("{:x}", Sha256::digest(t.body.as_bytes())));
+    assert_eq!(
+        t.sha256,
+        Sha256::digest(t.body.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
     // 区切り文字を含まないテンプレートは不変検査で節として読める。
     assert!(parse(&t.body).sections.iter().any(|s| s.is_unreleased()));
 }

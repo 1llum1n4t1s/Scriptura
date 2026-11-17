@@ -1,4 +1,4 @@
-// 危険な変更の二段階確認（設計書 9.2-8）と、表示用の行差分。
+// 危険な変更の二段階確認と、表示用の行差分。
 //
 // 判定は設定の差分から行う純粋関数 `dangers(before, after)`。フォームごとのフラグにしないので、
 // どの画面から同じ変更をしても（履歴の復元を含む）同じ規則で確認を挟む。
@@ -24,8 +24,7 @@ pub(crate) struct Pending {
 /// 設定の変更 `before → after` に含まれる危険な変更の説明（利用者向けの文）。空なら確認は不要。
 ///
 /// 対象: push モード化（登録・既定）、propose での登録の追加、権限 bypass 化、自動登録の方針を all / remote-owner にする変更と
-/// remote-owner の owner 追加、費用上限（max_budget_usd）を 0（上限なし）にする変更、カスタム種類の
-/// 対象パスの追加、同意の記録、登録の解除。
+/// remote-owner の owner 追加、カスタム種類の対象パスの追加、同意の記録、登録の解除。
 pub fn dangers(before: &Config, after: &Config) -> Vec<String> {
     let windows = cfg!(windows);
     let effective = |c: &Config, r: &Repository| r.mode.unwrap_or(c.defaults.mode);
@@ -74,9 +73,6 @@ pub fn dangers(before: &Config, after: &Config) -> Vec<String> {
             out.push(crate::t!("ui.danger.owner_added", owner = owner));
         }
     }
-    if after.worker.max_budget_usd == 0.0 && before.worker.max_budget_usd > 0.0 {
-        out.push(crate::t!("ui.danger.budget_removed").into());
-    }
     for (id, settings) in &after.kinds {
         if kinds::is_builtin_id(id) {
             continue;
@@ -114,7 +110,7 @@ pub(crate) fn form_digest(action: &str, pairs: &[(String, String)]) -> String {
         h.update(v.as_bytes());
         h.update([0]);
     }
-    format!("{:x}", h.finalize())
+    crate::maintenance::hex_lower(&h.finalize())
 }
 
 impl AppState {

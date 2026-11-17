@@ -16,7 +16,6 @@ use crate::{
     process::{capture, command},
 };
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -217,6 +216,7 @@ fn config_items(loaded: &Loaded) -> Vec<Value> {
 ///   （保守が見送られ続ける）、どこでも有効でなければ warn。
 /// - `kindsLimits`（info）: 上限が既存文書の現在の大きさより小さい（次の保守は棄却されうる）。
 /// - `kindsChangelog`（info）: push モードで CHANGELOG を保守するリポジトリがある（リリース作業との競合の注意）。
+///
 /// 出力はパス・数・定型の語だけ（設定ファイルや文書の内容は載せない）。読み取りだけで何も書かない。
 fn kinds_items(config: Option<&config::Config>) -> Vec<Value> {
     use config::Document;
@@ -469,7 +469,7 @@ fn parse_sum_line(line: &str) -> Option<(&str, &str)> {
 
 fn file_sha256(path: &Path) -> Option<String> {
     let bytes = fs::read(path).ok()?;
-    Some(format!("{:x}", Sha256::digest(bytes)))
+    Some(crate::maintenance::hash(bytes))
 }
 
 /// 実行中の本体が `<plugin>/bin|libexec/` 配下なら、プラグインの SHA256SUMS と照合する。

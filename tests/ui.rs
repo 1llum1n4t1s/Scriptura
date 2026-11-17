@@ -419,6 +419,157 @@ async fn session_cookie_is_http_only_strict_and_key_is_single_use() {
     assert!(!again.headers().contains_key(header::SET_COOKIE));
 }
 
+/// 常駐（`--tray`）のための鍵の発行し直しとセッションの失効。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reissued_keys_replace_old_ones_and_expired_sessions_are_refused() {
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // 鍵と Cookie だけを見るので、設定・状態の場所は存在しないパスでよい（何も書かれない）。
+    let unused = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("validation")
+        .join("ui-unused");
+    let store = Store::new(unused.join("config.toml"), unused.join("state"));
+    let (state, first) = AppState::new(store, PORT);
+    let app = ui::router(state.clone());
+    let auth = |key: String| {
+        let app = app.clone();
+        async move { app.oneshot(get(&format!("/auth?key={key}"))).await.unwrap() }
+    };
+    let with_cookie = |cookie: String| {
+        let app = app.clone();
+        async move {
+            let mut req = get("/no-such-page");
+            req.headers_mut()
+                .insert(header::COOKIE, cookie.parse().unwrap());
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+    let cookie_of = |res: &axum::response::Response| {
+        res.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    };
+
+    // 発行し直すと、使われなかった前の鍵は無効になる（起動時の鍵も、その次の鍵も）。
+    let second = state.issue_key();
+    assert_eq!(auth(first).await.status(), StatusCode::UNAUTHORIZED);
+    let third = state.issue_key();
+    assert_ne!(second, third);
+    assert_eq!(auth(second).await.status(), StatusCode::UNAUTHORIZED);
+    // 新しい鍵は一度だけ使える。
+    let res = auth(third.clone()).await;
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    let cookie = cookie_of(&res);
+    assert_eq!(auth(third).await.status(), StatusCode::UNAUTHORIZED);
+    // 期限の切れた鍵は使えない。
+    let stale = state.issue_key_for(std::time::Duration::ZERO);
+    let res = auth(stale).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert!(!res.headers().contains_key(header::SET_COOKIE));
+
+    // セッションが有効なあいだは画面に入れる（存在しないページは 404）。
+    assert_eq!(with_cookie(cookie.clone()).await, StatusCode::NOT_FOUND);
+    // 失効させると、未使用の鍵も前の Cookie も無効になる。
+    let unused_key = state.issue_key();
+    state.expire_session();
+    assert_eq!(auth(unused_key).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(with_cookie(cookie.clone()).await, StatusCode::UNAUTHORIZED);
+    // 発行し直せば入り直せる。Cookie の値は前と違う。
+    let res = auth(state.issue_key()).await;
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    let renewed = cookie_of(&res);
+    assert_ne!(renewed, cookie);
+    assert_eq!(with_cookie(renewed).await, StatusCode::NOT_FOUND);
+    assert_eq!(with_cookie(cookie).await, StatusCode::UNAUTHORIZED);
+}
+
+/// 常駐（`--tray`）では、ログインが切れた画面とフッターが常駐の事実に合う文言になる
+/// （コンソールの URL は無く、無操作でも終了しない）。通常起動は従来の文言のまま。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resident_screens_explain_reopening_from_the_tray() {
+    let fx = Fx::new().await;
+    let ja = |path: &str, cookie: Option<&str>| {
+        let mut req = get(path);
+        req.headers_mut()
+            .insert(header::ACCEPT_LANGUAGE, "ja".parse().unwrap());
+        if let Some(cookie) = cookie {
+            req.headers_mut()
+                .insert(header::COOKIE, cookie.parse().unwrap());
+        }
+        req
+    };
+    let body_of = |res: axum::response::Response| async move {
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    };
+
+    // 通常起動: 従来の 401 とフッター。
+    let normal = AppState::new(fx.store.clone(), PORT).0;
+    let app = ui::router(normal);
+    let (status, body) = body_of(app.oneshot(ja("/", None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.contains("が表示した URL"), "{body}");
+    assert!(!body.contains("タスクトレイ"), "{body}");
+    let page = fx.get("/").await;
+    assert!(page.body.contains("60 分操作が無いと終了します"));
+    assert!(!page.body.contains("常駐中"));
+
+    // 常駐: トレイのアイコンから開き直す案内と、ログインが切れるというフッター。
+    let (resident, key) = AppState::new(fx.store.clone(), PORT);
+    resident.set_resident();
+    let app = ui::router(resident);
+    let (status, body) = body_of(app.clone().oneshot(ja("/", None)).await.unwrap()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.contains("タスクトレイ（メニューバー）"), "{body}");
+    assert!(!body.contains("が表示した URL"), "{body}");
+    // 鍵の拒否画面も、常駐では起動し直す案内でなくアイコンから開き直す案内にする（通常起動は従来のまま）。
+    let (status, body) = body_of(
+        app.clone()
+            .oneshot(ja("/auth?key=wrong", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.contains("タスクトレイ（メニューバー）"), "{body}");
+    assert!(!body.contains("起動し直して"), "{body}");
+    let normal = AppState::new(fx.store.clone(), PORT).0;
+    let (status, body) = body_of(
+        ui::router(normal)
+            .oneshot(ja("/auth?key=wrong", None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.contains("起動し直して"), "{body}");
+    assert!(!body.contains("タスクトレイ"), "{body}");
+    let res = app
+        .clone()
+        .oneshot(ja(&format!("/auth?key={key}"), None))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    let cookie = res.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let (status, body) = body_of(app.oneshot(ja("/", Some(&cookie))).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("常駐中。60 分操作が無いとログインが切れます"),
+        "{body}"
+    );
+    assert!(!body.contains("60 分操作が無いと終了します"), "{body}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn posts_require_csrf_and_same_origin() {
     let fx = Fx::new().await;
@@ -428,7 +579,6 @@ async fn posts_require_csrf_and_same_origin() {
         ("model", "claude-sonnet-5-5"),
         ("effort", "high"),
         ("timeout_secs", "1200"),
-        ("max_budget_usd", "1"),
         ("permission", "restricted"),
         ("claude_path", ""),
     ];
@@ -463,7 +613,7 @@ async fn posts_require_csrf_and_same_origin() {
         .unwrap();
     let r = fx.raw(req).await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
-    assert_eq!(fx.config().worker.max_budget_usd, 1.0);
+    assert_eq!(fx.config().worker.timeout_secs, 1200);
 }
 
 // ---------------------------------------------------------------------------
@@ -533,7 +683,6 @@ async fn broken_config_is_shown_but_never_rewritten() {
                 ("model", "m"),
                 ("effort", "high"),
                 ("timeout_secs", "1200"),
-                ("max_budget_usd", "1"),
                 ("permission", "restricted"),
             ],
         )
@@ -546,18 +695,12 @@ async fn broken_config_is_shown_but_never_rewritten() {
 // 版の衝突・二段階確認
 // ---------------------------------------------------------------------------
 
-fn worker_pairs<'a>(
-    rev: &'a str,
-    model: &'a str,
-    permission: &'a str,
-    budget: &'a str,
-) -> Vec<(&'a str, &'a str)> {
+fn worker_pairs<'a>(rev: &'a str, model: &'a str, permission: &'a str) -> Vec<(&'a str, &'a str)> {
     vec![
         ("revision", rev),
         ("model", model),
         ("effort", "high"),
         ("timeout_secs", "1200"),
-        ("max_budget_usd", budget),
         ("permission", permission),
         ("claude_path", ""),
     ]
@@ -570,7 +713,7 @@ async fn stale_revision_is_rejected_with_409_and_file_untouched() {
     let r = fx
         .post(
             "/settings/worker",
-            &worker_pairs(&rev, "model-a", "restricted", "1"),
+            &worker_pairs(&rev, "model-a", "restricted"),
         )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
@@ -583,7 +726,7 @@ async fn stale_revision_is_rejected_with_409_and_file_untouched() {
     let r = fx
         .post(
             "/settings/worker",
-            &worker_pairs(&opened, "model-b", "restricted", "1"),
+            &worker_pairs(&opened, "model-b", "restricted"),
         )
         .await;
     assert_eq!(r.status, StatusCode::CONFLICT);
@@ -593,7 +736,7 @@ async fn stale_revision_is_rejected_with_409_and_file_untouched() {
     let r = fx
         .post(
             "/settings/worker",
-            &worker_pairs("nope", "model-b", "restricted", "1"),
+            &worker_pairs("nope", "model-b", "restricted"),
         )
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
@@ -604,20 +747,16 @@ async fn dangerous_change_needs_a_one_time_nonce_bound_to_the_content() {
     let fx = Fx::new().await;
     let rev = fx.revision();
     let r = fx
-        .post(
-            "/settings/worker",
-            &worker_pairs(&rev, "m", "restricted", "2"),
-        )
+        .post("/settings/worker", &worker_pairs(&rev, "m", "restricted"))
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
     let rev = fx.revision();
-    // 1 回目: bypass 化と費用上限 0 は確認画面を返し、書き込まない。
+    // 1 回目: bypass 化は確認画面を返し、書き込まない。
     let first = fx
-        .post("/settings/worker", &worker_pairs(&rev, "m", "bypass", "0"))
+        .post("/settings/worker", &worker_pairs(&rev, "m", "bypass"))
         .await;
     assert_eq!(first.status, StatusCode::OK);
     assert!(first.body.contains("bypass"));
-    assert!(first.body.contains("費用上限"));
     assert_eq!(fx.revision(), rev);
     let fields = hidden_fields(&first.body);
     assert!(fields.iter().any(|(k, _)| k == "confirm"));
@@ -640,16 +779,15 @@ async fn dangerous_change_needs_a_one_time_nonce_bound_to_the_content() {
     );
     // 正しい手順（確認画面 → 同内容で送信）なら書き込む。
     let r = fx
-        .post_confirmed("/settings/worker", &worker_pairs(&rev, "m", "bypass", "0"))
+        .post_confirmed("/settings/worker", &worker_pairs(&rev, "m", "bypass"))
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     let c = fx.config();
     assert_eq!(c.worker.permission, Permission::Bypass);
-    assert_eq!(c.worker.max_budget_usd, 0.0);
     // 危険でない変更（モデル名だけ）は確認なしで通る。
     let rev = fx.revision();
     let r = fx
-        .post("/settings/worker", &worker_pairs(&rev, "m2", "bypass", "0"))
+        .post("/settings/worker", &worker_pairs(&rev, "m2", "bypass"))
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
     assert_eq!(fx.config().worker.model, "m2");
@@ -658,7 +796,6 @@ async fn dangerous_change_needs_a_one_time_nonce_bound_to_the_content() {
 #[test]
 fn dangers_cover_the_listed_changes() {
     let mut before = Config::default();
-    before.worker.max_budget_usd = 1.0;
     before.repository.push(config::Repository {
         root: "D:/r1".into(),
         remote: None,
@@ -686,7 +823,6 @@ fn dangers_cover_the_listed_changes() {
         &|c| c.enrollment.policy = Policy::RemoteOwner,
         "remote-owner",
     );
-    check(&|c| c.worker.max_budget_usd = 0.0, "費用上限");
     check(
         &|c| {
             c.kinds.insert(
@@ -727,7 +863,7 @@ fn dangers_cover_the_listed_changes() {
     r3.mode = Some(Mode::Off);
     off.repository.push(r3);
     assert!(ui::dangers(&before, &off).is_empty());
-    // 費用上限を 0 から別の値へ、bypass から restricted へ戻す変更は危険ではない。
+    // bypass から restricted へ戻す変更は危険ではない。
     let mut a = before.clone();
     a.worker.permission = Permission::Bypass;
     let mut b = a.clone();
@@ -1132,7 +1268,7 @@ async fn history_lists_backups_and_restore_is_confirmed_when_dangerous() {
     let r = fx
         .post(
             "/settings/worker",
-            &worker_pairs(&rev, "model-1", "restricted", "1"),
+            &worker_pairs(&rev, "model-1", "restricted"),
         )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
@@ -1140,7 +1276,7 @@ async fn history_lists_backups_and_restore_is_confirmed_when_dangerous() {
     let r = fx
         .post(
             "/settings/worker",
-            &worker_pairs(&rev, "model-2", "restricted", "1"),
+            &worker_pairs(&rev, "model-2", "restricted"),
         )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
@@ -1163,17 +1299,14 @@ async fn history_lists_backups_and_restore_is_confirmed_when_dangerous() {
     // bypass の版を作ってから restricted に戻し、bypass の版への復元は確認を挟む。
     let rev = fx.revision();
     let r = fx
-        .post_confirmed(
-            "/settings/worker",
-            &worker_pairs(&rev, "model-b", "bypass", "1"),
-        )
+        .post_confirmed("/settings/worker", &worker_pairs(&rev, "model-b", "bypass"))
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
     let rev = fx.revision();
     let r = fx
         .post(
             "/settings/worker",
-            &worker_pairs(&rev, "model-r", "restricted", "1"),
+            &worker_pairs(&rev, "model-r", "restricted"),
         )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
@@ -1340,7 +1473,7 @@ async fn secrets_never_appear_in_pages() {
     let r = fx
         .post(
             "/settings/worker",
-            &worker_pairs(&rev, "model-x", "restricted", "1"),
+            &worker_pairs(&rev, "model-x", "restricted"),
         )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
@@ -1354,10 +1487,7 @@ async fn secrets_never_appear_in_pages() {
     // 検証エラーの文言（設定の値を含みうる）にも出さない。
     let rev = fx.revision();
     let r = fx
-        .post(
-            "/settings/worker",
-            &worker_pairs(&rev, "", "restricted", "1"),
-        )
+        .post("/settings/worker", &worker_pairs(&rev, "", "restricted"))
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     let mut seen = r.body;

@@ -235,7 +235,11 @@ fn tree_hash(dir: &Path) -> String {
         hasher.update(path.strip_prefix(dir).unwrap().to_string_lossy().as_bytes());
         hasher.update(fs::read(&path).unwrap());
     }
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 #[test]
@@ -276,16 +280,7 @@ fn propose_changes_nothing_of_the_user_repository_and_saves_a_document_only_patc
     assert_eq!(meta["documents"], json!(["README.md"]));
     assert_eq!(meta["worker"]["permission"], "bypass");
     let keys: Vec<_> = meta["worker"].as_object().unwrap().keys().collect();
-    assert_eq!(
-        keys,
-        [
-            "model",
-            "effort",
-            "permission",
-            "timeout_secs",
-            "max_budget_usd"
-        ]
-    );
+    assert_eq!(keys, ["model", "effort", "permission", "timeout_secs",]);
     // カーソルは成功として進む。クローンは残らない。
     let cursor = f.cursor().unwrap();
     assert_eq!(cursor.1, sha);
@@ -726,7 +721,7 @@ fn custom_kind_reaches_the_patch_and_the_meta_records_kinds_and_templates() {
     assert_eq!(meta["kinds"], json!(["readme", "architecture"]));
     assert_eq!(
         meta["templates"],
-        json!([{"id": "architecture", "sha256": format!("{:x}", Sha256::digest(template.as_bytes()))}])
+        json!([{"id": "architecture", "sha256": Sha256::digest(template.as_bytes()).iter().map(|b| format!("{b:02x}")).collect::<String>()}])
     );
     assert_eq!(meta["documents"], json!(["docs/ARCHITECTURE.md"]));
     let patch =

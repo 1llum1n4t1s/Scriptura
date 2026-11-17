@@ -86,7 +86,7 @@ pub enum PollPlan {
     Silent,
 }
 
-/// poll の挙動指定。既存の `poll_repository(root, initialize, cwd)` は `initialize` だけを使う。
+/// poll の挙動指定。
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PollOptions {
     /// 起点の記録だけ行う（UserPromptSubmit 用）。
@@ -102,8 +102,12 @@ fn now() -> f64 {
         .unwrap_or_default()
         .as_secs_f64()
 }
+/// バイト列を小文字 16 進で表す（sha2 0.11 の出力は `LowerHex` を実装しないため、ここで固定する）。
+pub fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 pub fn hash(data: impl AsRef<[u8]>) -> String {
-    format!("{:x}", Sha256::digest(data))
+    hex_lower(&Sha256::digest(data))
 }
 fn s(v: &Value, key: &str) -> String {
     v[key].as_str().unwrap_or("").to_owned()
@@ -729,7 +733,7 @@ pub fn git_ignore_status(root: &Path, path: &Path) -> (String, String) {
         }
         let data = text(r.stdout)?;
         let f: Vec<_> = data.split('\0').collect();
-        if f.len() != 5 || f[4] != "" {
+        if f.len() != 5 || !f[4].is_empty() {
             return Err("could not parse the rule information from git check-ignore".into());
         }
         Ok((
@@ -1030,6 +1034,14 @@ pub fn open_state_db() -> Result<Connection> {
     }
     Ok(db)
 }
+/// 現在の HEAD と upstream の先頭コミット（取得できなければ空文字）。
+/// `push_snapshot` には含めず、新しい push が見込まれる経路（fingerprint 不一致）でだけ
+/// HEAD → upstream の順に 1 回ずつ取得する（「新しい push なし」の毎回の hook で git を 2 回省く）。
+fn head_and_tip(root: &Path, upstream: &str) -> (String, String) {
+    let head = rt(root, &["rev-parse", "HEAD"]).unwrap_or_default();
+    let tip = rt(root, &["rev-parse", upstream]).unwrap_or_default();
+    (head, tip)
+}
 pub fn push_snapshot(root: &Path) -> Option<Value> {
     let upstream = rt(root, &["rev-parse", "--symbolic-full-name", "@{upstream}"])?;
     let branch = rt(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
@@ -1070,7 +1082,7 @@ pub fn push_snapshot(root: &Path) -> Option<Value> {
             .ok()?
     };
     Some(
-        json!({"repo_root":path_string(&fs::canonicalize(root).ok()?),"upstream":upstream,"destination":hash(url),"fingerprint":hash(&raw),"pushed":pushed,"pushed_at":pushed_at,"head":rt(root,&["rev-parse","HEAD"]).unwrap_or_default(),"tip":rt(root,&["rev-parse",&upstream]).unwrap_or_default()}),
+        json!({"repo_root":path_string(&fs::canonicalize(root).ok()?),"upstream":upstream,"destination":hash(url),"fingerprint":hash(&raw),"pushed":pushed,"pushed_at":pushed_at}),
     )
 }
 /// 保守対象の文書（現在存在するもの）。
@@ -1193,7 +1205,7 @@ pub fn build_maintenance_reason_for(
 }
 
 /// 種類ごとの実効設定（`kinds`）に基づくプロンプトを作る。
-/// - 従来 3 種の文面は `build_maintenance_reason_for` と同一（P0 の基準テストで固定）。
+/// - 従来 3 種の文面は `build_maintenance_reason_for` と同一（golden テストで固定）。
 /// - CHANGELOG・カスタム種類は「〈名前〉対象: …。」と記載指針を、その種類が有効なときだけ足す。
 ///   有効でない種類（対象が無く `create_if_missing = false`）はどこにも現れない。
 /// - 種類別の上限・言語・必須見出し・テンプレート・追加指示は、末尾の「利用者設定由来の追加指示」枠にだけ置く。
@@ -1392,7 +1404,7 @@ pub fn build_maintenance_reason_with(
         let (status, detail) = git_ignore_status(root, p);
         reason.push_str(&format!(
             "Effective ignore status of {}: {status} ({detail}). ",
-            list(&[p.clone()])
+            list(std::slice::from_ref(p))
         ))
     }
     // CHANGELOG・カスタム種類の既存の対象の ignore 判定（存在するものだけ。新規作成予定のものは対象外）。
@@ -1401,7 +1413,7 @@ pub fn build_maintenance_reason_with(
             let (status, detail) = git_ignore_status(root, p);
             reason.push_str(&format!(
                 "Effective ignore status of {}: {status} ({detail}). ",
-                list(&[p.clone()])
+                list(std::slice::from_ref(p))
             ))
         }
     }
@@ -1439,7 +1451,7 @@ pub fn build_maintenance_reason_with(
     reason.push_str(&crate::kinds::settings_frame(
         root, scope, &active, templates,
     ));
-    // 未信頼の資料は利用者設定の枠とは別枠で最後に置く（設計書 2.5・8 章）。
+    // 未信頼の資料は利用者設定の枠とは別枠で最後に置く。
     reason.push_str(&changelog_frame);
     reason
 }
@@ -1471,19 +1483,6 @@ fn save_cursor(
     )
     .map_err(err)?;
     Ok(())
-}
-/// 旧来の呼び出し口。設定を持たない互換動作（3 文書・権限バイパス）で処理する。
-/// 新しい呼び出し側は `poll_repository_with` に判定結果の `PollPlan` を渡すこと。
-pub fn poll_repository(root: &Path, initialize: bool, cwd: Option<&str>) -> Result<Option<String>> {
-    poll_repository_with(
-        root,
-        PollOptions {
-            initialize,
-            ..PollOptions::default()
-        },
-        cwd,
-        &PollPlan::Process(MaintenanceOptions::default()),
-    )
 }
 /// 現在の push 状態を処理済みとして記録するだけで、保守は行わない（`enable` 用）。
 /// 有効化前の push を後から一斉に処理してしまわないための起点づくり。
@@ -1535,15 +1534,18 @@ pub fn poll_repository_with(
     if opts.baseline {
         // reflog に push の記録が無ければ upstream の現在位置を起点にする（以後の差分がその先だけになる）。
         let marked = if s(&snapshot, "pushed").is_empty() {
-            s(&snapshot, "tip")
+            rt(root, &["rev-parse", &s(&snapshot, "upstream")]).unwrap_or_default()
         } else {
             s(&snapshot, "pushed")
         };
         save_cursor(&db, &snapshot, &s(&snapshot, "fingerprint"), None, &marked)?;
         return Ok(None);
     }
-    let mut row:Option<(String,Option<String>,String)>=db.query_row("SELECT fingerprint,error,pushed_commit FROM poll_cursors WHERE repo_root=?1 AND upstream=?2 AND destination=?3",params![s(&snapshot,"repo_root"),s(&snapshot,"upstream"),s(&snapshot,"destination")],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(err)?;
-    if row.is_none() {
+    let row:Option<(String,Option<String>,String)>=db.query_row("SELECT fingerprint,error,pushed_commit FROM poll_cursors WHERE repo_root=?1 AND upstream=?2 AND destination=?3",params![s(&snapshot,"repo_root"),s(&snapshot,"upstream"),s(&snapshot,"destination")],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(err)?;
+    // 記録の無い（初めて見る）リポジトリは、空の前回状態から始める。
+    let row = if let Some(row) = row {
+        row
+    } else {
         let started: f64 = db
             .query_row(
                 "SELECT value FROM poll_metadata WHERE name='started_at'",
@@ -1564,33 +1566,34 @@ pub fn poll_repository_with(
             )?;
             return Ok(None);
         }
-        row = Some(("".into(), None, "".into()));
         if initialize {
             save_cursor(&db, &snapshot, "", None, "")?;
         }
-    }
+        ("".into(), None, "".into())
+    };
     if initialize {
         return Ok(None);
     }
-    let (mut prior_fingerprint, prior_error, mut prior_commit) = row.unwrap();
+    let (mut prior_fingerprint, prior_error, mut prior_commit) = row;
     if !opts.force && prior_fingerprint == s(&snapshot, "fingerprint") && prior_error.is_none() {
         return Ok(None);
     }
+    // 新しい push の可能性がある経路だけで、HEAD → upstream を 1 回ずつ取得して後続で使い回す。
+    let (head, tip) = head_and_tip(root, &s(&snapshot, "upstream"));
     let (path, _) = publication_paths(root);
     let mut state = read_state(&path)?;
     let pushed = s(&snapshot, "pushed");
     // force で push の記録が無いときは upstream の現在位置を対象にする。
     let pushed = if opts.force && pushed.is_empty() {
-        s(&snapshot, "tip")
+        tip.clone()
     } else {
         pushed
     };
-    let head = s(&snapshot, "head");
     let fingerprint = s(&snapshot, "fingerprint");
     let own_pending = s(&state, "phase") == "push_pending"
         && s(&state, "commit") == head
         && s(&state, "head") == pushed;
-    if pushed.is_empty() || s(&snapshot, "tip") != pushed || head != pushed && !own_pending {
+    if pushed.is_empty() || tip != pushed || head != pushed && !own_pending {
         return Ok(None);
     }
     // ここまで来れば「処理対象の新しい push がある」。設定の判定結果に従って処理・見送りを分ける。
@@ -1607,7 +1610,7 @@ pub fn poll_repository_with(
             // push モードの publication 状態（commit / push の進行記録）には触れない。
             // 成功・変更なし・作成済みは位置を進め、失敗は push モードの save_error と同じ形
             // （前回の fingerprint のまま error を記録）にして次回の hook で再試行する。
-            // 期限が来た種類だけを処理する（設計書 3 章）。どの種類も期限前なら worker を起動せず、
+            // 期限が来た種類だけを処理する。どの種類も期限前なら worker を起動せず、
             // 処理済み位置をそのまま進める（propose は publication 状態を持たないので無条件）。
             let repo_key = s(&snapshot, "repo_root");
             let due = due_kinds_for(
@@ -1855,7 +1858,7 @@ pub fn poll_repository_with(
         save_cursor(&db, &snapshot, &fingerprint, None, &pushed)?;
         return Ok(None);
     }
-    // 期限が来た種類だけを処理する（設計書 3 章。判定は上の復旧処理の後なので、復旧は止めない）。
+    // 期限が来た種類だけを処理する（判定は上の復旧処理の後なので、復旧は止めない）。
     // - 未完了の保守が無い（phase が空か complete）: 期限の来た種類だけに絞る。どれも期限前なら worker を
     //   起動せず、AdvanceOnly と同じく処理済み位置だけ進める。
     // - 未完了の保守がある: 記録済みの編集対象（`before`）から再開する。保守後検査は全種類のまま（絞ると
@@ -2161,7 +2164,7 @@ pub fn handle_hook(payload: &Value) -> Result<Option<String>> {
                     )));
                 }
                 config::Loaded::Missing => {
-                    // 設定の更新は U1 の `config::update_in`（設定ロック・版照合・アトミック保存）を通す。
+                    // 設定の更新は `config::update_in`（設定ロック・版照合・アトミック保存）を通す。
                     // 期待する版を「ファイルなし」にすることで、管理画面や CLI が先に設定を作った場合は
                     // 衝突として扱い、その設定を上書きしない。ロック順は「poll → 設定」で enable と同じ。
                     let created = config::update_in(
@@ -2231,8 +2234,8 @@ pub fn handle_hook(payload: &Value) -> Result<Option<String>> {
 /// `documents` のうち設定を解決できない種類（定義の無いカスタム種類など）があるときの見送りメッセージ
 /// （無ければ None）。hook 経路の `plan_for_decision` を通らない run-now のように `PollPlan` を直接組み立てる
 /// 経路も同じ判定を通るよう、`poll_repository_with` の入口でまとめて見る。
-/// CHANGELOG・カスタムは通常の文書種類として保守する（P2）。ただし CHANGELOG 固有の処理
-/// （コミット履歴の資料、リリース済みエントリの不変検査、promote、遡り）は P4 まで無い。
+/// CHANGELOG・カスタムは通常の文書種類として保守する。CHANGELOG 固有の処理
+/// （コミット履歴の資料、リリース済みエントリの不変検査、promote、遡り）は `changelog` が担う。
 fn unresolved_kinds_hold(run: &MaintenanceOptions) -> Option<String> {
     let kinds = run.resolved_kinds();
     let missing: Vec<&str> = run
@@ -2250,7 +2253,7 @@ fn unresolved_kinds_hold(run: &MaintenanceOptions) -> Option<String> {
 }
 
 /// 判定結果から push 検知後の処理方針を決める唯一の場所。
-/// propose モードは `PollPlan::Propose`（P5。`crate::proposal`）。
+/// propose モードは `PollPlan::Propose`（`crate::proposal`）。
 pub fn plan_for_decision(decision: &Decision) -> PollPlan {
     match decision.skip_reason {
         // 同意なし・未登録は完全に静か（状態 DB にも触れない）。
@@ -2375,8 +2378,8 @@ pub fn run() {
 }
 /// 中断した worker が残っていないかの確認。
 ///
-/// 未対応（P8 で扱う）: 非 Windows では終了を確認する手段が無く、常に「見送り」を返すため、
-/// worker 実行中に中断した保守の再開が永久に止まる。ここでは意図的に変更していない。
+/// 既知の制約（未対応）: 非 Windows では終了を確認する手段が無く、常に「見送り」を返すため、
+/// worker 実行中に中断した保守の再開が止まったままになる。ここでは意図的に変更していない。
 pub fn worker_quiescence_error() -> Option<String> {
     if !cfg!(windows) {
         return Some(crate::t!("maint.quiescence_unsupported").into());
@@ -2398,11 +2401,6 @@ pub fn worker_quiescence_error() -> Option<String> {
         _ => Some(crate::t!("maint.quiescence_unknown").into()),
     }
 }
-// worker が使う Claude モデルと推論レベル。
-// 保守は小さな修正が中心でバックグラウンド実行のため、精度と使用量の釣り合いから Sonnet の high を使う。
-pub const WORKER_MODEL: &str = "claude-sonnet-5-5";
-pub const WORKER_EFFORT: &str = "high";
-
 /// `PATH` から実行ファイルを探す（`which` 相当）。Windows は存在するファイル、それ以外は
 /// 実行ビットのあるファイルだけを対象にする。`path` は PATH 形式の文字列（テストで差し替えられる）。
 pub fn find_in_path(name: &str, path: Option<std::ffi::OsString>) -> Option<PathBuf> {
@@ -2410,17 +2408,14 @@ pub fn find_in_path(name: &str, path: Option<std::ffi::OsString>) -> Option<Path
         let Ok(meta) = fs::metadata(p) else {
             return false;
         };
-        if !meta.is_file() {
-            return false;
-        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            meta.permissions().mode() & 0o111 != 0
+            meta.is_file() && meta.permissions().mode() & 0o111 != 0
         }
         #[cfg(not(unix))]
         {
-            true
+            meta.is_file()
         }
     };
     env::split_paths(&path?)
@@ -2512,7 +2507,7 @@ fn rule_unsafe_path(path: &str) -> bool {
 /// Claude Code worker に渡す引数を組み立てる。
 ///
 /// - 共通: `-p`（プロンプトは stdin）、`--model`、`--effort`、`--no-session-persistence`、
-///   `--output-format text`、`max_budget_usd > 0` のときだけ `--max-budget-usd`。
+///   `--output-format text`。費用上限（`--max-budget-usd`）は渡さない（機能を廃止した）。
 /// - `Permission::Bypass`: 従来どおり `--dangerously-skip-permissions`（権限確認を全て省略）。
 /// - `Permission::Restricted`: `--dangerously-skip-permissions` を使わず、
 ///   `--safe-mode`（CLAUDE.md・hook・MCP・プラグイン等の利用者カスタマイズを読まない）、
@@ -2534,12 +2529,12 @@ fn rule_unsafe_path(path: &str) -> bool {
 ///   `./path` は cwd 相対。`Read(./**)` を許可規則として使う（allow では cwd 配下の限定になる）。
 ///   拒否は許可より優先する。`Bash(git status *)` の末尾 `*` は引数なしにも一致する。
 ///   `./path` は cwd 相対、`//path` が絶対パス、先頭 `/` は「設定ファイルの置き場」基準。
-/// - 未確認（U4）: 許可規則 `Read(./**)` だけで Glob / Grep の検索が許可されること（公式は Read の
+/// - 未確認: 許可規則 `Read(./**)` だけで Glob / Grep の検索が許可されること（公式は Read の
 ///   deny / ask 規則が Grep / Glob に適用されると述べるが、allow 規則が両ツールに及ぶとは明記していない。
 ///   dontAsk でも作業ディレクトリ内の読み取り専用ツールは確認不要とされるため動くはずだが、実機では未確認）。
 ///   また `Read(./**)` が cwd の外（絶対パス・`..`・シンボリックリンク先）の読み取りを拒否することも
 ///   規則上の保証としては未確認で、クローンの外を読めない保証は規則だけでは無い。
-/// - 未確認（U3）: `--allowedTools` で渡した `./path` が worker の cwd（リポジトリルート）基準で
+/// - 未確認: `--allowedTools` で渡した `./path` が worker の cwd（リポジトリルート）基準で
 ///   解釈されること、機密パターン（`.env*`、`**/secrets/**` など）が各階層の該当ファイルへ一致すること、
 ///   Windows でパスが POSIX 形式へ正規化された後の一致、`Bash` の git 規則が `git -C` 等の別形式を
 ///   拒否すること（公式も Bash 規則は境界ではないと説明している）。実機の Claude Code での確認は未実施。
@@ -2605,10 +2600,6 @@ pub fn worker_args(worker: &Worker, allowed: &[String], exclude: &[String]) -> V
             }
         }
     }
-    if worker.max_budget_usd > 0.0 {
-        args.push("--max-budget-usd".into());
-        args.push(format!("{}", worker.max_budget_usd));
-    }
     args.extend(["--output-format", "text"].map(String::from));
     args
 }
@@ -2629,11 +2620,6 @@ pub(crate) fn scrub_host_env(c: &mut std::process::Command) {
             c.env_remove(&key);
         }
     }
-}
-
-/// 旧来の呼び出し口（互換動作の設定・許可パスの限定なし）。
-pub fn run_maintenance_worker(root: &Path, reason: &str) -> Option<String> {
-    run_maintenance_worker_with(root, reason, &[], &MaintenanceOptions::default())
 }
 
 /// worker（Claude Code CLI）を設定どおりに起動する。失敗は表示言語のメッセージで返す。
@@ -2768,7 +2754,7 @@ fn dir_fingerprint(dir: &Path) -> String {
             }
         }
     }
-    format!("d:{:x}", hasher.finalize())
+    format!("d:{}", hex_lower(&hasher.finalize()))
 }
 
 /// 1 パスの内容指紋。無い・リンク・通常ファイル・ディレクトリ（無視対象やサブモジュール）を区別する。
@@ -2889,7 +2875,10 @@ fn read_state(path: &Path) -> Result<Value> {
     if path.exists() {
         let state: Value = serde_json::from_slice(&fs::read(path).map_err(err)?).map_err(err)?;
         if !state.is_object() {
-            return Err(crate::t!("maint.state_field_invalid", field = "publication").into());
+            return Err(crate::t!(
+                "maint.state_field_invalid",
+                field = "publication"
+            ));
         }
         Ok(state)
     } else {
@@ -2950,24 +2939,23 @@ pub fn maintain_and_publish_with(
     };
     work().unwrap_or_else(|e| Some(crate::t!("maint.state_check_failed", error = e)))
 }
-/// 旧来の呼び出し口（互換動作: 3 文書・権限バイパス）。
-pub fn publish_locked(
-    root: &Path,
-    reason: &str,
-    documents: &[PathBuf],
-    path: &Path,
-    fingerprint: Option<&str>,
-    validation_dirs: &[PathBuf],
-) -> Result<Option<String>> {
-    publish_locked_with(
-        root,
-        reason,
-        documents,
-        path,
-        fingerprint,
-        validation_dirs,
-        &MaintenanceOptions::default(),
-    )
+/// 対象文書と、その各階層（`root` 直下を含む）の `.gitignore` の候補集合。
+/// ignore 訂正のため、worker に許す編集対象は「対象文書 + 各階層の .gitignore」になる。
+/// push モードと propose モードで同じ規則を使うための共通部分で、シンボリックリンク・
+/// 作業ツリー外への逸脱・index・status による後段の絞り込みは呼び出し側が行う。
+pub(crate) fn with_ancestor_gitignores(root: &Path, documents: &[PathBuf]) -> BTreeSet<PathBuf> {
+    let mut candidates: BTreeSet<PathBuf> = documents.iter().cloned().collect();
+    for doc in documents {
+        let mut parent = doc.parent();
+        while let Some(d) = parent {
+            if !d.starts_with(root) {
+                break;
+            }
+            candidates.insert(d.join(".gitignore"));
+            parent = d.parent();
+        }
+    }
+    candidates
 }
 pub fn publish_locked_with(
     root: &Path,
@@ -3090,10 +3078,10 @@ pub fn publish_locked_with(
         if !destination_matches(&state) {
             return fail(path, &mut state, crate::t!("maint.destination_unknown"));
         }
-        if s(&state, "phase") == "worker_running" {
-            if let Some(e) = worker_quiescence_error() {
-                return fail(path, &mut state, e);
-            }
+        if s(&state, "phase") == "worker_running"
+            && let Some(e) = worker_quiescence_error()
+        {
+            return fail(path, &mut state, e);
         }
         if let Some(e) = interrupted_ignored_error(root, &state, documents) {
             return fail(path, &mut state, e);
@@ -3153,17 +3141,7 @@ pub fn publish_locked_with(
             }
         }
     } else {
-        let mut candidates: BTreeSet<_> = documents.iter().cloned().collect();
-        for doc in documents {
-            let mut parent = doc.parent();
-            while let Some(d) = parent {
-                if !d.starts_with(root) {
-                    break;
-                }
-                candidates.insert(d.join(".gitignore"));
-                parent = d.parent();
-            }
-        }
+        let candidates = with_ancestor_gitignores(root, documents);
         let mut before = serde_json::Map::new();
         let mut ignored = vec![];
         for candidate in candidates {

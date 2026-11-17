@@ -113,7 +113,6 @@ pub(crate) fn home_dir() -> PathBuf {
 }
 
 /// ログオン時の起動に引き継ぐ `SCRIPTURA_HOME`（絶対パスのときだけ。paths の解決規則と同じ）。
-#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn scriptura_home() -> Option<PathBuf> {
     std::env::var_os("SCRIPTURA_HOME")
         .map(PathBuf::from)
@@ -188,6 +187,69 @@ fn record_value(state_dir: &Path, key: &str, value: Value) -> Result<(), String>
     let mut bytes = serde_json::to_vec_pretty(&current).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
     atomic_write(&path, &bytes).map_err(|e| e.to_string())
+}
+
+// ───────────────────────── 管理画面の常駐（ログオン時の起動） ─────────────────────────
+
+/// 設定ファイル（`app-update.json`）の、ログオン時に管理画面を常駐させるかのキー。未設定は false（既定 OFF）。
+const TRAY_AUTOSTART_KEY: &str = "tray_autostart";
+
+/// 状態フォルダーから、ログオン時の常駐の設定を読む（読むだけ。無い・壊れている・型が違えば false）。
+fn load_tray_autostart(state_dir: &Path) -> bool {
+    let path = state_dir.join(SETTINGS_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_file() => fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|value| value.get(TRAY_AUTOSTART_KEY).and_then(Value::as_bool))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// ログオン時に管理画面を常駐させる設定。Setup 版でなければ None（自動起動は Setup 版だけの機能）。
+pub fn tray_autostart() -> Option<bool> {
+    locate()?;
+    Some(load_tray_autostart(&paths::state_dir()))
+}
+
+/// ログオン時の常駐を切り替える。戻り値は値が変わったか。Setup 版でなければ、状態フォルダーに触れずに断る
+/// （プラグイン同梱・単独 install の実行ファイルは場所が変わるため、ログオン時の起動を持たせない）。
+pub fn set_tray_autostart(on: bool) -> Result<bool, String> {
+    if locate().is_none() {
+        return Err(crate::t!("setup.tray_unmanaged").into());
+    }
+    let state_dir = paths::state_dir();
+    let Some(_lock) = try_lock(&state_dir) else {
+        return Err(crate::t!("setup.busy").into());
+    };
+    let before = load_tray_autostart(&state_dir);
+    record_value(&state_dir, TRAY_AUTOSTART_KEY, json!(on))?;
+    Ok(before != on)
+}
+
+/// ログオン時の常駐が ON のとき、更新の適用後に更新器へ渡す再起動引数（常駐を起動する引数）。
+/// OFF・対応外の OS・管理画面を含まないビルドでは None（従来どおり、再起動なしで適用する）。
+fn resident_restart_args() -> Option<Vec<String>> {
+    #[cfg(all(feature = "ui", any(windows, target_os = "macos")))]
+    if tray_autostart() == Some(true) {
+        return Some(crate::ui::resident_args(None, false));
+    }
+    None
+}
+
+/// ログオン時の `update-apply` の後に呼ぶ。常駐の設定が ON なら、管理画面の常駐を別プロセスで起動する
+/// （ブラウザーは開かない。既に常駐中なら、起動した側が黙って終わる）。
+///
+/// ログオンエントリを常駐用に増やさず `update-apply` の後に起動するのは、常駐が先に立つと、導入先に他の
+/// プロセスがいる扱い（busy）になって更新が適用されなくなるため。適用を依頼したときは呼ばない
+/// （更新器が入れ替えの後に、[`resident_restart_args`] の引数で新しい版の常駐を起動する）。
+/// 標準出力へは何も書かない（`update-apply` の出力は JSON 1 行のまま）。
+pub fn start_resident_after_logon_apply() {
+    #[cfg(all(feature = "ui", any(windows, target_os = "macos")))]
+    if tray_autostart() == Some(true) {
+        let _ = crate::ui::spawn_resident(None, false);
+    }
 }
 
 fn record_time(state_dir: &Path, key: &str, now: u64) -> Result<(), String> {
@@ -577,7 +639,8 @@ pub enum ApplyOutcome {
     Busy(Vec<u32>),
     /// 署名者などの検証に通らず、適用しなかった。
     Untrusted(String),
-    /// 適用を更新器に依頼した（このプロセスの終了を待って入れ替わる。再起動しない）。
+    /// 適用を更新器に依頼した（このプロセスの終了を待って入れ替わる。再起動しない。ログオン時の常駐が ON の
+    /// ときだけ、入れ替えの後に常駐を起動する）。
     Applied(String),
 }
 
@@ -650,14 +713,16 @@ pub fn update_apply() -> Result<ApplyOutcome, String> {
         log_line(&state_dir, &format!("update-apply: refused: {error}"));
         return Ok(ApplyOutcome::Untrusted(error.to_string()));
     }
-    // このプロセスの終了を待って適用し、再起動しない。更新器は別プロセスとして続行する。
+    // このプロセスの終了を待って適用する。更新器は別プロセスとして続行する。再起動はしない。ただし、
+    // ログオン時の常駐が ON のときだけ、入れ替えの後に更新器が新しい版の常駐を起動する。
+    let restart_args = resident_restart_args();
     manager
         .unsafe_apply_updates(
             &pending,
             true,
             ApplyWaitMode::WaitPid(std::process::id()),
-            false,
-            Vec::<String>::new(),
+            restart_args.is_some(),
+            restart_args.unwrap_or_default(),
         )
         .map_err(|error| format!("update apply failed: {error}"))?;
     log_line(
@@ -792,6 +857,7 @@ pub fn setup_status() -> Value {
         "version": context.as_ref().map(|c| c.version.clone()),
         "executable": context.as_ref().map(|c| c.executable.clone()),
         "autoUpdate": settings.auto_update,
+        "trayAutostart": load_tray_autostart(&state_dir),
         "lastCheckedAt": settings.last_checked_at,
         "lastFailedAt": settings.last_failed_at,
         "pendingVersion": context.as_ref().and_then(|_| pending_version()),
@@ -930,6 +996,15 @@ pub fn welcome(first_run: bool) -> bool {
         println!("{}", crate::t!("setup.welcome_auto_off"));
     }
     println!("{}", crate::t!("setup.welcome_next"));
+    // 端末から（スタートメニュー・Setup 直後の専用のコンソールを含む）対話で起動されたときは、管理画面を
+    // 常駐させてブラウザーで開く。標準入出力が端末でない起動（スクリプト・検証）では、常駐を残さない。
+    #[cfg(all(feature = "ui", any(windows, target_os = "macos")))]
+    if std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && crate::ui::spawn_resident(None, true)
+    {
+        println!("{}", crate::t!("setup.welcome_tray"));
+    }
     if first_run && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         // Setup 直後の初回起動のコンソールは、閉じると結果が読めなくなる。確認してから閉じる。
         print!("{}", crate::t!("setup.press_enter"));
@@ -949,6 +1024,42 @@ mod tests {
             std::env::temp_dir().join(format!("scriptura-app-update-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn tray_autostart_is_off_unless_explicitly_true() {
+        let dir = scratch();
+        // 無い・壊れた JSON・型違いは false（既定 OFF）。
+        assert!(!load_tray_autostart(&dir));
+        for body in [
+            "{",
+            r#"{"tray_autostart":"yes"}"#,
+            r#"{"tray_autostart":1}"#,
+        ] {
+            fs::write(dir.join(SETTINGS_FILE), body).unwrap();
+            assert!(!load_tray_autostart(&dir), "{body}");
+        }
+        // 記録は他のキーを保ち、true だけが ON。
+        fs::write(dir.join(SETTINGS_FILE), r#"{"auto_update":false}"#).unwrap();
+        record_value(&dir, TRAY_AUTOSTART_KEY, json!(true)).unwrap();
+        assert!(load_tray_autostart(&dir));
+        assert!(!load_settings(&dir).auto_update);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(all(feature = "ui", any(windows, target_os = "macos")))]
+    fn resident_restart_arguments_start_the_tray_without_a_browser() {
+        assert_eq!(
+            crate::ui::resident_args(None, false),
+            ["ui", "--tray", "--no-open"]
+        );
+        assert_eq!(
+            crate::ui::resident_args(Some(0), true),
+            ["ui", "--tray", "--port", "0"]
+        );
+        // 管理外のビルドでは、適用後に常駐を起動しない（従来どおり再起動なし）。
+        assert_eq!(resident_restart_args(), None);
     }
 
     #[test]

@@ -191,7 +191,6 @@ fn unknown_keys_are_rejected_everywhere() {
         "[kinds.readme]\nunknown = 1\n",
         "[kinds.readme.timing]\nunknown = 1\n",
         "[kinds.changelog.changelog]\nunknown = 1\n",
-        "[defaults]\nunknown = 1\n",
     ] {
         assert!(matches!(parse(text), Loaded::Invalid(_)), "{text}");
     }
@@ -573,14 +572,6 @@ fn sensitive_matcher_matches_defaults_and_additions() {
     }
 }
 
-#[test]
-fn consent_source_ui_makes_the_config_schema_two() {
-    let c = ok(
-        "schema = 2\n[consent]\nversion = 1\naccepted_at = \"2026-01-01T00:00:00Z\"\nsource = \"ui\"\n",
-    );
-    assert_eq!(c.consent.unwrap().source, ConsentSource::Ui);
-}
-
 // ---------------------------------------------------------------------------
 // 実行時（P2）: 対象パスの組み立て・上限と必須見出しの検査・テンプレートの場所検査・プロンプトの断片
 // ---------------------------------------------------------------------------
@@ -875,7 +866,10 @@ fn templates_are_loaded_with_normalization_and_a_hash_of_the_raw_bytes() {
     use sha2::{Digest, Sha256};
     assert_eq!(
         loaded[0].sha256,
-        format!("{:x}", Sha256::digest(raw.as_bytes()))
+        Sha256::digest(raw.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     );
     // builtin / none は実体を読まない（builtin の実体は CHANGELOG の種類だけにあり、カスタム種類では空扱い）。
     for spec in ["builtin", "none"] {
@@ -1072,7 +1066,7 @@ fn settings_frame_carries_limits_language_headings_template_and_instructions() {
         body: "# 概要\n\n## 責務\n".into(),
     };
     let text = prompt(&root, &scope, &kinds, std::slice::from_ref(&template));
-    // 枠の注記は設計書 2.5 の文面。枠は末尾の側に 1 つだけ。
+    // 枠の注記は定められた文面どおり。枠は末尾の側に 1 つだけ。
     assert_eq!(
         text.matches("【Additional instructions from user settings】")
             .count(),

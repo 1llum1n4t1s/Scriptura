@@ -1,4 +1,4 @@
-//! CHANGELOG 固有の処理（設計書 4 章）。
+//! CHANGELOG 固有の処理。
 //!
 //! # 役割
 //! - **リリース済みエントリ不変の検査**（`released_entries_error`。純粋関数）: worker の保守前後で、
@@ -29,7 +29,7 @@
 //!
 //! # 注意
 //! - 節の分割は「フェンス付きコードブロックの外にある `## ` 行」（先頭 3 文字までのインデント可）。
-//!   標準から外れた形式では誤って拒否し得る（設計書 12 章のリスク）。節が 1 つも無い文書は
+//!   標準から外れた形式では誤って拒否し得る（既知のリスク）。節が 1 つも無い文書は
 //!   「編集前の本文が編集後に部分文字列として含まれること」の検査に落とす。
 //! - リンク参照定義（`[label]: ...` の行）は、どの節にあっても節の内容の比較から外し、別の規則（4）で
 //!   見る。Keep a Changelog の末尾リンク群は最後の版の節に属してしまうため、外さないと promote のたびに
@@ -38,7 +38,6 @@ use std::fs;
 use std::path::Path;
 
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::config::{Backfill, ChangelogFormat, Document, OnRelease};
 use crate::kinds::{LoadedTemplate, ResolvedChangelog, ResolvedKind};
@@ -183,9 +182,7 @@ pub fn version_matches_tag(version: &str, tag: &str) -> bool {
 /// タグ glob の固定接頭辞（最初のメタ文字 `* ? [ {` と `\` より前の部分）。`v*` → `v`、
 /// `release-*` → `release-`、`pkg@*` → `pkg@`、`*` → 空。
 fn glob_literal_prefix(glob: &str) -> &str {
-    let end = glob
-        .find(|c| matches!(c, '*' | '?' | '[' | '{' | '\\'))
-        .unwrap_or(glob.len());
+    let end = glob.find(['*', '?', '[', '{', '\\']).unwrap_or(glob.len());
     &glob[..end]
 }
 
@@ -289,7 +286,7 @@ fn label_key(label: &str) -> String {
         .to_lowercase()
 }
 
-/// リリース済みエントリ不変の検査（純粋関数。設計書 4 章の規則 1〜6）。
+/// リリース済みエントリ不変の検査（純粋関数。規則 1〜6）。
 ///
 /// - `before`: 編集前の本文（無ければ新規作成なので検査しない＝規則 6。上限と必須見出しは別の検査）。
 /// - `after`: 編集後の本文（None は削除された）。
@@ -431,7 +428,7 @@ pub fn builtin_template() -> LoadedTemplate {
     LoadedTemplate {
         kind: Document::Changelog.id().to_string(),
         spec: "builtin".into(),
-        sha256: format!("{:x}", Sha256::digest(body.as_bytes())),
+        sha256: crate::maintenance::hash(body.as_bytes()),
         body,
     }
 }

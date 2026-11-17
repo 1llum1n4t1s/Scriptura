@@ -649,14 +649,7 @@ fn status_json_reports_config_repositories_and_worker_without_secrets() {
     assert_eq!(repo["paused"], false);
     assert_eq!(repo["branches"], json!(["main"]));
     assert_eq!(repo["proposals"], json!({"pending": 0, "applied": 0}));
-    for key in [
-        "model",
-        "effort",
-        "timeoutSecs",
-        "maxBudgetUsd",
-        "permission",
-        "claudePath",
-    ] {
+    for key in ["model", "effort", "timeoutSecs", "permission", "claudePath"] {
         assert!(v["worker"].get(key).is_some(), "worker.{key}");
     }
     assert_eq!(v["worker"]["permission"], "restricted");
@@ -1665,6 +1658,12 @@ fn setup_features_do_nothing_in_a_non_velopack_build() {
     assert_eq!(v["ok"], true);
     let v = fx.run(&["uninstall-setup", "--apply", "--json"]).json();
     assert_eq!(v["status"], "unmanaged");
+    // ログオン時の管理画面の常駐（ui --autostart）は Setup 版だけの機能。管理外では断り、何も書かない
+    // （Windows・macOS は終了コード 1、常駐に対応しない OS は 2）。
+    let out = fx.run(&["ui", "--autostart", "on"]);
+    assert_ne!(out.code, 0, "{}", out.stdout);
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+    assert!(!out.stderr.is_empty());
     // 引数なしの起動は従来の使い方を表示する（Setup の案内や登録はしない）。
     let out = fx.run(&[]);
     assert_eq!(out.code, 0);
@@ -1677,6 +1676,7 @@ fn setup_features_do_nothing_in_a_non_velopack_build() {
     let v = fx.run(&["status", "--json"]).json();
     assert_eq!(v["setup"]["managed"], false);
     assert_eq!(v["setup"]["autoUpdate"], true);
+    assert_eq!(v["setup"]["trayAutostart"], false);
     assert_eq!(v["setup"]["registration"], Value::Null);
     let v = fx.run(&["doctor", "--json"]).json();
     let setup = v["items"]

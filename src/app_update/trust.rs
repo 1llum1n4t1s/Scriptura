@@ -171,7 +171,7 @@ mod linux {
             .map_err(|_| anyhow::anyhow!("The update package is not a readable archive."))?;
         let mut names = Vec::with_capacity(archive.len());
         for index in 0..archive.len() {
-            names.push(archive.by_index_raw(index)?.name().to_owned());
+            names.push(archive.by_index_raw(index)?.name()?.into_owned());
         }
         linux_package_names(&names)
     }
@@ -227,7 +227,7 @@ mod macos {
         let mut entries = Vec::with_capacity(archive.len());
         for index in 0..archive.len() {
             let entry = archive.by_index_raw(index)?;
-            entries.push((entry.name().to_owned(), entry.size()));
+            entries.push((entry.name()?.into_owned(), entry.size()));
         }
         drop(archive);
         if mac_package_names(&entries)? > MAX_EXTRACTED {
@@ -441,7 +441,7 @@ mod windows {
             .map_err(|_| anyhow::anyhow!("The update package is not a readable archive."))?;
         let mut names = Vec::with_capacity(archive.len());
         for index in 0..archive.len() {
-            names.push(archive.by_index_raw(index)?.name().to_owned());
+            names.push(archive.by_index_raw(index)?.name()?.into_owned());
         }
         let entries = package_pe_entries(&names)?;
         // 検査する実体は、検査のために取り出した私的な一時ファイル。検査後に必ず消す。

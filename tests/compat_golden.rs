@@ -144,26 +144,10 @@ fn legacy_worker_args_are_identical() {
         "args_bypass.txt",
         &lines(&worker_args(&bypass, &allowed, &exclude)),
     );
-    let bypass_budget = Worker {
-        max_budget_usd: 1.5,
-        ..bypass
-    };
-    check(
-        "args_bypass_budget.txt",
-        &lines(&worker_args(&bypass_budget, &allowed, &exclude)),
-    );
 
     let restricted = Worker::default();
     check(
         "args_restricted.txt",
         &lines(&worker_args(&restricted, &allowed, &exclude)),
-    );
-    let restricted_budget = Worker {
-        max_budget_usd: 2.0,
-        ..restricted
-    };
-    check(
-        "args_restricted_budget.txt",
-        &lines(&worker_args(&restricted_budget, &allowed, &exclude)),
     );
 }

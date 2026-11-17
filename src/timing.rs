@@ -1,4 +1,4 @@
-//! 文書種類ごとのメンテナンスタイミング（設計書 3 章）。
+//! 文書種類ごとのメンテナンスタイミング。
 //!
 //! # 役割
 //! push 検知時（と run-now）に、有効な種類のうち「今回処理する期限が来た種類」を決める。
@@ -220,19 +220,6 @@ pub fn narrow_options(run: &MaintenanceOptions, due: &[ResolvedKind]) -> Mainten
 // ---------------------------------------------------------------------------
 // I/O: タグの収集・CHANGELOG の読み取り（release 判定）
 // ---------------------------------------------------------------------------
-
-/// `pushed` から到達できるタグ名の一覧（`git tag --merged <pushed>`）。取得できなければ None。
-pub fn reachable_tags(root: &Path, pushed: &str) -> Option<Vec<String>> {
-    let raw = crate::maintenance::run_git(root, &["tag", "--merged", pushed])?;
-    let text = String::from_utf8(raw).ok()?;
-    Some(
-        text.lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect(),
-    )
-}
 
 /// `pushed` 時点の `CHANGELOG.md` の本文（作業ツリーではなくコミットの内容）。
 /// 綴りは `pushed` のツリーから大文字小文字を区別せずに決める（`Changelog.md` でも読む。

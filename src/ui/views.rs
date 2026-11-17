@@ -21,6 +21,8 @@ pub struct Layout {
     pub flash: Option<&'static str>,
     /// 設定ファイルが壊れているときの注意（先頭行だけ）。
     pub broken: Option<String>,
+    /// 常駐（`--tray`）か。フッターの文言を切り替える。
+    pub resident: bool,
 }
 
 /// 資格情報らしい部分を伏せる。エンジン・git 由来の自由文（処理済み位置のエラー・publication・
@@ -365,7 +367,6 @@ pub struct WorkerPage {
     pub timeout_secs: String,
     pub timeout_min: u64,
     pub timeout_max: u64,
-    pub max_budget_usd: String,
     pub permission: Vec<Choice>,
     pub claude_path: String,
     pub claude_state: String,

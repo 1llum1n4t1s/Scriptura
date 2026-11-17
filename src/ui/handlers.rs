@@ -21,7 +21,7 @@ use serde::Deserialize;
 use super::{
     AppState,
     confirm::{self, dangers},
-    guard::{self, FormData, SESSION_COOKIE},
+    guard::{FormData, SESSION_COOKIE},
     read,
     views::{self, *},
 };
@@ -113,9 +113,10 @@ fn layout(
     Layout {
         title: title.into(),
         nav,
-        csrf: state.csrf.clone(),
+        csrf: state.csrf(),
         flash: views::flash_text(msg),
         broken,
+        resident: state.is_resident(),
     }
 }
 
@@ -435,20 +436,21 @@ pub struct AuthQuery {
 
 /// 使い捨て鍵をセッション Cookie に交換する。一度だけ有効（二度目は 401）。
 pub async fn auth(State(state): State<AppState>, Query(q): Query<AuthQuery>) -> Response {
-    let accepted = {
-        let mut slot = state.auth_key.lock().unwrap_or_else(|p| p.into_inner());
-        match (slot.as_deref(), q.key.as_deref()) {
-            (Some(expected), Some(given)) if guard::same(expected, given) => {
-                *slot = None;
-                true
-            }
-            _ => false,
-        }
-    };
+    let accepted = q
+        .key
+        .as_deref()
+        .is_some_and(|given| state.redeem_key(given));
     if !accepted {
+        // 常駐（`--tray`）にはコンソールに表示された URL が無く、鍵は「開く」のたびに置き換わって 5 分で失効する。
+        // 起動し直す案内ではなく、アイコンから開き直す案内にする。
+        let message = if state.is_resident() {
+            crate::t!("ui.deny.key_resident")
+        } else {
+            crate::t!("ui.deny.key")
+        };
         return (
             StatusCode::UNAUTHORIZED,
-            views::bare_page(crate::t!("ui.deny.key_title"), crate::t!("ui.deny.key")),
+            views::bare_page(crate::t!("ui.deny.key_title"), message),
         )
             .into_response();
     }
@@ -456,7 +458,7 @@ pub async fn auth(State(state): State<AppState>, Query(q): Query<AuthQuery>) -> 
     let mut response = Redirect::to("/").into_response();
     if let Ok(cookie) = HeaderValue::from_str(&format!(
         "{SESSION_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/",
-        state.session
+        state.session()
     )) {
         response.headers_mut().insert(header::SET_COOKIE, cookie);
     }
@@ -525,9 +527,6 @@ fn warnings(c: &Config) -> Vec<String> {
         Policy::All => out.push(crate::t!("ui.warn.policy_all").into()),
         Policy::RemoteOwner => out.push(crate::t!("ui.warn.policy_owner").into()),
         Policy::Explicit => {}
-    }
-    if c.worker.max_budget_usd == 0.0 {
-        out.push(crate::t!("ui.warn.no_budget").into());
     }
     out
 }
@@ -2193,7 +2192,6 @@ pub async fn worker(State(state): State<AppState>, Query(q): Query<Msg>) -> Resp
         timeout_secs: w.timeout_secs.to_string(),
         timeout_min: *TIMEOUT_RANGE.start(),
         timeout_max: *TIMEOUT_RANGE.end(),
-        max_budget_usd: w.max_budget_usd.to_string(),
         permission: vec![
             Choice::new(
                 "restricted",
@@ -2233,12 +2231,6 @@ pub async fn worker_save(
                 .unwrap_or_default()
                 .parse()
                 .map_err(|_| crate::t!("ui.worker.timeout_invalid").to_string())?,
-            max_budget_usd: match form.text("max_budget_usd") {
-                None => 0.0,
-                Some(v) => v
-                    .parse()
-                    .map_err(|_| crate::t!("ui.worker.budget_invalid").to_string())?,
-            },
             permission: match form.get("permission") {
                 Some("restricted") => Permission::Restricted,
                 Some("bypass") => Permission::Bypass,

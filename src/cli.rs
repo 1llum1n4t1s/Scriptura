@@ -477,7 +477,6 @@ fn status() -> Value {
         "model": worker.model,
         "effort": worker.effort,
         "timeoutSecs": worker.timeout_secs,
-        "maxBudgetUsd": worker.max_budget_usd,
         "permission": match worker.permission {
             config::Permission::Restricted => "restricted",
             config::Permission::Bypass => "bypass",

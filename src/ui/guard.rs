@@ -1,4 +1,4 @@
-// 管理画面の保護（設計書 9.2）。すべての要求はここを通る。
+// 管理画面の保護。すべての要求はここを通る。
 //
 // 順序（どれかで失敗したらそこで拒否し、ハンドラには届かない）:
 // 1. Host は `127.0.0.1:<port>` か `localhost:<port>` だけ（DNS rebinding 対策）→ 違えば 403。
@@ -94,7 +94,7 @@ impl FormData {
     }
 }
 
-fn header_text<'a>(req: &'a Request, name: header::HeaderName) -> Option<&'a str> {
+fn header_text(req: &Request, name: header::HeaderName) -> Option<&str> {
     req.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
@@ -150,6 +150,7 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
     let path = req.uri().path();
     let public = matches!(path, "/auth" | "/assets/app.css" | "/assets/app.js");
     if !public {
+        let session = state.session();
         let has_session = req
             .headers()
             .get_all(header::COOKIE)
@@ -157,12 +158,18 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
             .filter_map(|v| v.to_str().ok())
             .flat_map(|v| v.split(';'))
             .filter_map(|pair| pair.trim().split_once('='))
-            .any(|(name, value)| name == SESSION_COOKIE && same(value, &state.session));
+            .any(|(name, value)| name == SESSION_COOKIE && same(value, &session));
         if !has_session {
+            // 常駐中はコンソールに表示した URL が無いので、トレイのアイコンから開き直す案内にする。
+            let message = if state.is_resident() {
+                crate::t!("ui.deny.login_resident")
+            } else {
+                crate::t!("ui.deny.login")
+            };
             return deny(
                 StatusCode::UNAUTHORIZED,
                 crate::t!("ui.deny.login_title"),
-                crate::t!("ui.deny.login"),
+                message,
             );
         }
         state.touch();
@@ -181,7 +188,7 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
             }
         };
         let form = FormData::parse(&bytes);
-        if !form.get("csrf").is_some_and(|t| same(t, &state.csrf)) {
+        if !form.get("csrf").is_some_and(|t| same(t, &state.csrf())) {
             return deny(
                 StatusCode::FORBIDDEN,
                 crate::t!("ui.deny.title"),
@@ -194,7 +201,7 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
     next.run(req).await
 }
 
-/// 応答ヘッダー（設計書 9.2-6）。インラインの script・style は CSP で禁止する
+/// 応答ヘッダー。インラインの script・style は CSP で禁止する
 /// （テンプレートに style 属性・on* 属性・インライン script を書かない）。
 pub async fn security_headers(req: Request, next: Next) -> Response {
     let mut response = next.run(req).await;

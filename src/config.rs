@@ -45,7 +45,7 @@ pub const DEFAULT_SENSITIVE_PATTERNS: &[&str] = &[
     "id_rsa*",
     "id_ed25519*",
     "**/secrets/**",
-    // 実機検証（P0）で、Read(./**) だけだと .git/config を読めると分かったため追加。
+    // 実機検証で、Read(./**) だけだと .git/config を読めると分かったため追加。
     // remote の URL にトークンが埋め込まれている場合に漏れるのを防ぐ。
     ".git/config",
 ];
@@ -174,7 +174,7 @@ pub enum ConsentSource {
 }
 
 /// 種類のタイミング（`when`）。push=push のたび、release=リリース（タグ）が出たとき、
-/// manual=run-now のときだけ。評価は P3 以降（P1 は値の保持と検証のみ）。
+/// manual=run-now のときだけ。評価は `timing::due_kinds` が行う。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum When {
@@ -332,8 +332,6 @@ pub struct Worker {
     pub model: String,
     pub effort: String,
     pub timeout_secs: u64,
-    /// 0 で無指定。
-    pub max_budget_usd: f64,
     pub permission: Permission,
     /// 空なら PATH から探す。指定する場合は絶対パス。
     pub claude_path: String,
@@ -342,10 +340,11 @@ pub struct Worker {
 impl Default for Worker {
     fn default() -> Self {
         Self {
+            // 保守は小さな修正が中心でバックグラウンド実行のため、
+            // 精度と使用量の釣り合いから Sonnet の high を既定にする。
             model: "claude-sonnet-5-5".into(),
             effort: "high".into(),
             timeout_secs: 1200,
-            max_budget_usd: 0.0,
             permission: Permission::Restricted,
             claude_path: String::new(),
         }
@@ -505,9 +504,6 @@ impl Config {
                 max = TIMEOUT_RANGE.end(),
                 value = w.timeout_secs
             ));
-        }
-        if !w.max_budget_usd.is_finite() || w.max_budget_usd < 0.0 {
-            return Err(crate::t!("config.budget_invalid").into());
         }
         if !w.claude_path.is_empty() && !Path::new(&w.claude_path).is_absolute() {
             return Err(crate::t!("config.claude_path_absolute").into());
@@ -702,7 +698,7 @@ pub fn save(config: &Config) -> io::Result<()> {
 // ---------------------------------------------------------------------------
 // 設定の版・楽観的排他つきの更新・変更履歴（CLI・管理画面・自動移行で共通の書き込み経路）
 //
-// 設計（設計書 9.3）:
+// 設計:
 // ① 状態フォルダーの `config-lock.sqlite3` で `BEGIN IMMEDIATE`（書き手同士の排他）
 // ② ロック内でファイルを読み直し、期待する版（Revision）と照合（画面は必須、CLI は省略可）
 // ③ 変更を適用して `validate`
@@ -741,9 +737,8 @@ impl Revision {
 
     /// バイト列（無ければ None）から版を求める。
     pub fn of(bytes: Option<&[u8]>) -> Self {
-        use sha2::{Digest, Sha256};
         match bytes {
-            Some(b) => Self(format!("{:x}", Sha256::digest(b))),
+            Some(b) => Self(crate::maintenance::hash(b)),
             None => Self::missing(),
         }
     }
