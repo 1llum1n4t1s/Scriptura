@@ -108,7 +108,6 @@ exclude = ["private/**"]                        # 既定の機密パターンに
 model = "claude-sonnet-5-5"
 effort = "high"
 timeout_secs = 1200                             # 60..=1500（Stop hook の 1800 秒より短く）
-max_budget_usd = 0.0                            # 0 で無指定
 permission = "restricted"                       # restricted / bypass
 claude_path = ""                                # 空なら PATH から探す（指定は絶対パス）
 
@@ -229,15 +228,18 @@ documents = ["README.md", "CHANGELOG.md"]
 ## 管理画面（`scriptura ui`）
 
 ```powershell
-scriptura ui [--port <n>] [--no-open]
+scriptura ui [--port <n>] [--no-open] [--tray]
+scriptura ui --autostart on|off
 ```
 
-設定・更新案・診断をブラウザーで扱う画面です（9 言語。画面上部の言語の選択欄（Cookie に保存）→ ブラウザーの `Accept-Language` → 英語の順で表示言語が決まります）。常駐はせず、起動したコマンドが画面の「終了」・Ctrl+C・60 分の無操作のいずれかで終わります。hook は画面の有無を見ません。cargo feature `ui`（既定で有効）で、`--no-default-features` でビルドすると含まれません（`scriptura ui` は拒否して終了します）。
+設定・更新案・診断をブラウザーで扱う画面です（9 言語。画面上部の言語の選択欄（Cookie に保存）→ ブラウザーの `Accept-Language` → 英語の順で表示言語が決まります）。既定では常駐せず、起動したコマンドが画面の「終了」・Ctrl+C・60 分の無操作のいずれかで終わります（`--tray` を付けると常駐します。下記）。hook は画面の有無を見ません。cargo feature `ui`（既定で有効）で、`--no-default-features` でビルドすると含まれません（`scriptura ui` は拒否して終了します）。
 
 - **待ち受け**: `127.0.0.1` だけ（既定のポートは 7468、`--port 0` で空きポート）。ポートが使用中なら終了します。
+- **常駐（`--tray`）**: Windows はタスクトレイ、macOS はメニューバーにアイコンを置いて常駐します（Linux は未対応で、`--tray` は拒否して終了します）。アイコンのクリックで管理画面を開き、右クリックのメニューから「管理画面を開く」「ログオン時に起動」（Setup 版のみ）「終了」を選べます。常駐中は無操作でも終了しません。代わりに 60 分の無操作でセッションを失効させ（開いたままのタブは 401 になります）、アイコンから開くたびに使い捨て鍵を発行し直します（発行し直した鍵は 5 分で失効し、使われなかった前の鍵は無効になります）。Windows では、既定のポートで常駐中にもう一度 `scriptura ui --tray` を実行すると、2 つ目は起動せず、常駐中の側がブラウザーを開きます。端末以外（スタートメニューなど）から起動されたときは、コンソール窓を持たないプロセスとして起動し直します。
+- **ログオン時の常駐（Setup 版のみ・既定は OFF）**: `scriptura ui --autostart on|off` か、アイコンのメニューの「ログオン時に起動」で切り替えます（状態フォルダーの `app-update.json` の `tray_autostart`）。ログオンエントリは増やさず、ログオン時の `update-apply` が終わったあとに常駐を起動します（常駐が先に起動すると、導入先で他のプロセスが動いている扱いになり、更新が適用されないためです）。更新を適用したログオンでは、入れ替えのあとに更新器が新しい版の常駐を起動します。Setup 版のスタートメニュー（引数なしの起動）は、案内を表示したあと、管理画面を常駐させてブラウザーで開きます。常駐中は Scriptura が導入先で動き続けるため、取得済みの更新が適用されるのは次のログオンです。プラグイン同梱・単独 `install` の実行ファイルでは `--autostart` は使えません（`ui --tray` での常駐はできます）。
 - **保護**: 起動ごとの使い捨て鍵の URL（`/auth?key=…`）を一度だけ使えるセッション Cookie（`HttpOnly; SameSite=Strict`）へ交換します（Cookie が無ければ 401）。Host は `127.0.0.1:<port>` か `localhost:<port>` だけ、Origin があれば同一オリジンだけ、POST は同一オリジン（`Origin` か `Sec-Fetch-Site`）に加えて CSRF トークンが必須です。CSP・`nosniff`・`no-store` などの応答ヘッダーを付け、秘密値は表示しません。Cookie はブラウザーの仕様上ポートで分離されないため、同じ PC の 127.0.0.1 の別ポートで動くサービスにも送られます（同じ利用者のプロセスは元々設定ファイルを触れるので、問題になるのは権限の違うローカルサービスだけです）。
 - **競合**: 保存は表示時の版を照合し、他で変更されていれば再読み込みを案内します。
-- **確認画面**: push モード化、権限 `bypass` 化、自動登録の方針を `all` / `remote-owner` にする変更、費用上限（`max_budget_usd`）を外す変更、カスタム種類の対象パスの追加、同意の記録、登録の解除、更新案の適用、push モードの `run-now`（と、これらを含む版への履歴の復元）は、1 回目の送信では書き込まず、変更点の一覧を見せて 1 回限りの確認（10 分で失効）を求めます。
+- **確認画面**: push モード化、権限 `bypass` 化、自動登録の方針を `all` / `remote-owner` にする変更、カスタム種類の対象パスの追加、同意の記録、登録の解除、更新案の適用、push モードの `run-now`（と、これらを含む版への履歴の復元）は、1 回目の送信では書き込まず、変更点の一覧を見せて 1 回限りの確認（10 分で失効）を求めます。
 - **画面**: 概要 / リポジトリ（登録・有効化・一時停止・再開・解除・モードと対象の文書・`run-now`）/ 文書の種類（種類の追加・編集・削除、`templates/` のテンプレート編集）/ 更新案（差分の確認・適用・破棄）/ worker / 全般 / 同意 / 履歴（変更履歴・差分・復元）/ 診断。`run-now` は時間がかかるためバックグラウンドで実行し、画面で状態を確認できます。
 
 ## 出力の言語
@@ -253,11 +255,11 @@ CLI・hook・インストーラー案内の出力は 9 言語（ja・en・zh-CN�
 | `enable --repo <path> --accept-consent <版> [--mode propose\|push\|off] [--branches a,b] [--documents AGENTS.md,README.md]` | リポジトリを登録して有効化する。`--documents` には組み込み 4 種（`CHANGELOG.md` を含む。大文字小文字は問わない）と、設定に定義したカスタム種類の id を挙げられる。 |
 | `disable --repo <path>` | 登録を削除する。 |
 | `pause [--repo <path>]` / `resume [--repo <path>]` | 一時停止 / 再開（`--repo` 省略時は cwd のリポジトリ）。 |
-| `status` | 導入状態・設定・同意・登録・worker 設定・更新案の件数と、Setup 版の情報（`setup`: 管理下か・packId・版・実行ファイル・自動更新・前回の確認／失敗時刻・取得済みの版・登録の結果・旧単独導入の残存）を表示する。`installedVersion` は単独 `install` の記録（`install.json`、無ければ以前の版の `current.json`）。 |
+| `status` | 導入状態・設定・同意・登録・worker 設定・更新案の件数と、Setup 版の情報（`setup`: 管理下か・packId・版・実行ファイル・自動更新・ログオン時の管理画面の常駐（`trayAutostart`）・前回の確認／失敗時刻・取得済みの版・登録の結果・旧単独導入の残存）を表示する。`installedVersion` は単独 `install` の記録（`install.json`、無ければ以前の版の `current.json`）。 |
 | `doctor [--verify]` | 環境と設定を診断する（後述）。 |
 | `run-now [--repo <path>] [--documents <id,...>]` | push を待たず、いま 1 回保守を実行する（登録済み・同意済みのリポジトリだけ。タイミングは無視して有効な種類をすべて処理する）。`--documents` で処理する種類を絞れる（未定義・このリポジトリで無効な種類は worker を起動せず拒否）。**注意**: 絞った `run-now` も処理済み位置を進め、更新案はコミットごとに 1 つなので、絞り込みの外の種類はその push について保守されない。保守後の検査に違反した propose は `outcome` が `rejected`（`reason` つき。失敗ではなく、その push は処理済みになる）で返る。 |
 | `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | 文書の種類（組み込み・カスタム）の一覧と 1 件の詳細を表示する（有効・無効、対象パスと存在、上限、タイミング、テンプレートの状態、最終完了時刻。`show` は設定した指針・追加指示の本文も出す。読み取り専用で、文書の内容は出さない）。 |
-| `ui [--port <n>] [--no-open]` | 管理画面を起動する（前述）。`--json` は使えない。 |
+| `ui [--port <n>] [--no-open] [--tray]` / `ui --autostart on\|off` | 管理画面を起動する（前述。`--tray` で常駐）/ Setup 版のログオン時の常駐を切り替える。`--json` は使えない。 |
 | `review [sha\|latest] [--repo <path>]` | 更新案の diffstat・パッチのパス・対象文書を確認する。 |
 | `apply [sha\|latest] [--repo <path>]` | 更新案を作業ツリーへ適用する。対象文書に未コミットの変更があれば拒否する。 |
 | `discard [sha\|latest] [--repo <path>]` | 更新案を破棄する。 |
@@ -277,7 +279,7 @@ CLI・hook・インストーラー案内の出力は 9 言語（ja・en・zh-CN�
 
 ## 費用とデータ送信
 
-保守の worker（既定は Sonnet）は、**あなた自身の Claude 認証**で動きます。worker が読んだリポジトリの内容は Anthropic へ送信され、実行ごとに Claude の利用料金（使用量）が発生します。push 1 回につき worker は最大 1 回、`worker.timeout_secs` を上限に動きます。`worker.max_budget_usd` で予算の上限も指定できます。
+保守の worker（既定は Sonnet）は、**あなた自身の Claude 認証**で動きます。worker が読んだリポジトリの内容は Anthropic へ送信され、実行ごとに Claude の利用料金（使用量）が発生します。push 1 回につき worker は最大 1 回、`worker.timeout_secs` を上限に動きます。
 
 ## 診断（doctor）
 
@@ -304,7 +306,9 @@ CLI・hook・インストーラー案内の出力は 9 言語（ja・en・zh-CN�
 - 管理画面（`ui`）での自動更新の切り替えは未対応です（`scriptura update --auto on|off` を使います）。
 - Windows のログオン時の Run 値は `SCRIPTURA_HOME` を引き継ぎません（macOS の LaunchAgent と Linux の autostart は引き継ぎます）。
 - 非 Windows では、worker 実行中に中断した保守の再開を見送ります（終了確認の手段が無いため）。
-- branch + PR での公開は後続です。カスタム種類は固定パスのみ（glob・サブディレクトリの走査は後続）で、種類ごとのモデル・effort の上書き、リポジトリごとの種類設定（`[repository.kinds]`）、テンプレートの強制適用、CLI からの設定編集（`set`）、管理画面のトレイ常駐・自動起動・
+- branch + PR での公開は後続です。カスタム種類は固定パスのみ（glob・サブディレクトリの走査は後続）で、種類ごとのモデル・effort の上書き、リポジトリごとの種類設定（`[repository.kinds]`）、テンプレートの強制適用、CLI からの設定編集（`set`）も後続です。
+- 管理画面の常駐（`ui --tray`）は Windows と macOS だけです（Linux は未対応）。アイコンは暫定の図柄です（Windows は実行時に描く図柄、macOS はシステムの記号）。macOS は、起動と Ctrl+C での終了を実機で確かめましたが、メニューバーのアイコンの表示・クリック・メニューは目視で未確認です。ログオン時の常駐と、更新の適用後の常駐の起動（Setup 版）は、実際の導入では未検証です。
+
 ## 検証
 
 ```powershell

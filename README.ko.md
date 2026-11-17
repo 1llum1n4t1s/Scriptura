@@ -108,7 +108,6 @@ exclude = ["private/**"]                        # 기본 민감 패턴에 추가
 model = "claude-sonnet-5-5"
 effort = "high"
 timeout_secs = 1200                             # 60..=1500 (Stop hook의 1800초보다 짧게)
-max_budget_usd = 0.0                            # 0은 미지정을 뜻함
 permission = "restricted"                       # restricted / bypass
 claude_path = ""                                # 비어 있으면 PATH를 검색 (지정하면 절대 경로)
 
@@ -229,15 +228,18 @@ documents = ["README.md", "CHANGELOG.md"]
 ## 관리 화면(`scriptura ui`)
 
 ```powershell
-scriptura ui [--port <n>] [--no-open]
+scriptura ui [--port <n>] [--no-open] [--tray]
+scriptura ui --autostart on|off
 ```
 
-설정, 업데이트 제안, 진단을 다루는 브라우저 기반 화면입니다. 9개 언어(ja, en, zh-CN, zh-TW, ko, es, fr, de, pt-BR)로 제공됩니다. 언어는 화면 상단의 언어 선택(쿠키에 저장됨) → 브라우저의 `Accept-Language` → 영어 순으로 선택됩니다. 상주하지 않으며, 화면에서 "종료"를 선택하거나 Ctrl+C를 누르거나 60분 동안 조작이 없으면 실행한 명령이 종료됩니다. hook은 화면이 열려 있는지 확인하지 않습니다. cargo feature `ui`(기본값으로 활성)로 제어되며, `--no-default-features`로 빌드하면 포함되지 않습니다(그 경우 `scriptura ui`는 거부하고 종료합니다).
+설정, 업데이트 제안, 진단을 다루는 브라우저 기반 화면입니다. 9개 언어(ja, en, zh-CN, zh-TW, ko, es, fr, de, pt-BR)로 제공됩니다. 언어는 화면 상단의 언어 선택(쿠키에 저장됨) → 브라우저의 `Accept-Language` → 영어 순으로 선택됩니다. 기본적으로는 상주하지 않으며, 화면에서 "종료"를 선택하거나 Ctrl+C를 누르거나 60분 동안 조작이 없으면 실행한 명령이 종료됩니다(`--tray`를 붙이면 상주합니다. 아래 참조). hook은 화면이 열려 있는지 확인하지 않습니다. cargo feature `ui`(기본값으로 활성)로 제어되며, `--no-default-features`로 빌드하면 포함되지 않습니다(그 경우 `scriptura ui`는 거부하고 종료합니다).
 
 - **수신 대기**: `127.0.0.1`에서만(기본 포트는 7468이며 `--port 0`은 비어 있는 포트를 고릅니다). 포트가 사용 중이면 종료합니다.
+- **상주(`--tray`)**: Windows에서는 시스템 트레이, macOS에서는 메뉴 막대에 아이콘을 두고 상주합니다(Linux는 지원하지 않으며, `--tray`는 거부하고 종료합니다). 아이콘을 클릭하면 관리 화면이 열리고, 오른쪽 클릭 메뉴에서 "관리 화면 열기", "로그온 시 시작"(Setup 판 전용), "종료"를 고를 수 있습니다. 상주 중에는 조작이 없어도 종료되지 않습니다. 대신 60분 동안 조작이 없으면 세션을 만료시키고(열어 둔 탭은 401이 됩니다), 아이콘에서 화면을 열 때마다 일회용 키를 다시 발급합니다(다시 발급한 키는 5분 뒤에 만료되고, 사용되지 않은 이전 키는 무효가 됩니다). Windows에서는 기본 포트로 상주 중일 때 `scriptura ui --tray`를 다시 실행하면 두 번째는 시작하지 않고, 상주 중인 쪽이 브라우저를 엽니다. 터미널이 아닌 곳(시작 메뉴 등)에서 실행되면 콘솔 창이 없는 프로세스로 다시 실행합니다.
+- **로그온 시 상주(Setup 판 전용, 기본값은 OFF)**: `scriptura ui --autostart on|off` 또는 아이콘 메뉴의 "로그온 시 시작"으로 전환합니다(상태 폴더의 `app-update.json`에 있는 `tray_autostart`). 로그온 항목은 늘리지 않고, 로그온 시의 `update-apply`가 끝난 뒤에 상주를 시작합니다(상주가 먼저 시작되면 설치 폴더에서 다른 프로세스가 실행 중인 것으로 간주되어 업데이트가 적용되지 않기 때문입니다). 업데이트를 적용한 로그온에서는 교체가 끝난 뒤 업데이터가 새 버전의 상주를 시작합니다. Setup 판의 시작 메뉴(인수 없는 실행)는 안내를 표시한 뒤 관리 화면을 상주시키고 브라우저로 엽니다. 상주 중에는 Scriptura가 설치 폴더에서 계속 실행되므로, 내려받은 업데이트가 적용되는 것은 다음 로그온입니다. 플러그인에 포함된 실행 파일과 단독 `install`의 실행 파일에서는 `--autostart`를 사용할 수 없습니다(`ui --tray`로 상주하는 것은 가능합니다).
 - **보호**: 실행할 때마다 생성되는 일회용 키 URL(`/auth?key=…`)을 한 번 세션 쿠키(`HttpOnly; SameSite=Strict`)로 교환합니다(쿠키가 없으면 응답은 401입니다). Host는 `127.0.0.1:<port>` 또는 `localhost:<port>`뿐이어야 하고, Origin이 있으면 same-origin이어야 하며, POST에는 same-origin(`Origin` 또는 `Sec-Fetch-Site`)과 CSRF 토큰이 필요합니다. CSP, `nosniff`, `no-store` 같은 응답 헤더가 추가되며 비밀 값은 표시되지 않습니다. 브라우저는 쿠키를 포트별로 분리하지 않으므로, 쿠키는 같은 PC의 다른 127.0.0.1 포트에서 실행 중인 서비스에도 전송됩니다(같은 사용자의 프로세스는 이미 설정 파일을 만질 수 있으므로, 우려되는 것은 권한이 다른 로컬 서비스뿐입니다).
 - **충돌**: 저장은 표시한 버전을 비교하며, 파일이 다른 곳에서 변경되었으면 다시 불러오도록 안내합니다.
-- **확인 화면**: push 모드로의 전환, 권한을 `bypass`로 전환, enrollment 정책을 `all` / `remote-owner`로 변경, 비용 상한(`max_budget_usd`) 제거, 커스텀 종류의 대상 경로 추가, 동의 기록, 등록 제거, 업데이트 제안 적용, push 모드에서의 `run-now`(그리고 이 중 하나라도 포함하는 버전으로 이력을 복원하는 것)는 첫 제출에서는 쓰지 않으며, 변경 사항 목록을 보여주고 일회용 확인을 요청합니다(10분간 유효).
+- **확인 화면**: push 모드로의 전환, 권한을 `bypass`로 전환, enrollment 정책을 `all` / `remote-owner`로 변경, 커스텀 종류의 대상 경로 추가, 동의 기록, 등록 제거, 업데이트 제안 적용, push 모드에서의 `run-now`(그리고 이 중 하나라도 포함하는 버전으로 이력을 복원하는 것)는 첫 제출에서는 쓰지 않으며, 변경 사항 목록을 보여주고 일회용 확인을 요청합니다(10분간 유효).
 - **화면**: 개요 / 저장소(등록, 활성화, 일시 중지, 재개, 제거, 모드와 대상 문서, `run-now`) / 문서 종류(종류의 추가, 편집, 삭제. `templates/`의 템플릿 편집) / 업데이트 제안(diff 확인, 적용, 폐기) / Worker / 일반 / 동의 / 이력(변경 이력, diff, 복원) / 진단. `run-now`는 시간이 걸리므로 백그라운드에서 실행되며 화면에서 상태를 확인할 수 있습니다.
 
 ## 출력 언어
@@ -253,11 +255,11 @@ CLI, hook, 설치 프로그램의 안내 출력은 9개 언어(ja, en, zh-CN, zh
 | `enable --repo <path> --accept-consent <version> [--mode propose\|push\|off] [--branches a,b] [--documents AGENTS.md,README.md]` | 저장소를 등록하고 활성화합니다. `--documents`에는 내장 4종류(`CHANGELOG.md` 포함. 대소문자 구분 없음)와 설정에 정의된 커스텀 종류의 id를 지정할 수 있습니다. |
 | `disable --repo <path>` | 등록을 제거합니다. |
 | `pause [--repo <path>]` / `resume [--repo <path>]` | 일시 중지 / 재개(`--repo`를 생략하면 현재 작업 디렉터리의 저장소). |
-| `status` | 설치 상태, 설정, 동의, 등록, worker 설정, 업데이트 제안 수, Setup 판의 정보(`setup`: 관리 여부, packId, 버전, 실행 파일, 자동 업데이트, 마지막 확인 / 실패 시각, 내려받은 버전, 등록 결과, 남아 있는 이전 단독 설치)를 표시합니다. `installedVersion`은 단독 `install`의 기록(`install.json`, 없으면 이전 버전의 `current.json`)에서 가져옵니다. |
+| `status` | 설치 상태, 설정, 동의, 등록, worker 설정, 업데이트 제안 수, Setup 판의 정보(`setup`: 관리 여부, packId, 버전, 실행 파일, 자동 업데이트, 로그온 시 관리 화면의 상주 여부(`trayAutostart`), 마지막 확인 / 실패 시각, 내려받은 버전, 등록 결과, 남아 있는 이전 단독 설치)를 표시합니다. `installedVersion`은 단독 `install`의 기록(`install.json`, 없으면 이전 버전의 `current.json`)에서 가져옵니다. |
 | `doctor [--verify]` | 환경과 설정을 진단합니다(아래에서 설명). |
 | `run-now [--repo <path>] [--documents <id,...>]` | push를 기다리지 않고 지금 바로 유지 관리를 한 번 실행합니다(등록되고 동의한 저장소에 한하며, 시점은 무시하고 활성화된 모든 종류를 처리합니다). `--documents`는 처리할 종류를 좁힙니다(정의되지 않은 종류나 해당 저장소에서 비활성화된 종류는 worker를 시작하지 않고 거부됩니다). **주의**: 좁힌 `run-now`도 처리 완료 위치를 진행하며, 업데이트 제안은 commit당 하나이므로 좁힌 범위 밖의 종류는 그 push에 대해 유지 관리되지 않습니다. 유지 관리 후 검사를 위반한 propose는 `outcome`이 `rejected`로 반환됩니다(`reason` 포함. 실패가 아니며 그 push는 처리된 것으로 간주합니다). |
 | `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | 문서 종류(내장과 커스텀)를 나열하고 하나의 상세(활성 또는 비활성, 대상 경로와 존재 여부, 상한, 시점, 템플릿 상태, 마지막 완료 시각. `show`는 설정된 guidance와 추가 지시도 출력합니다. 읽기 전용이며 문서 내용은 출력하지 않습니다)를 표시합니다. |
-| `ui [--port <n>] [--no-open]` | 관리 화면을 실행합니다(위에서 설명). `--json`은 사용할 수 없습니다. |
+| `ui [--port <n>] [--no-open] [--tray]` / `ui --autostart on\|off` | 관리 화면을 실행합니다(위에서 설명. `--tray`로 상주) / Setup 판의 로그온 시 상주를 전환합니다. `--json`은 사용할 수 없습니다. |
 | `review [sha\|latest] [--repo <path>]` | 업데이트 제안의 diffstat, 패치 경로, 대상 문서를 확인합니다. |
 | `apply [sha\|latest] [--repo <path>]` | 업데이트 제안을 작업 트리에 적용합니다. 대상 문서에 commit되지 않은 변경이 있으면 거부됩니다. |
 | `discard [sha\|latest] [--repo <path>]` | 업데이트 제안을 폐기합니다. |
@@ -277,7 +279,7 @@ CLI, hook, 설치 프로그램의 안내 출력은 9개 언어(ja, en, zh-CN, zh
 
 ## 비용과 데이터 전송
 
-유지 관리 worker(기본은 Sonnet)는 **사용자 본인의 Claude 인증**으로 실행됩니다. worker가 읽는 저장소의 내용은 Anthropic으로 전송되며, 실행할 때마다 Claude 사용 요금(소비)이 발생합니다. worker는 push당 최대 한 번 실행되며 `worker.timeout_secs`가 상한입니다. `worker.max_budget_usd`로 예산 상한을 지정할 수도 있습니다.
+유지 관리 worker(기본은 Sonnet)는 **사용자 본인의 Claude 인증**으로 실행됩니다. worker가 읽는 저장소의 내용은 Anthropic으로 전송되며, 실행할 때마다 Claude 사용 요금(소비)이 발생합니다. worker는 push당 최대 한 번 실행되며 `worker.timeout_secs`가 상한입니다.
 
 ## 진단(doctor)
 
@@ -304,7 +306,8 @@ CLI, hook, 설치 프로그램의 안내 출력은 9개 언어(ja, en, zh-CN, zh
 - 관리 화면(`ui`)에서 자동 업데이트를 전환하는 것은 지원하지 않습니다(`scriptura update --auto on|off`를 사용하십시오).
 - Windows에서 로그온 Run 값은 `SCRIPTURA_HOME`을 상속하지 않습니다(macOS의 LaunchAgent와 Linux의 autostart 항목은 상속합니다).
 - Windows 이외의 플랫폼에서는, worker가 실행 중이던 도중에 중단된 유지 관리의 재개는 건너뜁니다(worker가 종료되었는지 확인할 방법이 없습니다).
-- 브랜치 + PR을 통한 게시는 나중에 예정되어 있습니다. 커스텀 종류는 고정 경로로 제한되어 있으며(glob과 하위 디렉터리 스캔은 나중에), 종류별 model과 effort의 재정의, 저장소별 종류 설정(`[repository.kinds]`), 템플릿의 강제 적용, CLI에서의 설정 편집(`set`), 관리 화면의 트레이 상주와 자동 시작도 나중에 예정되어 있습니다.
+- 브랜치 + PR을 통한 게시는 나중에 예정되어 있습니다. 커스텀 종류는 고정 경로로 제한되어 있으며(glob과 하위 디렉터리 스캔은 나중에), 종류별 model과 effort의 재정의, 저장소별 종류 설정(`[repository.kinds]`), 템플릿의 강제 적용, CLI에서의 설정 편집(`set`)도 나중에 예정되어 있습니다.
+- 관리 화면의 상주(`ui --tray`)는 Windows와 macOS에서만 사용할 수 있습니다(Linux는 지원하지 않습니다). 아이콘은 임시 디자인입니다(Windows는 실행 시에 그리는 도안, macOS는 시스템 기호). macOS에서는 시작과 Ctrl+C로의 종료를 실제 기기에서 확인했지만, 메뉴 막대 아이콘의 표시·클릭·메뉴는 눈으로 확인하지 못했습니다. 로그온 시 상주와 업데이트 적용 후의 상주 시작(Setup 판)은 실제 설치에서는 검증하지 않았습니다.
 
 ## 검증
 

@@ -108,7 +108,6 @@ exclude = ["private/**"]                        # ADDED to the default sensitive
 model = "claude-sonnet-5-5"
 effort = "high"
 timeout_secs = 1200                             # 60..=1500 (shorter than the Stop hook's 1800 seconds)
-max_budget_usd = 0.0                            # 0 means unspecified
 permission = "restricted"                       # restricted / bypass
 claude_path = ""                                # empty means search PATH (an absolute path if specified)
 
@@ -229,15 +228,18 @@ All settings writes, whether from the CLI, the admin UI, or the automatic migrat
 ## Admin UI (`scriptura ui`)
 
 ```powershell
-scriptura ui [--port <n>] [--no-open]
+scriptura ui [--port <n>] [--no-open] [--tray]
+scriptura ui --autostart on|off
 ```
 
-A browser-based screen for handling settings, update proposals, and diagnostics. It is available in 9 languages (ja, en, zh-CN, zh-TW, ko, es, fr, de, pt-BR). The language is chosen in this order: the language selector at the top of the screen (saved in a cookie) → the browser's `Accept-Language` → English. It is not resident: the command that launched it ends when you choose "Quit" on the screen, press Ctrl+C, or after 60 minutes of inactivity. Hooks do not look at whether the screen is open. It is controlled by the cargo feature `ui` (enabled by default) and is not included when built with `--no-default-features` (`scriptura ui` then refuses and exits).
+A browser-based screen for handling settings, update proposals, and diagnostics. It is available in 9 languages (ja, en, zh-CN, zh-TW, ko, es, fr, de, pt-BR). The language is chosen in this order: the language selector at the top of the screen (saved in a cookie) → the browser's `Accept-Language` → English. By default it is not resident: the command that launched it ends when you choose "Quit" on the screen, press Ctrl+C, or after 60 minutes of inactivity (add `--tray` to keep it resident; see below). Hooks do not look at whether the screen is open. It is controlled by the cargo feature `ui` (enabled by default) and is not included when built with `--no-default-features` (`scriptura ui` then refuses and exits).
 
 - **Listening**: only on `127.0.0.1` (the default port is 7468; `--port 0` picks a free port). If the port is in use, it exits.
+- **Resident mode (`--tray`)**: stays resident with an icon in the system tray on Windows and in the menu bar on macOS (Linux is not supported; `--tray` refuses and exits). Clicking the icon opens the admin UI, and the right-click menu offers "Open the management screen", "Start at logon" (Setup edition only), and "Exit". While resident it does not exit on inactivity. Instead, the session expires after 60 minutes of inactivity (tabs left open get 401), and a new one-time key is issued every time you open the screen from the icon (a reissued key expires after 5 minutes, and an earlier unused key becomes invalid). On Windows, running `scriptura ui --tray` again while one is already resident on the default port does not start a second one; the resident one opens the browser. When launched from something other than a terminal (such as the Start menu), it relaunches itself as a process without a console window.
+- **Resident at logon (Setup edition only; off by default)**: switch it with `scriptura ui --autostart on|off` or with "Start at logon" in the icon's menu (`tray_autostart` in `app-update.json` in the state folder). No extra logon entry is added; the resident UI is started after the logon-time `update-apply` finishes (if it started first, the install folder would count as having another process running and updates would never be applied). At a logon where an update is applied, the updater starts the new version's resident UI after the swap. The Setup edition's Start menu entry (a launch with no arguments) shows its guidance and then keeps the admin UI resident and opens it in the browser. Because Scriptura keeps running from the install folder while resident, a downloaded update is applied at the next logon. `--autostart` cannot be used with the plugin-bundled or standalone `install` executable (staying resident with `ui --tray` still works).
 - **Protection**: the disposable key URL generated at each launch (`/auth?key=…`) is exchanged once for a session cookie (`HttpOnly; SameSite=Strict`) (without the cookie, the response is 401). Host must be only `127.0.0.1:<port>` or `localhost:<port>`; if an Origin is present it must be same-origin; and a POST requires same-origin (`Origin` or `Sec-Fetch-Site`) plus a CSRF token. Response headers such as CSP, `nosniff`, and `no-store` are added, and secret values are never displayed. Because browsers do not isolate cookies by port, the cookie is also sent to services running on other 127.0.0.1 ports on the same PC (processes of the same user can already touch the settings file, so the only concern is a local service with different privileges).
 - **Conflicts**: a save compares the version it displayed and, if the file was changed elsewhere, tells you to reload.
-- **Confirmation screen**: switching to push mode, switching the permission to `bypass`, changing the enrollment policy to `all` / `remote-owner`, removing the cost cap (`max_budget_usd`), adding a custom kind's target path, recording consent, removing a registration, applying an update proposal, and `run-now` in push mode (and restoring history to a version that includes any of these) do not write on the first submission; they show a list of the changes and ask for a one-time confirmation (valid for 10 minutes).
+- **Confirmation screen**: switching to push mode, switching the permission to `bypass`, changing the enrollment policy to `all` / `remote-owner`, adding a custom kind's target path, recording consent, removing a registration, applying an update proposal, and `run-now` in push mode (and restoring history to a version that includes any of these) do not write on the first submission; they show a list of the changes and ask for a one-time confirmation (valid for 10 minutes).
 - **Screens**: Overview / Repositories (register, enable, pause, resume, remove, mode and target documents, `run-now`) / Document kinds (add, edit, and delete kinds; edit templates in `templates/`) / Update proposals (inspect diffs, apply, discard) / Worker / General / Consent / History (change history, diffs, restore) / Diagnostics. `run-now` takes time, so it runs in the background and you can check its status on the screen.
 
 ## Language of output
@@ -253,11 +255,11 @@ All commands except `ui` accept `--json` (prints a single machine-readable JSON 
 | `enable --repo <path> --accept-consent <version> [--mode propose\|push\|off] [--branches a,b] [--documents AGENTS.md,README.md]` | Registers and enables a repository. `--documents` accepts the 4 built-in kinds (including `CHANGELOG.md`; case-insensitive) and the ids of custom kinds defined in the settings. |
 | `disable --repo <path>` | Removes the registration. |
 | `pause [--repo <path>]` / `resume [--repo <path>]` | Pause / resume (the cwd's repository when `--repo` is omitted). |
-| `status` | Shows the installation state, settings, consent, registrations, worker settings, the number of update proposals, and the Setup edition's information (`setup`: whether it is managed, packId, version, executable, auto-update, the last check / failure times, the downloaded version, the registration result, and any leftover old standalone install). `installedVersion` comes from the standalone `install` record (`install.json`, or an earlier version's `current.json` if absent). |
+| `status` | Shows the installation state, settings, consent, registrations, worker settings, the number of update proposals, and the Setup edition's information (`setup`: whether it is managed, packId, version, executable, auto-update, whether the admin UI stays resident at logon (`trayAutostart`), the last check / failure times, the downloaded version, the registration result, and any leftover old standalone install). `installedVersion` comes from the standalone `install` record (`install.json`, or an earlier version's `current.json` if absent). |
 | `doctor [--verify]` | Diagnoses the environment and settings (described below). |
 | `run-now [--repo <path>] [--documents <id,...>]` | Runs maintenance once right now without waiting for a push (only for registered, consented repositories; timing is ignored and all enabled kinds are processed). `--documents` narrows the kinds to process (an undefined kind, or one that is disabled for this repository, is refused without starting the worker). **Note**: a narrowed `run-now` also advances the processed position, and since there is one update proposal per commit, kinds outside the narrowing are not maintained for that push. A propose that violates the post-maintenance checks returns an `outcome` of `rejected` (with a `reason`; this is not a failure, and that push counts as processed). |
 | `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | Lists the document kinds (built-in and custom) and shows the details of one (enabled or disabled, target paths and whether they exist, limits, timing, template status, last completion time; `show` also prints the configured guidance and additional instructions. Read-only, and it does not print document contents). |
-| `ui [--port <n>] [--no-open]` | Launches the admin UI (described above). `--json` cannot be used. |
+| `ui [--port <n>] [--no-open] [--tray]` / `ui --autostart on\|off` | Launches the admin UI (described above; `--tray` keeps it resident) / switches the Setup edition's resident-at-logon setting. `--json` cannot be used. |
 | `review [sha\|latest] [--repo <path>]` | Inspects an update proposal's diffstat, patch path, and target documents. |
 | `apply [sha\|latest] [--repo <path>]` | Applies an update proposal to the working tree. Refused if the target documents have uncommitted changes. |
 | `discard [sha\|latest] [--repo <path>]` | Discards an update proposal. |
@@ -277,7 +279,7 @@ All commands except `ui` accept `--json` (prints a single machine-readable JSON 
 
 ## Cost and data transmission
 
-The maintenance worker (Sonnet by default) runs with **your own Claude authentication**. The repository contents the worker reads are sent to Anthropic, and Claude usage charges (consumption) are incurred on every run. The worker runs at most once per push, with `worker.timeout_secs` as its upper bound. You can also specify a budget cap with `worker.max_budget_usd`.
+The maintenance worker (Sonnet by default) runs with **your own Claude authentication**. The repository contents the worker reads are sent to Anthropic, and Claude usage charges (consumption) are incurred on every run. The worker runs at most once per push, with `worker.timeout_secs` as its upper bound.
 
 ## Diagnostics (doctor)
 
@@ -304,7 +306,8 @@ A user who ran an older Scriptura (a version that had no settings file) and stil
 - Switching auto-update in the admin UI (`ui`) is not supported (use `scriptura update --auto on|off`).
 - On Windows, the logon Run value does not inherit `SCRIPTURA_HOME` (the macOS LaunchAgent and the Linux autostart entry do).
 - On non-Windows platforms, resuming maintenance that was interrupted while the worker was running is skipped (there is no way to confirm the worker has ended).
-- Publishing via branch + PR is planned for later. Custom kinds are limited to fixed paths (globs and subdirectory scanning come later), and per-kind overrides of model and effort, per-repository kind settings (`[repository.kinds]`), forced template application, editing settings from the CLI (`set`), and the admin UI's tray residency and auto-start are also planned for later.
+- Publishing via branch + PR is planned for later. Custom kinds are limited to fixed paths (globs and subdirectory scanning come later), and per-kind overrides of model and effort, per-repository kind settings (`[repository.kinds]`), forced template application, and editing settings from the CLI (`set`) are also planned for later.
+- The admin UI's resident mode (`ui --tray`) is available on Windows and macOS only (Linux is not supported). The icon is a provisional design (drawn at run time on Windows, a system symbol on macOS). On macOS, starting it and exiting with Ctrl+C were confirmed on real hardware, but the menu bar icon's appearance, clicks, and menu have not been checked by eye. Staying resident at logon, and starting the resident UI after an update is applied (Setup edition), have not been verified in a real installation.
 
 ## Verification
 

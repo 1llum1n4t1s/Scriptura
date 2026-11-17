@@ -108,7 +108,6 @@ exclude = ["private/**"]                        # 會「追加」到預設的敏
 model = "claude-sonnet-5-5"
 effort = "high"
 timeout_secs = 1200                             # 60..=1500（比 Stop hook 的 1800 秒短）
-max_budget_usd = 0.0                            # 0 表示未指定
 permission = "restricted"                       # restricted / bypass
 claude_path = ""                                # 空字串表示搜尋 PATH（若有指定則為絕對路徑）
 
@@ -229,15 +228,18 @@ documents = ["README.md", "CHANGELOG.md"]
 ## 管理介面（`scriptura ui`）
 
 ```powershell
-scriptura ui [--port <n>] [--no-open]
+scriptura ui [--port <n>] [--no-open] [--tray]
+scriptura ui --autostart on|off
 ```
 
-這是一個以瀏覽器操作的畫面，用來處理設定、更新提案與診斷。提供 9 種語言（ja、en、zh-CN、zh-TW、ko、es、fr、de、pt-BR）。語言依下列順序選擇：畫面頂端的語言選擇器（儲存在 cookie 中）→ 瀏覽器的 `Accept-Language` → 英文。它不會常駐：當你在畫面上選擇「Quit」、按下 Ctrl+C，或閒置 60 分鐘後，啟動它的指令就會結束。hook 不會查看該畫面是否開啟。它由 cargo feature `ui` 控制（預設啟用），以 `--no-default-features` 建置時不會包含（此時 `scriptura ui` 會拒絕並結束）。
+這是一個以瀏覽器操作的畫面，用來處理設定、更新提案與診斷。提供 9 種語言（ja、en、zh-CN、zh-TW、ko、es、fr、de、pt-BR）。語言依下列順序選擇：畫面頂端的語言選擇器（儲存在 cookie 中）→ 瀏覽器的 `Accept-Language` → 英文。預設不會常駐：當你在畫面上選擇「Quit」、按下 Ctrl+C，或閒置 60 分鐘後，啟動它的指令就會結束（加上 `--tray` 則會常駐，見下文）。hook 不會查看該畫面是否開啟。它由 cargo feature `ui` 控制（預設啟用），以 `--no-default-features` 建置時不會包含（此時 `scriptura ui` 會拒絕並結束）。
 
 - **監聽**：僅限 `127.0.0.1`（預設連接埠為 7468；`--port 0` 會挑選一個空閒連接埠）。若連接埠已被占用，則結束。
+- **常駐（`--tray`）**：在 Windows 以系統匣圖示、在 macOS 以選單列圖示的形式常駐（不支援 Linux；`--tray` 會拒絕並結束）。點擊圖示會開啟管理介面，右鍵選單提供「開啟管理畫面」「登入時啟動」（僅限 Setup 版）與「結束」。常駐期間不會因閒置而結束，而是在閒置 60 分鐘後讓工作階段失效（一直開著的分頁會得到 401），並且每次從圖示開啟畫面時都會重新核發一次性金鑰（重新核發的金鑰 5 分鐘後失效，先前未使用的金鑰會作廢）。在 Windows 上，若已在預設連接埠常駐，再次執行 `scriptura ui --tray` 不會啟動第二個，而是由常駐的那個開啟瀏覽器。若是從終端機以外（例如開始功能表）啟動，它會以沒有主控台視窗的處理程序重新啟動自己。
+- **登入時常駐（僅限 Setup 版；預設為關閉）**：以 `scriptura ui --autostart on|off`，或圖示選單中的「登入時啟動」切換（狀態資料夾中 `app-update.json` 的 `tray_autostart`）。不會增加額外的登入項目；常駐介面會在登入時的 `update-apply` 結束後才啟動（若它先啟動，安裝資料夾會被視為有其他處理程序正在執行，更新就永遠不會被套用）。在套用了更新的那次登入中，更新程式會在替換完成後啟動新版本的常駐介面。Setup 版的開始功能表項目（不帶引數的啟動）會先顯示說明，接著讓管理介面常駐並在瀏覽器中開啟。由於常駐期間 Scriptura 會一直在安裝資料夾中執行，已下載的更新要到下一次登入才會被套用。隨外掛程式封裝的執行檔與單機 `install` 的執行檔不能使用 `--autostart`（以 `ui --tray` 常駐仍然可行）。
 - **保護**：每次啟動時產生的一次性金鑰 URL（`/auth?key=…`）會被換成一次性的工作階段 cookie（`HttpOnly; SameSite=Strict`）（沒有 cookie 時，回應為 401）。Host 必須只能是 `127.0.0.1:<port>` 或 `localhost:<port>`；若有 Origin，必須為同源；POST 需要同源（`Origin` 或 `Sec-Fetch-Site`）加上 CSRF 權杖。回應標頭如 CSP、`nosniff` 與 `no-store` 都會加上，且絕不顯示祕密值。由於瀏覽器不會依連接埠隔離 cookie，該 cookie 也會被送往同一台 PC 上其他 127.0.0.1 連接埠上執行的服務（同一位使用者的處理程序本來就能存取設定檔，因此唯一的疑慮是權限不同的本機服務）。
 - **衝突**：儲存時會比對其所顯示的版本，若檔案已在其他地方被變更，會提示你重新載入。
-- **確認畫面**：切換到 push 模式、將權限切換為 `bypass`、將註冊政策變更為 `all` / `remote-owner`、移除費用上限（`max_budget_usd`）、新增自訂種類的目標路徑、記錄同意、移除註冊、套用更新提案，以及在 push 模式下的 `run-now`（還有將歷史還原到包含上述任何一項的版本）都不會在第一次送出時寫入；它們會顯示變更清單，並要求一次性的確認（10 分鐘內有效）。
+- **確認畫面**：切換到 push 模式、將權限切換為 `bypass`、將註冊政策變更為 `all` / `remote-owner`、新增自訂種類的目標路徑、記錄同意、移除註冊、套用更新提案，以及在 push 模式下的 `run-now`（還有將歷史還原到包含上述任何一項的版本）都不會在第一次送出時寫入；它們會顯示變更清單，並要求一次性的確認（10 分鐘內有效）。
 - **畫面**：Overview / Repositories（註冊、啟用、暫停、恢復、移除、模式與目標文件、`run-now`）/ Document kinds（新增、編輯與刪除種類；編輯 `templates/` 中的範本）/ Update proposals（檢視差異、套用、捨棄）/ Worker / General / Consent / History（變更歷史、差異、還原）/ Diagnostics。`run-now` 需要時間，因此會在背景執行，你可以在畫面上確認其狀態。
 
 ## 輸出語言
@@ -253,11 +255,11 @@ CLI、hook 與安裝程式的指引輸出提供 9 種語言（ja、en、zh-CN、
 | `enable --repo <path> --accept-consent <version> [--mode propose\|push\|off] [--branches a,b] [--documents AGENTS.md,README.md]` | 註冊並啟用儲存庫。`--documents` 接受 4 種內建種類（包含 `CHANGELOG.md`；不區分大小寫）以及設定中所定義的自訂種類 id。 |
 | `disable --repo <path>` | 移除註冊。 |
 | `pause [--repo <path>]` / `resume [--repo <path>]` | 暫停／恢復（省略 `--repo` 時為目前工作目錄所在的儲存庫）。 |
-| `status` | 顯示安裝狀態、設定、同意、註冊、worker 設定、更新提案的數量，以及 Setup 版的資訊（`setup`：是否受管理、packId、版本、執行檔、自動更新、最近的檢查／失敗時間、已下載的版本、註冊結果，以及遺留的舊版單機安裝）。`installedVersion` 來自單機版 `install` 的記錄（`install.json`，若無則為更早版本的 `current.json`）。 |
+| `status` | 顯示安裝狀態、設定、同意、註冊、worker 設定、更新提案的數量，以及 Setup 版的資訊（`setup`：是否受管理、packId、版本、執行檔、自動更新、登入時管理介面是否常駐（`trayAutostart`）、最近的檢查／失敗時間、已下載的版本、註冊結果，以及遺留的舊版單機安裝）。`installedVersion` 來自單機版 `install` 的記錄（`install.json`，若無則為更早版本的 `current.json`）。 |
 | `doctor [--verify]` | 診斷環境與設定（詳見後文）。 |
 | `run-now [--repo <path>] [--documents <id,...>]` | 不等待 push，立即執行一次維護（僅限已註冊且已同意的儲存庫；忽略時機，並處理所有已啟用的種類）。`--documents` 可縮小要處理的種類（未定義的種類，或在該儲存庫中已停用的種類，會在不啟動 worker 的情況下被拒絕）。**注意**：縮小範圍的 `run-now` 同樣會推進已處理位置，且由於每個 commit 只有一個更新提案，縮小範圍之外的種類在該次 push 中不會被維護。違反維護後檢查的 propose 會回傳 `outcome` 為 `rejected`（附帶 `reason`；這不算失敗，該次 push 視為已處理）。 |
 | `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | 列出文件種類（內建與自訂），並顯示單一種類的詳細資訊（啟用或停用、目標路徑及其是否存在、上限、時機、範本狀態、最後完成時間；`show` 也會印出已設定的 guidance 與額外指示。唯讀，且不會印出文件內容）。 |
-| `ui [--port <n>] [--no-open]` | 啟動管理介面（詳見前文）。不可使用 `--json`。 |
+| `ui [--port <n>] [--no-open] [--tray]` / `ui --autostart on\|off` | 啟動管理介面（詳見前文；`--tray` 使其常駐）/ 切換 Setup 版的登入時常駐設定。不可使用 `--json`。 |
 | `review [sha\|latest] [--repo <path>]` | 檢視更新提案的 diffstat、patch 路徑與目標文件。 |
 | `apply [sha\|latest] [--repo <path>]` | 將更新提案套用到工作樹。若目標文件有未 commit 的變更則拒絕。 |
 | `discard [sha\|latest] [--repo <path>]` | 捨棄更新提案。 |
@@ -277,7 +279,7 @@ CLI、hook 與安裝程式的指引輸出提供 9 種語言（ja、en、zh-CN、
 
 ## 費用與資料傳送
 
-維護 worker（預設為 Sonnet）使用**你自己的 Claude 驗證**執行。worker 所讀取的儲存庫內容會被傳送到 Anthropic，且每次執行都會產生 Claude 的使用費用（消耗量）。每次 push 最多只會執行一次 worker，並以 `worker.timeout_secs` 作為其上限。你也可以用 `worker.max_budget_usd` 指定預算上限。
+維護 worker（預設為 Sonnet）使用**你自己的 Claude 驗證**執行。worker 所讀取的儲存庫內容會被傳送到 Anthropic，且每次執行都會產生 Claude 的使用費用（消耗量）。每次 push 最多只會執行一次 worker，並以 `worker.timeout_secs` 作為其上限。
 
 ## 診斷（doctor）
 
@@ -304,7 +306,8 @@ CLI、hook 與安裝程式的指引輸出提供 9 種語言（ja、en、zh-CN、
 - 不支援在管理介面（`ui`）中切換自動更新（請使用 `scriptura update --auto on|off`）。
 - 在 Windows 上，登入時的 Run 值不會繼承 `SCRIPTURA_HOME`（macOS 的 LaunchAgent 與 Linux 的 autostart 項目則會）。
 - 在非 Windows 平台上，恢復在 worker 執行中被中斷的維護時會被略過（沒有辦法確認 worker 已結束）。
-- 透過分支 + PR 發布的功能預計於日後提供。自訂種類僅限於固定路徑（glob 與子目錄掃描之後才會支援），而各種類對 model 與 effort 的覆寫、各儲存庫的種類設定（`[repository.kinds]`）、強制套用範本、從 CLI 編輯設定（`set`），以及管理介面的系統匣常駐與自動啟動，也都預計於日後提供。
+- 透過分支 + PR 發布的功能預計於日後提供。自訂種類僅限於固定路徑（glob 與子目錄掃描之後才會支援），而各種類對 model 與 effort 的覆寫、各儲存庫的種類設定（`[repository.kinds]`）、強制套用範本，以及從 CLI 編輯設定（`set`），也都預計於日後提供。
+- 管理介面的常駐（`ui --tray`）僅支援 Windows 與 macOS（不支援 Linux）。圖示為暫定設計（Windows 上是執行時繪製的圖案，macOS 上是系統符號）。在 macOS 上，已在實機確認啟動以及以 Ctrl+C 結束，但選單列圖示的顯示、點擊與選單尚未以目視確認。登入時常駐，以及套用更新後啟動常駐介面（Setup 版），尚未在實際安裝中驗證。
 
 ## 驗證
 
