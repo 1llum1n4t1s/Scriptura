@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Claude Code を一度も起動していない（`~/.claude` が無い）環境で、Setup 版の導入時と `connect claude-code --apply` の Stop hook の登録が「No such file or directory」で失敗していた。設定フォルダーを作ってから登録する。
+
 ## [1.0.1] - 2026-11-18
 
 ### Added

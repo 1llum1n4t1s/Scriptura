@@ -478,7 +478,12 @@ fn read_settings(path: &Path) -> Result<Value, String> {
 
 /// 変更を書き込む。最初の変更前に元の内容を `settings.json.scriptura-backup` へ退避し（既にあれば
 /// 上書きしない）、一時ファイルへ書いてから rename する。退避したときはそのパスを返す。
+/// Claude Code を一度も起動していないと設定フォルダー（`~/.claude` など）が無いので、先に作る
+/// （無いまま書くと登録が「No such file or directory」で失敗し続ける）。
 fn write_settings(path: &Path, settings: &Value) -> Result<Option<PathBuf>, String> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     let backup = path.with_file_name("settings.json.scriptura-backup");
     let mut made = None;
     if path.exists() && !backup.exists() {
@@ -792,6 +797,30 @@ mod tests {
         assert!(!merge_setup_hooks(&mut settings, &exe).unwrap());
         assert!(merge_setup_hooks(&mut json!([]), &exe).is_err());
         assert!(merge_setup_hooks(&mut json!({"hooks":{"Stop":{}}}), &exe).is_err());
+    }
+
+    #[test]
+    fn setup_registration_creates_a_missing_claude_config_folder() {
+        // Claude Code を一度も起動していない環境（`~/.claude` が無い）でも登録できる。
+        let exe = setup_exe();
+        let root = std::env::temp_dir().join(format!("scriptura-connect-{}", uuid::Uuid::new_v4()));
+        let path = root.join(".claude").join("settings.json");
+        assert!(!root.exists());
+        assert_eq!(
+            register_for_setup(&path, &exe),
+            SetupRegistration::Registered {
+                changed: true,
+                legacy_hook: false
+            }
+        );
+        assert_eq!(commands(&read(&path)), [hook_command(&exe).unwrap()]);
+        // 元のファイルが無かったので退避は作らない。
+        assert!(
+            !path
+                .with_file_name("settings.json.scriptura-backup")
+                .exists()
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
