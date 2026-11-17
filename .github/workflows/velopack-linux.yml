@@ -108,6 +108,14 @@ jobs:
             export PATH="$CI_ROOT/tools/dotnet:$PATH" DOTNET_ROOT="$CI_ROOT/tools/dotnet"
           fi
           dotnet --version
+          # tool-path で入れた vpk（apphost）は、DOTNET_ROOT が無いと既定の場所だけで runtime を探す。macOS のランナーの
+          # dotnet は既定の場所の外にあり、hostfxr を見つけられずに終了コード 131（0x80008083）で落ちたため、実体の場所を渡す。
+          if [[ -z "${DOTNET_ROOT:-}" ]]; then
+            DOTNET_ROOT="$(dirname "$(python3 -c 'import os, shutil; print(os.path.realpath(shutil.which("dotnet")))')")"
+            export DOTNET_ROOT
+            printf 'DOTNET_ROOT=%s\n' "$DOTNET_ROOT" >> "$GITHUB_ENV"
+          fi
+          echo "DOTNET_ROOT=$DOTNET_ROOT"
           dotnet tool install vpk --version 1.2.161 --tool-path "$CI_ROOT/tools/vpk"
           printf '%s\n' "$CI_ROOT/tools/vpk" >> "$GITHUB_PATH"
           # 出力を変数に取ってから照合する（パイプで grep -q が先に終わると、pipefail で誤って失敗になるため）。
