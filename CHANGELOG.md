@@ -2,9 +2,15 @@
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-18
+
 ### Added
 
 - macOS（Apple Silicon、11 以降）と Linux（x64・arm64、glibc 2.39 以降）向けの Setup を配信する。macOS は Developer ID で署名して公証した `.pkg`、Linux は AppImage で、Windows と同じ自動更新の仕組みで配信する。
+
+### Fixed
+
+- macOS など大文字小文字を区別しないファイルシステムで、ファイル名の大文字小文字だけが違う CHANGELOG（例: `Changelog.md`）の保守が、常に「対象文書以外の変更」として棄却されていた。
 
 ## [1.0.0] - 2026-11-18
 
