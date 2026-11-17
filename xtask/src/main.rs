@@ -9,7 +9,7 @@ fn usage() -> &'static str {
      \n\
      stage [--target <triple>] [--binary <absolute-path>]  本体を同梱先へコピー\n\
      checksums                                            SHA256SUMS を生成\n\
-     package [--out <absolute-dir>]                        再現可能な zip を作成（既定 D:\\tmp\\scriptura-release）\n\
+     package [--out <absolute-dir>]                        再現可能な zip を作成（既定 <OS の一時フォルダー>/scriptura-release）\n\
      marketplace-entry --url <https-url> --sha256 <hex>    archive ソースの項目 JSON を出力\n"
 }
 
@@ -65,8 +65,7 @@ fn run(args: &[String]) -> Result<()> {
                     }
                     d
                 }
-                None if cfg!(windows) => PathBuf::from(DEFAULT_OUT_DIR),
-                None => return Err("Windows 以外では --out の指定が必要です".into()),
+                None => default_out_dir(),
             };
             let (zip, sha) = package(&root, &out)?;
             eprintln!("作成しました: {}", zip.display());

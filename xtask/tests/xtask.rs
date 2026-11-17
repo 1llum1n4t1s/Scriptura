@@ -154,7 +154,7 @@ fn package_contains_sums_and_preserves_exec_bits() {
         let mut f = ar.by_index(i).unwrap();
         let mut s = Vec::new();
         f.read_to_end(&mut s).unwrap();
-        names.push((f.name().to_string(), f.unix_mode().unwrap()));
+        names.push((f.name().unwrap().to_string(), f.unix_mode().unwrap()));
     }
     let mode = |n: &str| {
         names

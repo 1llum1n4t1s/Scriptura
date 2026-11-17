@@ -19,8 +19,12 @@ pub type Result<T> = std::result::Result<T, String>;
 
 /// プラグインのディレクトリ（リポジトリのルートからの相対パス）。
 pub const PLUGIN_REL: &str = "plugins/scriptura";
-/// 既定の zip 出力先。C ドライブの TEMP は使わない運用規約のため D ドライブ固定。
-pub const DEFAULT_OUT_DIR: &str = r"D:\tmp\scriptura-release";
+/// 既定の zip 出力先。一時物の置き場は OS の一時フォルダー（Windows は `%TEMP%`）に統一する
+/// 運用規約のため、`std::env::temp_dir()` 配下の `scriptura-release` を返す。
+/// TEMP/TMP の環境変数を尊重し、固定パスは持たない。
+pub fn default_out_dir() -> PathBuf {
+    std::env::temp_dir().join("scriptura-release")
+}
 /// チェックサムファイル名（プラグイン直下）。
 pub const SUMS_FILE: &str = "SHA256SUMS";
 
@@ -311,6 +315,9 @@ pub fn package(root: &Path, out_dir: &Path) -> Result<(PathBuf, String)> {
                 .compression_method(zip::CompressionMethod::Deflated)
                 .compression_level(Some(9))
                 .last_modified_time(zip::DateTime::default())
+                // 配布物の mode（実行ビットを含む）を読み手へ確実に伝えるため、作った環境に関係なく Unix として記録する。
+                // zip 9 は未指定だと Windows で DOS 扱いにし、unix_mode が読めなくなる（実行ビットが失われる）。
+                .system(zip::System::Unix)
                 .unix_permissions(*mode);
             zw.start_file(rel.as_str(), opts)
                 .map_err(|e| format!("zip エントリ {rel} を開始できません: {e}"))?;
