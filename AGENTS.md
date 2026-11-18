@@ -60,7 +60,7 @@ Scriptura は、利用者が登録した自分のリポジトリへの push 後�
 - **管理外のビルド（開発・プラグイン同梱・単独 install）では何もしない**。公開関数は Velopack 管理下と分かる前に状態フォルダーへ触れない（`tests/cli.rs` の `setup_features_do_nothing_in_a_non_velopack_build` と `app_update` の単体テストが正本）。
 - `update-feed-test` feature（本番ビルドに入れない）だけが `SCRIPTURA_UPDATE_FEED_DIR` と `SCRIPTURA_UPDATE_ALLOW_UNSIGNED=1` を読む。ただし省けるのは署名の検証だけで、Linux（署名が無く、置き場の所有者・権限とパッケージの形を見る）ではこの環境変数でも検証を省かない。
 - 検証で本物の導入・`~/.claude/settings.json`・HKCU Run・Claude Code の登録に触れない。テスト用 packId（例 `ScripturaVelopackTest`）、外部の作業フォルダーへの `--installto`、プロセス単位の `SCRIPTURA_HOME`・`CLAUDE_CONFIG_DIR`・`TEMP`/`TMP` で隔離し、終わったらテスト用の Run 値・アンインストール情報・導入先を外す。レジストリの単体テストは専用のハイブ（`RegLoadAppKeyW`）を使う。macOS・Linux の cfg コードは Windows 上では未コンパイル（`velopack-macos.yml`・`velopack-linux.yml` の CI と実機で確かめる）。
-- **配信 CI**（`.github/workflows/release-velopack.yml`）は windows・macos・linux（x64・arm64）の 4 job が独立（`needs` なし）。push は `release/<x.y.z>` だけで起動し、試走は `release/dryrun-*` を dispatch する（mode は入力ではなくブランチ名で決め、配信は publish のときだけ。配信済みのチャネルは飛ばす）。macOS は一時キーチェーンと App Store Connect API キーで署名・公証（Secrets は準備 step だけ）、Linux は ubuntu-24.04 で梱包して glibc 2.39 以下を検査する。
+- **配信 CI**（`.github/workflows/release-velopack.yml`）は windows・macos・linux（x64・arm64）の 4 job が独立（`needs` なし）。push は main のコミットに付けた軽量タグ `v<x.y.z>` だけで起動し（`git push origin v<x.y.z>`。`git push --tags` は使わない）、試走は `dryrun/<任意>` ブランチを dispatch する（mode は入力ではなく ref で決め、配信は publish のときだけ。publish はタグの形・Cargo.toml の版・軽量タグ・main の祖先を各 job で確かめる。配信済みのチャネルは飛ばす）。配信のやり直しは `gh workflow run release-velopack.yml --ref v<x.y.z>`。macOS は一時キーチェーンと App Store Connect API キーで署名・公証（Secrets は準備 step だけ）、Linux は ubuntu-24.04 で梱包して glibc 2.39 以下を検査する。
 
 ## ローカライズ（9 言語）
 

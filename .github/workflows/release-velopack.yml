@@ -12,16 +12,16 @@ name: Release Velopack
 # （梱包した実行ファイルが glibc 2.39 を超える記号を使えば失敗させる）。macOS は MACOSX_DEPLOYMENT_TARGET=11.0。
 #
 # 方針:
-# - 実行可能な Actions を使わない。checkout は git のコマンドで行い、Sigilune はタグを固定して git で取得して導入する。
+# - 実行可能な Actions を使わない。checkout は git のコマンドで行い、Sigilune は commit SHA を固定して git で取得して導入する。
 #   成果物の受け渡しに upload-artifact が要らないよう、梱包・署名と配信は同じ job で行う。
 # - 署名の Secrets（Sigilune・Apple）と R2 の Secrets は、それぞれ使う step だけへ渡す（テスト・ビルド・梱包の step には
 #   渡さない。macOS の梱包 step へは identity 名・プロファイル名・キーチェーンのパスだけを渡す）。
-# - 起動: release/<x.y.z> ブランチの push（ブランチ名が数字 3 つの版のときだけ）と workflow_dispatch。どちらも release/* 上で
-#   だけ動く（Environment の deployment branch policy も release/* に限る）。main など他のブランチの push では動かない。
-#   release/dryrun-* の push では起動しないので、試走は release/dryrun-<任意> ブランチを作って workflow_dispatch で起動する
-#   （Environment の許可パターン release/* に一致するため Secrets を使える）。
-# - 各 job の mode は入力値ではなくブランチ名で決める: release/<Cargo.toml の版> なら publish、release/dryrun- で始まれば
-#   dryrun、それ以外は失敗。R2 への配信は publish のときだけ。dryrun は署名・公証まで本番どおりに梱包し（macOS は
+# - 起動: main のコミットに付けた軽量タグ v<x.y.z> の push（タグ名が数字 3 つの版のときだけ）と workflow_dispatch。
+#   dispatch は、配信のやり直し（gh workflow run release-velopack.yml --ref v<x.y.z>）と試走（dryrun/<任意> ブランチ）にだけ使う
+#   （Environment の deployment policy も、タグ v<x.y.z> と dryrun/* に限る）。main など他のブランチの push では動かない。
+#   dryrun/* の push では起動しないので、試走は dryrun/<任意> ブランチを作って workflow_dispatch で起動する。
+# - 各 job の mode は入力値ではなく ref で決める: タグ v<Cargo.toml の版> なら publish（軽量タグ・main の祖先も確かめる）、
+#   dryrun/ で始まるブランチからの workflow_dispatch なら dryrun、それ以外は失敗。R2 への配信は publish のときだけ。dryrun は署名・公証まで本番どおりに梱包し（macOS は
 #   テスト用の packId ScripturaVelopackTest・版 9.0.0）、publish-r2.ps1 -DryRun で置く予定の一覧を表示するだけで R2 へは書かない。
 # - 部分配信と再実行: publish では、各 job が公開 URL の releases.<channel>.json（Secrets なしで取得。404 は未配信）に
 #   その版が載っているかを先に調べ、載っていれば梱包と配信を飛ばす（notice を出す）。そのため、dispatch や失敗した job の
@@ -33,7 +33,7 @@ name: Release Velopack
 # - Scriptura には ci.yml が無いため、配信の前に各 job 内でテスト（cargo test --locked --features test-support --
 #   --test-threads=1）も通す。
 # - 本人が事前に用意するもの（リポジトリの設定。値はここに書かない）:
-#     Environment `r2-release`（deployment branch は release/* のみ）に
+#     Environment `r2-release`（deployment は タグ v<x.y.z> と dryrun/* のみ）に
 #       Secrets:   R2_RELEASE_ACCESS_KEY_ID / R2_RELEASE_SECRET_ACCESS_KEY（R2）
 #                  SIGILUNE_EMAIL / SIGILUNE_TOTP_URI（Windows の署名）
 #                  APPLE_DEVELOPER_ID_APPLICATION_P12_BASE64 / APPLE_DEVELOPER_ID_INSTALLER_P12_BASE64 / APPLE_P12_PASSWORD
@@ -44,7 +44,7 @@ name: Release Velopack
 #     成果物を受け渡す形に変える（その場合は upload-artifact 相当の受け渡し方法を決める必要がある）。
 on:
   push:
-    branches: ['release/[0-9]+.[0-9]+.[0-9]+']
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
   workflow_dispatch:
 
 permissions:
@@ -57,7 +57,7 @@ concurrency:
 jobs:
   windows-installer:
     name: windows-installer
-    if: github.repository == '1llum1n4t1s/scriptura' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/heads/release/')
+    if: github.repository == '1llum1n4t1s/scriptura' && ((github.event_name == 'push' && github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && (github.ref_type == 'tag' || startsWith(github.ref, 'refs/heads/dryrun/'))))
     runs-on: windows-latest
     environment: r2-release
     timeout-minutes: 60
@@ -101,8 +101,12 @@ jobs:
           $help = (vpk --help 2>&1 | Out-String) -replace "`e\[[0-9;]*m", ''
           if ($help -notmatch '\bVelopack CLI 1\.2\.161\b') { Write-Host $help; throw 'vpk 1.2.161 could not start.' }
 
-      - name: Decide the mode (publish or dryrun) from the branch name
-        # 入力値ではなくブランチ名で決める。release/<Cargo.toml の版> は publish、release/dryrun-* は dryrun、それ以外は失敗。
+      - name: Decide the mode (publish or dryrun) from the ref
+        # 入力値ではなく ref で決める。タグ v<Cargo.toml の版> は publish、dryrun/<任意> ブランチからの workflow_dispatch は dryrun、
+        # それ以外は失敗。publish は、タグの形（厳密な v<x.y.z>）・Cargo.toml の版との一致・軽量タグがこの commit を指すこと・
+        # 既定ブランチの祖先であることを無条件に確かめる（Secrets を使う step より前。checkout は depth=1 なので祖先は compare API で調べる）。
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
           $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
@@ -110,9 +114,24 @@ jobs:
           $version = ($metadata.packages | Where-Object name -eq 'scriptura').version
           if ($version -cnotmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw "Unexpected package version '$version'." }
           $ref = $env:GITHUB_REF_NAME
-          if ($ref -ceq "release/$version") { $mode = 'publish' }
-          elseif ($ref.StartsWith('release/dryrun-', [StringComparison]::Ordinal)) { $mode = 'dryrun' }
-          else { throw "The branch '$ref' must be 'release/$version' (the version in Cargo.toml) to publish, or start with 'release/dryrun-' for a dry run." }
+          if ($env:GITHUB_REF_TYPE -ceq 'tag') {
+            if ($ref -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw "The tag '$ref' is not a strict v<major>.<minor>.<patch>." }
+            if ($ref -cne "v$version") { throw "The tag '$ref' must be 'v$version' (the version in Cargo.toml) to publish." }
+            # 軽量タグで、いまもこの commit を指すこと。
+            $tagObject = (gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$ref" --jq '.object.type + " " + .object.sha' | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($tagObject -cne "commit $env:GITHUB_SHA") { throw "The tag '$ref' is not a lightweight tag that points at $env:GITHUB_SHA ($tagObject)." }
+            # 既定ブランチの祖先であること（depth=1 の checkout では判定できないので compare API を使う）。
+            $default = (gh api "repos/$env:GITHUB_REPOSITORY" --jq .default_branch | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($default -cnotmatch '^[A-Za-z0-9._/-]+$') { throw 'Default branch is invalid.' }
+            $cmp = (gh api "repos/$env:GITHUB_REPOSITORY/compare/$($env:GITHUB_SHA)...$($default)?per_page=1" --jq '.status + " " + (.behind_by | tostring)' | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($cmp -cne 'ahead 0' -and $cmp -cne 'identical 0') { throw "The tagged commit is not an ancestor of $default ($cmp)." }
+            $mode = 'publish'
+          }
+          elseif ($env:GITHUB_REF_TYPE -ceq 'branch' -and $env:GITHUB_EVENT_NAME -ceq 'workflow_dispatch' -and $ref.StartsWith('dryrun/', [StringComparison]::Ordinal)) { $mode = 'dryrun' }
+          else { throw "The ref '$ref' must be the tag 'v$version' (the version in Cargo.toml) to publish, or a 'dryrun/*' branch run with workflow_dispatch for a dry run." }
           Write-Host "mode=$mode version=$version"
           "MODE=$mode" >> $env:GITHUB_ENV
           "VERSION=$version" >> $env:GITHUB_ENV
@@ -169,7 +188,7 @@ jobs:
         if: env.PUBLISHED != 'true'
         run: |
           $ErrorActionPreference = 'Stop'
-          # Sigilune は R2 配布の版とコミット SHA を固定する（タグは使わない）。更新するときはこの 2 行を同時に変える。
+          # Sigilune は R2 配布の版とコミット SHA を固定する（移動タグ v1 は使わない。git 取得の契約）。更新するときはこの 2 行を同時に変える。
           $sigiluneVersion = '1.1.4'
           $sigiluneCommit = 'b2142b4d1084ec2a5b0a18e83cea7e886406b389'
           $source = Join-Path $env:RUNNER_TEMP 'sigilune-src'
@@ -230,7 +249,7 @@ jobs:
 
   macos-installer:
     name: macos-installer
-    if: github.repository == '1llum1n4t1s/scriptura' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/heads/release/')
+    if: github.repository == '1llum1n4t1s/scriptura' && ((github.event_name == 'push' && github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && (github.ref_type == 'tag' || startsWith(github.ref, 'refs/heads/dryrun/'))))
     runs-on: macos-15
     environment: r2-release
     timeout-minutes: 90
@@ -272,19 +291,33 @@ jobs:
           rustup toolchain install 1.100.0 --profile minimal --target aarch64-apple-darwin
           rustup default 1.100.0
 
-      - name: Decide the mode (publish or dryrun) from the branch name
-        # 入力値ではなくブランチ名で決める。release/<Cargo.toml の版> は publish、release/dryrun-* は dryrun、それ以外は失敗。
+      - name: Decide the mode (publish or dryrun) from the ref
+        # 入力値ではなく ref で決める。タグ v<Cargo.toml の版> は publish、dryrun/<任意> ブランチからの workflow_dispatch は dryrun、
+        # それ以外は失敗。publish は、タグの形（厳密な v<x.y.z>）・Cargo.toml の版との一致・軽量タグがこの commit を指すこと・
+        # 既定ブランチの祖先であることを無条件に確かめる（Secrets を使う step より前。checkout は depth=1 なので祖先は compare API で調べる）。
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print([p for p in json.load(sys.stdin)["packages"] if p["name"]=="scriptura"][0]["version"])')"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Unexpected package version '$version'." >&2; exit 1; }
           ref="$GITHUB_REF_NAME"
-          if [[ "$ref" == "release/$version" ]]; then
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$ref" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "The tag '$ref' is not a strict v<major>.<minor>.<patch>." >&2; exit 1; }
+            [[ "$ref" == "v$version" ]] || { echo "The tag '$ref' must be 'v$version' (the version in Cargo.toml) to publish." >&2; exit 1; }
+            # 軽量タグで、いまもこの commit を指すこと。
+            [[ "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$ref" --jq '.object.type + " " + .object.sha')" == "commit $GITHUB_SHA" ]] \
+              || { echo "The tag '$ref' is not a lightweight tag that points at $GITHUB_SHA." >&2; exit 1; }
+            # 既定ブランチの祖先であること（depth=1 の checkout では判定できないので compare API を使う）。
+            default="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
+            [[ "$default" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo 'Default branch is invalid.' >&2; exit 1; }
+            cmp="$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...$default?per_page=1" --jq '.status + " " + (.behind_by | tostring)')"
+            [[ "$cmp" == "ahead 0" || "$cmp" == "identical 0" ]] || { echo "The tagged commit is not an ancestor of $default ($cmp)." >&2; exit 1; }
             mode=publish
-          elif [[ "$ref" == release/dryrun-* ]]; then
+          elif [[ "$GITHUB_REF_TYPE" == branch && "$GITHUB_EVENT_NAME" == workflow_dispatch && "$ref" == dryrun/* ]]; then
             mode=dryrun
           else
-            echo "The branch '$ref' must be 'release/$version' (the version in Cargo.toml) to publish, or start with 'release/dryrun-' for a dry run." >&2
+            echo "The ref '$ref' must be the tag 'v$version' (the version in Cargo.toml) to publish, or a 'dryrun/*' branch run with workflow_dispatch for a dry run." >&2
             exit 1
           fi
           echo "mode=$mode version=$version"
@@ -497,7 +530,7 @@ jobs:
 
   linux-installer:
     name: linux-installer (${{ matrix.channel }})
-    if: github.repository == '1llum1n4t1s/scriptura' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/heads/release/')
+    if: github.repository == '1llum1n4t1s/scriptura' && ((github.event_name == 'push' && github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && (github.ref_type == 'tag' || startsWith(github.ref, 'refs/heads/dryrun/'))))
     strategy:
       fail-fast: false
       matrix:
@@ -544,8 +577,12 @@ jobs:
       - name: Install locked Rust toolchain
         run: rustup toolchain install 1.100.0 --profile minimal && rustup default 1.100.0
 
-      - name: Decide the mode (publish or dryrun) from the branch name
-        # 入力値ではなくブランチ名で決める。release/<Cargo.toml の版> は publish、release/dryrun-* は dryrun、それ以外は失敗。
+      - name: Decide the mode (publish or dryrun) from the ref
+        # 入力値ではなく ref で決める。タグ v<Cargo.toml の版> は publish、dryrun/<任意> ブランチからの workflow_dispatch は dryrun、
+        # それ以外は失敗。publish は、タグの形（厳密な v<x.y.z>）・Cargo.toml の版との一致・軽量タグがこの commit を指すこと・
+        # 既定ブランチの祖先であることを無条件に確かめる（Secrets を使う step より前。checkout は depth=1 なので祖先は compare API で調べる）。
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           # matrix の runs-on と実際の CPU の取り違えを、梱包の前に検出する（pack-linux.sh は uname -m でチャネルを決める）。
@@ -553,12 +590,22 @@ jobs:
           version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; print([p for p in json.load(sys.stdin)["packages"] if p["name"]=="scriptura"][0]["version"])')"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Unexpected package version '$version'." >&2; exit 1; }
           ref="$GITHUB_REF_NAME"
-          if [[ "$ref" == "release/$version" ]]; then
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$ref" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "The tag '$ref' is not a strict v<major>.<minor>.<patch>." >&2; exit 1; }
+            [[ "$ref" == "v$version" ]] || { echo "The tag '$ref' must be 'v$version' (the version in Cargo.toml) to publish." >&2; exit 1; }
+            # 軽量タグで、いまもこの commit を指すこと。
+            [[ "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$ref" --jq '.object.type + " " + .object.sha')" == "commit $GITHUB_SHA" ]] \
+              || { echo "The tag '$ref' is not a lightweight tag that points at $GITHUB_SHA." >&2; exit 1; }
+            # 既定ブランチの祖先であること（depth=1 の checkout では判定できないので compare API を使う）。
+            default="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
+            [[ "$default" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo 'Default branch is invalid.' >&2; exit 1; }
+            cmp="$(gh api "repos/$GITHUB_REPOSITORY/compare/$GITHUB_SHA...$default?per_page=1" --jq '.status + " " + (.behind_by | tostring)')"
+            [[ "$cmp" == "ahead 0" || "$cmp" == "identical 0" ]] || { echo "The tagged commit is not an ancestor of $default ($cmp)." >&2; exit 1; }
             mode=publish
-          elif [[ "$ref" == release/dryrun-* ]]; then
+          elif [[ "$GITHUB_REF_TYPE" == branch && "$GITHUB_EVENT_NAME" == workflow_dispatch && "$ref" == dryrun/* ]]; then
             mode=dryrun
           else
-            echo "The branch '$ref' must be 'release/$version' (the version in Cargo.toml) to publish, or start with 'release/dryrun-' for a dry run." >&2
+            echo "The ref '$ref' must be the tag 'v$version' (the version in Cargo.toml) to publish, or a 'dryrun/*' branch run with workflow_dispatch for a dry run." >&2
             exit 1
           fi
           echo "mode=$mode version=$version"
