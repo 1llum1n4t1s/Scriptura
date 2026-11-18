@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-11-18
+
+### Changed
+
+- 利用者に見える変更はありません。配信の起動を release ブランチの push から、main のコミットに付けた版タグ（v1.0.2）の push へ変更しました（アプリの動作に変更なし）。
+
 ### Fixed
 
 - Claude Code を一度も起動していない（`~/.claude` が無い）環境で、Setup 版の導入時と `connect claude-code --apply` の Stop hook の登録が「No such file or directory」で失敗していた。設定フォルダーを作ってから登録する。
