@@ -24,6 +24,7 @@ on:
       - '.claude-plugin/**'
       - '.cargo/**'
       - 'Cargo.toml'
+      - 'build.rs'
       - 'scripts/velopack/**'
       - '.github/workflows/velopack-linux.yml'
       - 'Cargo.lock'

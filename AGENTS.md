@@ -13,7 +13,7 @@ Scriptura は、利用者が登録した自分のリポジトリへの push 後�
 - `src/proposal.rs` … propose モード。使い捨てクローンで worker を動かし、更新案（パッチ）を保存・一覧・確認・適用・破棄する。保守後検査に違反した更新案は作らず `Rejected`（メタに理由）にする。
 - `src/cli.rs` … 利用者向け CLI。`--json` で機械可読の 1 オブジェクトを返す。処理の本体は `ops`。
 - `src/ui/` と `templates/ui/` … 管理画面 `scriptura ui`（cargo feature `ui`、既定で有効。axum + askama の SSR）。`guard.rs`（Host・Origin・Cookie・CSRF）、`confirm.rs`（危険な変更の二段階確認）、`handlers.rs`（画面）、`read.rs`・`views.rs`、`tray.rs` と `tray/`（常駐アイコン。Windows は `Shell_NotifyIconW`、macOS は `NSStatusItem` を直接使う）。
-- `assets/` … 実行ファイルへ埋め込む資材（`assets/ui/app.css`・`app.js` = 管理画面の静的ファイル。CDN は使わない。`assets/templates/changelog.md` = CHANGELOG の組み込みテンプレート）。
+- `assets/` … 実行ファイルへ埋め込む資材（`assets/ui/app.css`・`app.js` = 管理画面の静的ファイル。CDN は使わない。`assets/templates/changelog.md` = CHANGELOG の組み込みテンプレート。`assets/icons/` = アプリアイコン）。
 - `src/doctor.rs` … `doctor` の診断項目（環境・認証・設定・hook の二重登録・`kinds` 項目・`--verify` の同梱物照合）。
 - `src/connect.rs` … Claude Code の `settings.json` への Stop hook の登録（`--apply`）と解除（`--remove`）。
 - `src/app.rs` / `src/paths.rs` / `src/process.rs` … 導入（`install`）、保存場所の決定、子プロセスの期限管理。
@@ -65,7 +65,7 @@ Scriptura は、利用者が登録した自分のリポジトリへの push 後�
 
 ## ローカライズ（9 言語）
 
-- 共通仕様は `D:DevAPP-DISTRIBUTION.md` の 8 節。対応言語は ja・en・zh-CN・zh-TW・ko・es・fr・de・pt-BR。実装は `src/locale.rs`（言語判定・辞書・`t!` マクロ）と `src/locales/<タグ>.json`、管理画面の判定は `src/ui/locale.rs`（Cookie `scriptura-language-<port>` → `Accept-Language` → 英語。`POST /language` は他の POST と同じく `guard` を通る）。
+- 共通仕様は `D:\Dev\APP-DISTRIBUTION.md` の 8 節。対応言語は ja・en・zh-CN・zh-TW・ko・es・fr・de・pt-BR。実装は `src/locale.rs`（言語判定・辞書・`t!` マクロ）と `src/locales/<タグ>.json`、管理画面の判定は `src/ui/locale.rs`（Cookie `scriptura-language-<port>` → `Accept-Language` → 英語。`POST /language` は他の POST と同じく `guard` を通る）。
 - 人が読む文言（CLI の出力・ヘルプ・エラー・hook の `systemMessage`・Setup 版の案内・管理画面）は辞書のキー（`t!("cli.xxx")`、テンプレートは `crate::locale::tr("...")`）で参照し、直書きしない。**人が読む文言を足したら、9 言語の辞書（`src/locales/*.json`）と整合テスト（`tests/localization.rs`）を更新する**。キーは文字列リテラルで書く（テストがソースを走査する）。プレースホルダーは `{name}` で全言語同じ集合にする。
 - AI が読む文言（worker へのプロンプト・`kinds::settings_frame`・`changelog::prompt_parts`・プラグインの SKILL.md）は**英語に固定**し、辞書に入れない。生成する文書の言語設定（`language`）は文書の言語で、画面の言語とは別（挙動を変えない。`language` が無いとき既存文書の言語に従い、新規作成は日本語）。
 - 分岐に文言を使わない（実行結果が未確定で止めた印は `outcome_unknown_error`、worker のタイムアウトは `WorkerFailure.timed_out`）。旧版が状態 DB に残した日本語の文言との互換だけ `contains` を残している。
