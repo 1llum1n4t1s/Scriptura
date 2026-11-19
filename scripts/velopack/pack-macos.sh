@@ -148,6 +148,7 @@ vpk --skip-updates pack \
   --packVersion "$version" --channel osx --runtime osx-arm64 \
   --mainExe scriptura --packDir "$work/payload" --outputDir "$work/packages" \
   --bundleId "$bundle_id" --delta None \
+  --icon "$repo/assets/icons/scriptura.icns" \
   --signEntitlements "$repo/scripts/velopack/macos.entitlements" \
   ${signing[@]+"${signing[@]}"}
 

@@ -94,6 +94,7 @@ vpk --skip-updates pack \
   --packId "$pack_id" --packTitle Scriptura --packAuthors Kagayoi \
   --packVersion "$version" --channel "$channel" --runtime "$channel" \
   --mainExe scriptura --packDir "$work/payload" --outputDir "$work/packages" \
+  --icon "$repo/assets/icons/icon-256.png" \
   --delta None
 
 packages="$work/packages"

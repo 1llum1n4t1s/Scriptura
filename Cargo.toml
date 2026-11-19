@@ -54,7 +54,7 @@ getrandom = { version = "0.4.3", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"], optional = true }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSButton", "NSCell", "NSControl", "NSEvent", "NSImage", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSView", "objc2-core-foundation"], optional = true }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSDate", "NSGeometry", "NSObject", "NSRunLoop", "NSString", "NSTimer"], optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSData", "NSDate", "NSGeometry", "NSObject", "NSRunLoop", "NSString", "NSTimer"], optional = true }
 
 # Windows の Job Object・レジストリ・Authenticode・トレイなど OS 連携だけが使う。使う箇所はすべて `cfg(windows)` なので、
 # macOS・Linux のビルドには入れない（入れると unused dependency の警告が出て、使わない crate もコンパイルされる）。

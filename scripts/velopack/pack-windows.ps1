@@ -126,6 +126,7 @@ try {
         '--mainExe', 'scriptura.exe',
         '--packDir', $payload,
         '--outputDir', $packages,
+        '--icon', (Join-Path $repo 'assets/icons/scriptura.ico'),
         '--shortcuts', $shortcuts,
         '--noPortable',
         '--delta', 'None'

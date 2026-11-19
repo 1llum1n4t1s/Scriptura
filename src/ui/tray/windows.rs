@@ -4,7 +4,7 @@
 // - Explorer の再起動（`TaskbarCreated`）でアイコンを登録し直す。
 // - サーバーが止まったか（Ctrl+C・画面の「終了」・異常終了）を 200ms ごとのタイマーで見て、ループを抜ける。
 // - 2 つ目の常駐は起動しない。既存の常駐のウィンドウをクラス名で探し、「開く」をメッセージで頼む。
-// - アイコンは同梱の画像を持たず、小アイコンの寸法に合わせて実行時に描く（暫定の図柄）。
+// - アイコンは同梱の `assets/icons/scriptura.ico` を実行ファイルに埋め込み、小アイコンの寸法に合う画像を読む。
 use std::{
     cell::Cell,
     io,
@@ -70,76 +70,44 @@ pub fn notify_existing(open: bool) -> bool {
     true
 }
 
-// ───────────────────────── アイコン（実行時に描く） ─────────────────────────
+// ───────────────────────── アイコン（同梱の ICO から読む） ─────────────────────────
 
-/// 図柄の 1 点（0.0〜1.0 の座標）が、角丸の地・白い線のどちらに入るか。
-fn sample(x: f32, y: f32) -> (bool, bool) {
-    // 角丸の正方形（地）。
-    let radius = 0.22;
-    let dx = (x - 0.5).abs() - (0.5 - radius);
-    let dy = (y - 0.5).abs() - (0.5 - radius);
-    let inside = if dx > 0.0 && dy > 0.0 {
-        dx * dx + dy * dy <= radius * radius
-    } else {
-        true
+/// 同梱のアイコン（16・20・24・32・48・64・128・256px の 32bpp BMP 形式）。実行ファイルに埋め込むので、
+/// 起動時に画像ファイルの配置は要らない。
+const ICON: &[u8] = include_bytes!("../../../assets/icons/scriptura.ico");
+
+/// ICO から、`target` ピクセルに最も近い（同じ距離なら大きい方の）画像のバイト列を返す。
+fn pick_frame(ico: &[u8], target: i32) -> Result<&[u8], String> {
+    let count = match ico {
+        [0, 0, 1, 0, lo, hi, ..] => u16::from_le_bytes([*lo, *hi]) as usize,
+        _ => return Err("the bundled icon is not an ICO file".to_string()),
     };
-    // 文書を表す 3 本の横線（最後の 1 本は短い）。
-    let line = [(0.25, 0.76), (0.45, 0.76), (0.65, 0.56)]
+    let entries = ico
+        .get(6..6 + 16 * count)
+        .ok_or("the bundled icon has a truncated directory")?;
+    let entry = entries
+        .as_chunks::<16>()
+        .0
         .iter()
-        .any(|(top, right)| (*top..top + 0.11).contains(&y) && (0.24..*right).contains(&x));
-    (inside, inside && line)
-}
-
-/// `size` ピクセル四方の図柄（上から下、BGRA、乗算していないアルファ）。4×4 の点で面積を取って縁をなめらかにする。
-pub(crate) fn icon_bgra(size: usize) -> Vec<u8> {
-    const GRID: usize = 4;
-    // 地の色（藍）と線の色（白）。
-    const GROUND: [f32; 3] = [229.0, 70.0, 79.0];
-    const LINE: [f32; 3] = [255.0, 255.0, 255.0];
-    let mut out = Vec::with_capacity(size * size * 4);
-    for py in 0..size {
-        for px in 0..size {
-            let (mut ground, mut line) = (0u32, 0u32);
-            for sy in 0..GRID {
-                for sx in 0..GRID {
-                    let x = (px as f32 + (sx as f32 + 0.5) / GRID as f32) / size as f32;
-                    let y = (py as f32 + (sy as f32 + 0.5) / GRID as f32) / size as f32;
-                    let (inside, on_line) = sample(x, y);
-                    ground += inside as u32;
-                    line += on_line as u32;
-                }
-            }
-            if ground == 0 {
-                out.extend_from_slice(&[0, 0, 0, 0]);
-                continue;
-            }
-            let mix = line as f32 / ground as f32;
-            for channel in 0..3 {
-                out.push((GROUND[channel] * (1.0 - mix) + LINE[channel] * mix).round() as u8);
-            }
-            out.push((ground * 255 / (GRID * GRID) as u32) as u8);
-        }
-    }
-    out
-}
-
-/// アイコンのリソース形式（.ico の中の 1 画像と同じ。BITMAPINFOHEADER + 下から上の BGRA + 1bpp のマスク）。
-pub(crate) fn icon_resource(size: usize) -> Vec<u8> {
-    let pixels = icon_bgra(size);
-    let mask_stride = size.div_ceil(32) * 4;
-    let mut out = Vec::with_capacity(40 + pixels.len() + mask_stride * size);
-    out.extend_from_slice(&40u32.to_le_bytes()); // biSize
-    out.extend_from_slice(&(size as i32).to_le_bytes()); // biWidth
-    out.extend_from_slice(&(size as i32 * 2).to_le_bytes()); // biHeight（色とマスクの 2 枚分）
-    out.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
-    out.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
-    out.extend_from_slice(&[0u8; 24]); // 圧縮なし。残りの項目は 0
-    for row in pixels.chunks_exact(size * 4).rev() {
-        out.extend_from_slice(row);
-    }
-    // マスクは全て 0（透過はアルファで表す）。
-    out.resize(out.len() + mask_stride * size, 0);
-    out
+        .min_by_key(|entry| {
+            // 幅 0 は 256px。
+            let size = if entry[0] == 0 {
+                256
+            } else {
+                i32::from(entry[0])
+            };
+            ((size - target).abs(), -size)
+        })
+        .ok_or("the bundled icon has no image")?;
+    let length = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]) as usize;
+    let offset = u32::from_le_bytes([entry[12], entry[13], entry[14], entry[15]]) as usize;
+    ico.get(
+        offset
+            ..offset
+                .checked_add(length)
+                .ok_or("the bundled icon has an invalid size")?,
+    )
+    .ok_or_else(|| "the bundled icon has an image outside the file".to_string())
 }
 
 struct Icon(HICON);
@@ -151,15 +119,14 @@ impl Drop for Icon {
     }
 }
 
-fn load_icon() -> Result<Icon, String> {
-    // システムメトリックの取得はポインターを参照しない。DPI に合った小アイコンの寸法で描く。
-    let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.clamp(16, 64);
-    let resource = icon_resource(size as usize);
-    // 作った範囲をそのまま渡す。LR_SHARED を使わず所有権を取る。
+/// 同梱の ICO から、`size` ピクセル四方のアイコンを作る。
+fn icon_of_size(size: i32) -> Result<Icon, String> {
+    let image = pick_frame(ICON, size)?;
+    // 検査済みの画像範囲をそのまま渡す。LR_SHARED を使わず所有権を取る。
     let icon = unsafe {
         CreateIconFromResourceEx(
-            resource.as_ptr(),
-            resource.len() as u32,
+            image.as_ptr(),
+            image.len() as u32,
             1,
             0x0003_0000,
             size,
@@ -171,6 +138,12 @@ fn load_icon() -> Result<Icon, String> {
         return Err(last_error());
     }
     Ok(Icon(icon))
+}
+
+fn load_icon() -> Result<Icon, String> {
+    // システムメトリックの取得はポインターを参照しない。DPI に合った小アイコンの寸法を使う。
+    let size = unsafe { GetSystemMetrics(SM_CXSMICON) }.clamp(16, 256);
+    icon_of_size(size)
 }
 
 // ───────────────────────── ウィンドウとメニュー ─────────────────────────
@@ -462,29 +435,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn icon_has_opaque_ground_white_lines_and_transparent_corners() {
-        for size in [16usize, 20, 24, 32, 48] {
-            let pixels = icon_bgra(size);
-            assert_eq!(pixels.len(), size * size * 4);
-            let at = |x: usize, y: usize| &pixels[(y * size + x) * 4..(y * size + x) * 4 + 4];
-            // 角は透明、縁の中央は不透明な地の色。
-            assert_eq!(at(0, 0)[3], 0, "size {size}");
-            assert_eq!(at(size / 2, 1), [229, 70, 79, 255], "size {size}");
-            // 1 本目の線の中ほどは白。
-            assert_eq!(
-                at(size / 2, size * 30 / 100),
-                [255, 255, 255, 255],
-                "size {size}"
-            );
+    fn every_small_icon_size_gets_a_frame_and_a_windows_icon() {
+        for size in [16, 20, 24, 32, 48] {
+            let frame = pick_frame(ICON, size).unwrap();
+            // 同梱の画像は 32bpp BMP 形式（BITMAPINFOHEADER から始まり、高さは色とマスクの 2 枚分）。
+            assert_eq!(&frame[..4], &40u32.to_le_bytes(), "size {size}");
+            assert_eq!(&frame[4..8], &size.to_le_bytes(), "size {size}");
+            assert_eq!(&frame[8..12], &(size * 2).to_le_bytes(), "size {size}");
+            // 実際に Windows がアイコンとして受け付ける。
+            assert!(icon_of_size(size).is_ok(), "size {size}");
         }
     }
 
     #[test]
-    fn icon_resource_has_header_pixels_and_mask() {
-        let resource = icon_resource(20);
-        // ヘッダー 40 + 色 20×20×4 + マスク（1 行は 32 ビット境界 = 4 バイト）。
-        assert_eq!(resource.len(), 40 + 20 * 20 * 4 + 4 * 20);
-        assert_eq!(&resource[..4], &40u32.to_le_bytes());
-        assert_eq!(&resource[8..12], &40i32.to_le_bytes());
+    fn frame_choice_uses_the_nearest_size_and_rejects_bad_input() {
+        // 中間の寸法は近い方（30 は 32）を選ぶ。256 は幅 0 の項目。
+        assert_eq!(&pick_frame(ICON, 30).unwrap()[4..8], &32i32.to_le_bytes());
+        assert_eq!(
+            &pick_frame(ICON, 1000).unwrap()[4..8],
+            &256i32.to_le_bytes()
+        );
+        assert!(pick_frame(&[1, 2, 3], 16).is_err());
+        assert!(pick_frame(&[0, 0, 1, 0, 1, 0], 16).is_err());
     }
 }

@@ -4,20 +4,20 @@
 // - クリック: 管理画面を開く。右クリック（または Control + クリック）: メニュー（開く・更新を確認・終了）。
 // - Dock にアイコンを出さない（Accessory）。
 // - サーバーが止まったか（Ctrl+C・画面の「終了」・異常終了）を約 100ms ごとに見て、ループを抜ける。
-// - アイコンは同梱の画像を持たず、システムの記号（SF Symbols の `doc.text`）を使う（暫定の図柄）。
+// - アイコンは同梱の `assets/icons/icon-32.png`（実行ファイルに埋め込む。色つきの画像）を 18pt で出す。
 use std::cell::RefCell;
 
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::AnyObject;
-use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
+use objc2::{AnyThread, DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSEventMask, NSEventModifierFlags,
     NSEventTrackingRunLoopMode, NSEventType, NSImage, NSMenu, NSMenuItem, NSSquareStatusItemLength,
     NSStatusBar, NSStatusBarButton,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSDate, NSDefaultRunLoopMode, NSObject, NSRunLoop, NSString, NSTimer,
-    ns_string,
+    MainThreadMarker, NSData, NSDate, NSDefaultRunLoopMode, NSObject, NSRunLoop, NSSize, NSString,
+    NSTimer, ns_string,
 };
 
 use super::Control;
@@ -164,14 +164,14 @@ pub fn run(control: &Control) -> Result<(), String> {
             status_bar.removeStatusItem(&status_item);
             return Err("the status item has no button".to_string());
         };
-        // システムの記号はテンプレート画像なので、メニューバーの明暗に合わせて描かれる。
-        match NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            ns_string!("doc.text"),
-            Some(ns_string!("Scriptura")),
-        ) {
-            Some(image) => button.setImage(Some(&image)),
-            // 記号が無い古い macOS では、文字で代える。
-            None => button.setTitle(ns_string!("S")),
+        // 同梱の画像（32px。メニューバーでは 18pt に縮めて描かれる）。読めないときは文字で代える。
+        let data = NSData::with_bytes(include_bytes!("../../../assets/icons/icon-32.png"));
+        match NSImage::initWithData(NSImage::alloc(), &data) {
+            Some(image) => {
+                image.setSize(NSSize::new(18.0, 18.0));
+                button.setImage(Some(&image));
+            }
+            None => button.setTitle(&NSString::from_str("S")),
         }
         button.setToolTip(Some(&NSString::from_str(crate::t!("ui.tray.tooltip"))));
         button.sendActionOn(NSEventMask::LeftMouseUp | NSEventMask::RightMouseUp);
