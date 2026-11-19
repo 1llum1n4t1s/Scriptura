@@ -150,10 +150,14 @@ impl Fx {
                 "HOOK_STUB_AUTH_EXIT",
                 "HOOK_STUB_AUTH_STDERR",
                 "HOOK_STUB_AUTH_LOG",
+                // モデル一覧の取得に使う環境変数のキー。実在の API へ繋がないよう、既定では無い状態にする。
+                "ANTHROPIC_API_KEY",
             ] {
                 env::remove_var(key);
             }
         }
+        ui::models::set_endpoint_for_tests(None);
+        ui::models::reset_cache_for_tests();
         let repo = base.join("repo");
         make_repo(&repo);
         let bare = base.join("remote.git");
@@ -680,7 +684,7 @@ async fn broken_config_is_shown_but_never_rewritten() {
             "/settings/worker",
             &[
                 ("revision", rev.as_str()),
-                ("model", "m"),
+                ("model", "opus"),
                 ("effort", "high"),
                 ("timeout_secs", "1200"),
                 ("permission", "restricted"),
@@ -713,7 +717,7 @@ async fn stale_revision_is_rejected_with_409_and_file_untouched() {
     let r = fx
         .post(
             "/settings/worker",
-            &worker_pairs(&rev, "model-a", "restricted"),
+            &worker_pairs(&rev, "sonnet", "restricted"),
         )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
@@ -726,7 +730,7 @@ async fn stale_revision_is_rejected_with_409_and_file_untouched() {
     let r = fx
         .post(
             "/settings/worker",
-            &worker_pairs(&opened, "model-b", "restricted"),
+            &worker_pairs(&opened, "haiku", "restricted"),
         )
         .await;
     assert_eq!(r.status, StatusCode::CONFLICT);
@@ -736,7 +740,7 @@ async fn stale_revision_is_rejected_with_409_and_file_untouched() {
     let r = fx
         .post(
             "/settings/worker",
-            &worker_pairs("nope", "model-b", "restricted"),
+            &worker_pairs("nope", "haiku", "restricted"),
         )
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
@@ -747,13 +751,16 @@ async fn dangerous_change_needs_a_one_time_nonce_bound_to_the_content() {
     let fx = Fx::new().await;
     let rev = fx.revision();
     let r = fx
-        .post("/settings/worker", &worker_pairs(&rev, "m", "restricted"))
+        .post(
+            "/settings/worker",
+            &worker_pairs(&rev, "opus", "restricted"),
+        )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
     let rev = fx.revision();
     // 1 回目: bypass 化は確認画面を返し、書き込まない。
     let first = fx
-        .post("/settings/worker", &worker_pairs(&rev, "m", "bypass"))
+        .post("/settings/worker", &worker_pairs(&rev, "opus", "bypass"))
         .await;
     assert_eq!(first.status, StatusCode::OK);
     assert!(first.body.contains("bypass"));
@@ -762,7 +769,7 @@ async fn dangerous_change_needs_a_one_time_nonce_bound_to_the_content() {
     assert!(fields.iter().any(|(k, _)| k == "confirm"));
     // 内容を改変した 2 回目は拒否（nonce は使い捨てなので消費される）。
     let mut tampered = fields.clone();
-    set_hidden(&mut tampered, "model", "other-model");
+    set_hidden(&mut tampered, "model", "haiku");
     let r = fx.post_exact("/settings/worker", &tampered).await;
     assert_eq!(r.status, StatusCode::CONFLICT);
     assert_eq!(fx.revision(), rev);
@@ -779,7 +786,7 @@ async fn dangerous_change_needs_a_one_time_nonce_bound_to_the_content() {
     );
     // 正しい手順（確認画面 → 同内容で送信）なら書き込む。
     let r = fx
-        .post_confirmed("/settings/worker", &worker_pairs(&rev, "m", "bypass"))
+        .post_confirmed("/settings/worker", &worker_pairs(&rev, "opus", "bypass"))
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     let c = fx.config();
@@ -787,10 +794,10 @@ async fn dangerous_change_needs_a_one_time_nonce_bound_to_the_content() {
     // 危険でない変更（モデル名だけ）は確認なしで通る。
     let rev = fx.revision();
     let r = fx
-        .post("/settings/worker", &worker_pairs(&rev, "m2", "bypass"))
+        .post("/settings/worker", &worker_pairs(&rev, "haiku", "bypass"))
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
-    assert_eq!(fx.config().worker.model, "m2");
+    assert_eq!(fx.config().worker.model, "haiku");
 }
 
 #[test]
@@ -1268,7 +1275,7 @@ async fn history_lists_backups_and_restore_is_confirmed_when_dangerous() {
     let r = fx
         .post(
             "/settings/worker",
-            &worker_pairs(&rev, "model-1", "restricted"),
+            &worker_pairs(&rev, "opus", "restricted"),
         )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
@@ -1276,11 +1283,11 @@ async fn history_lists_backups_and_restore_is_confirmed_when_dangerous() {
     let r = fx
         .post(
             "/settings/worker",
-            &worker_pairs(&rev, "model-2", "restricted"),
+            &worker_pairs(&rev, "sonnet", "restricted"),
         )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
-    // model-1 の版が履歴にある。
+    // opus の版が履歴にある。
     let history = scriptura::ops::history(&fx.store).unwrap();
     assert_eq!(history.len(), 1);
     let id = history[0].id.clone();
@@ -1288,25 +1295,25 @@ async fn history_lists_backups_and_restore_is_confirmed_when_dangerous() {
     assert!(page.body.contains(&id));
     let page = fx.get(&format!("/history/{id}")).await;
     assert_eq!(page.status, StatusCode::OK);
-    assert!(page.body.contains("model-1"));
+    assert!(page.body.contains("opus"));
     // 危険を含まない復元はそのまま。
     let rev = fx.revision();
     let r = fx
         .post("/history/restore", &[("revision", &rev), ("id", &id)])
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
-    assert_eq!(fx.config().worker.model, "model-1");
+    assert_eq!(fx.config().worker.model, "opus");
     // bypass の版を作ってから restricted に戻し、bypass の版への復元は確認を挟む。
     let rev = fx.revision();
     let r = fx
-        .post_confirmed("/settings/worker", &worker_pairs(&rev, "model-b", "bypass"))
+        .post_confirmed("/settings/worker", &worker_pairs(&rev, "haiku", "bypass"))
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
     let rev = fx.revision();
     let r = fx
         .post(
             "/settings/worker",
-            &worker_pairs(&rev, "model-r", "restricted"),
+            &worker_pairs(&rev, "fable", "restricted"),
         )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
@@ -1473,7 +1480,7 @@ async fn secrets_never_appear_in_pages() {
     let r = fx
         .post(
             "/settings/worker",
-            &worker_pairs(&rev, "model-x", "restricted"),
+            &worker_pairs(&rev, "claude-opus-5-5", "restricted"),
         )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
@@ -1788,4 +1795,522 @@ async fn display_language_follows_cookie_then_accept_language_then_english() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     assert!(cleared.contains("Max-Age=0"), "{cleared}");
+}
+
+// ---------------------------------------------------------------------------
+// 導入の形・時刻の表示・ヘッダーのメニュー・worker 設定の選択肢
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overview_does_not_claim_not_installed_for_non_standalone_builds() {
+    let fx = Fx::new().await;
+    let r = fx.get("/").await;
+    assert_eq!(r.status, StatusCode::OK);
+    // 開発ビルド・プラグイン同梱は「未導入」ではなく中立の表現にし、単独導入の案内は補足にとどめる。
+    assert!(!r.body.contains("未導入"), "{}", r.body);
+    assert!(r.body.contains("プラグイン／開発ビルド"), "{}", r.body);
+    assert!(r.body.contains("単独で導入する場合"), "{}", r.body);
+    assert!(r.body.contains("<code>scriptura install</code>"));
+}
+
+/// `<time datetime="…">表示</time>` を全部取り出す。
+fn time_tags(body: &str) -> Vec<(String, String)> {
+    Regex::new(r#"<time datetime="([^"]*)">([^<]*)</time>"#)
+        .unwrap()
+        .captures_iter(body)
+        .map(|c| (c[1].to_string(), c[2].to_string()))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn times_are_shown_in_local_time_without_fractions() {
+    let fx = Fx::new().await;
+    fx.enable(&fx.repo).await;
+    let raw_nanos = Regex::new(r"\d{2}:\d{2}:\d{2}\.\d+").unwrap();
+    let pretty = Regex::new(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}").unwrap();
+    // 概要・同意画面の「同意 版 N・時刻」は整形済みで、ナノ秒つきの UTC をそのまま出さない。
+    for path in ["/", "/consent"] {
+        let r = fx.get(path).await;
+        assert_eq!(r.status, StatusCode::OK);
+        assert!(!raw_nanos.is_match(&r.body), "{path}: {}", r.body);
+        assert!(!r.body.contains("+00:00"), "{path}");
+        assert!(pretty.is_match(&r.body), "{path}: {}", r.body);
+    }
+    // 設定を 1 回変えると履歴ができる。表は秒つきのローカル時刻で、元の値は datetime に残る。
+    let rev = fx.revision();
+    let r = fx
+        .post(
+            "/settings/worker",
+            &worker_pairs(&rev, "opus", "restricted"),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    let page = fx.get("/history").await;
+    let tags = time_tags(&page.body);
+    assert_eq!(tags.len(), 1, "{}", page.body);
+    let (raw, shown) = &tags[0];
+    let local = chrono::DateTime::parse_from_rfc3339(raw)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    assert_eq!(shown, &local);
+    assert!(!page.body.contains(&format!(">{raw}<")));
+    // 保存形式（設定ファイルの同意時刻）は変えない（RFC 3339 のまま）。
+    let c = fx.config();
+    assert!(chrono::DateTime::parse_from_rfc3339(&c.consent.as_ref().unwrap().accepted_at).is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn header_has_five_items_and_settings_screens_share_a_subnav() {
+    let fx = Fx::new().await;
+    let header = |body: &str| -> String {
+        let start = body.find("<header").unwrap();
+        body[start..body.find("</header>").unwrap()].to_string()
+    };
+    let r = fx.get("/").await;
+    let head = header(&r.body);
+    let nav = &head[head.find("<nav").unwrap()..head.find("</nav>").unwrap()];
+    assert_eq!(nav.matches("<a ").count(), 5, "{nav}");
+    for href in ["/", "/repos", "/kinds", "/proposals", "/settings/general"] {
+        assert!(nav.contains(&format!("href=\"{href}\"")), "{href}: {nav}");
+    }
+    assert!(!r.body.contains("class=\"subnav\""));
+    // 設定系の 5 画面: ヘッダーの「設定」が強調され、同じサブナビで現在の画面だけが強調される。
+    let settings = [
+        "/settings/general",
+        "/settings/worker",
+        "/consent",
+        "/history",
+        "/doctor",
+    ];
+    for path in settings {
+        let r = fx.get(path).await;
+        assert_eq!(r.status, StatusCode::OK, "{path}");
+        let head = header(&r.body);
+        assert!(
+            head.contains("href=\"/settings/general\" aria-current=\"page\""),
+            "{path}: {head}"
+        );
+        let sub = &r.body[r.body.find("class=\"subnav\"").expect(path)..];
+        let sub = &sub[..sub.find("</nav>").unwrap()];
+        assert_eq!(sub.matches("<a ").count(), 5, "{path}: {sub}");
+        assert_eq!(sub.matches("aria-current=\"page\"").count(), 1, "{path}");
+        for other in settings {
+            assert!(
+                sub.contains(&format!("href=\"{other}\"")),
+                "{path}: {other}"
+            );
+        }
+        assert!(
+            sub.contains(&format!("href=\"{path}\" aria-current=\"page\"")),
+            "{path}: {sub}"
+        );
+    }
+    // 履歴の個別画面（/history/{id}）も履歴として強調される。他のグループの画面は強調されない。
+    for model in ["opus", "haiku"] {
+        let rev = fx.revision();
+        let r = fx
+            .post("/settings/worker", &worker_pairs(&rev, model, "restricted"))
+            .await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    }
+    let id = scriptura::ops::history(&fx.store).unwrap()[0].id.clone();
+    let r = fx.get(&format!("/history/{id}")).await;
+    assert!(r.body.contains("href=\"/history\" aria-current=\"page\""));
+    let r = fx.get("/repos").await;
+    assert!(!header(&r.body).contains("href=\"/settings/general\" aria-current=\"page\""));
+    assert!(!r.body.contains("class=\"subnav\""));
+}
+
+fn option_values(body: &str, name: &str) -> Vec<(String, bool)> {
+    let start = body.find(&format!("<select name=\"{name}\">")).unwrap();
+    let block = &body[start..start + body[start..].find("</select>").unwrap()];
+    Regex::new(r#"<option value="([^"]*)"( selected)?>"#)
+        .unwrap()
+        .captures_iter(block)
+        .map(|c| (c[1].to_string(), c.get(2).is_some()))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_model_and_effort_are_selects_with_server_side_checks() {
+    let fx = Fx::new().await;
+    let page = fx.get("/settings/worker").await;
+    assert!(!page.body.contains("<input name=\"model\""));
+    assert!(!page.body.contains("<input name=\"effort\""));
+    let models = option_values(&page.body, "model");
+    let ids: Vec<&str> = models.iter().map(|(v, _)| v.as_str()).collect();
+    assert_eq!(
+        ids,
+        [
+            "opus",
+            "sonnet",
+            "haiku",
+            "fable",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-2"
+        ]
+    );
+    assert_eq!(models.iter().filter(|(_, s)| *s).count(), 1);
+    assert!(models.iter().any(|(v, s)| v == "claude-sonnet-5-5" && *s));
+    let efforts = option_values(&page.body, "effort");
+    let ids: Vec<&str> = efforts.iter().map(|(v, _)| v.as_str()).collect();
+    assert_eq!(ids, ["low", "medium", "high", "xhigh", "max"]);
+    assert!(efforts.iter().any(|(v, s)| v == "high" && *s));
+    // 一覧にない値は、新たには保存できない（1 文字違い・改ざん）。設定は変わらない。
+    let rev = fx.revision();
+    let r = fx
+        .post(
+            "/settings/worker",
+            &worker_pairs(&rev, "claude-sonnet-5-4", "restricted"),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(r.body.contains("モデルは一覧から選んでください"));
+    let mut pairs = worker_pairs(&rev, "claude-sonnet-5-5", "restricted");
+    pairs.iter_mut().for_each(|(k, v)| {
+        if *k == "effort" {
+            *v = "hgih";
+        }
+    });
+    let r = fx.post("/settings/worker", &pairs).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(r.body.contains("effort は一覧から選んでください"));
+    assert!(!fx.store.config_file.exists());
+    // 表の値は保存できる。
+    pairs.iter_mut().for_each(|(k, v)| {
+        if *k == "effort" {
+            *v = "xhigh";
+        }
+    });
+    let r = fx.post("/settings/worker", &pairs).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    assert_eq!(fx.config().worker.effort, "xhigh");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saved_values_outside_the_lists_are_kept_not_rejected() {
+    let fx = Fx::new().await;
+    // 設定ファイルへ直接、一覧にない値を置く（旧版・手編集で入った値）。
+    let mut c = Config::default();
+    c.worker.model = "my-custom-model".into();
+    c.worker.effort = "ultra".into();
+    config::save_to(&fx.store.config_file, &c).unwrap();
+    let page = fx.get("/settings/worker").await;
+    assert_eq!(page.status, StatusCode::OK);
+    let models = option_values(&page.body, "model");
+    assert_eq!(
+        models.last().unwrap(),
+        &("my-custom-model".to_string(), true)
+    );
+    assert!(page.body.contains("my-custom-model（一覧にない値）"));
+    let efforts = option_values(&page.body, "effort");
+    assert_eq!(efforts.last().unwrap(), &("ultra".to_string(), true));
+    assert!(page.body.contains("ultra（一覧にない値）"));
+    // 画面のまま（現在値を選んだまま）保存しても拒否されず、値は壊れない。別の項目だけ変えられる。
+    let rev = fx.revision();
+    let mut pairs = vec![
+        ("revision", rev.as_str()),
+        ("model", "my-custom-model"),
+        ("effort", "ultra"),
+        ("timeout_secs", "900"),
+        ("permission", "restricted"),
+        ("claude_path", ""),
+    ];
+    let r = fx.post("/settings/worker", &pairs).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    let w = fx.config().worker;
+    assert_eq!(
+        (w.model.as_str(), w.effort.as_str(), w.timeout_secs),
+        ("my-custom-model", "ultra", 900)
+    );
+    // ほかの未知の値への変更は拒否する。
+    let rev = fx.revision();
+    pairs[0].1 = rev.as_str();
+    pairs[1].1 = "my-custom-model2";
+    assert_eq!(
+        fx.post("/settings/worker", &pairs).await.status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+/// 1 回だけ応答するローカルのスタブ（実在の API には繋がない）。受け取った要求を返す。
+fn models_stub(status: &str, payload: String) -> (String, std::thread::JoinHandle<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://{}/v1/models?limit=100",
+        listener.local_addr().unwrap()
+    );
+    let status = status.to_string();
+    let handle = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = conn.read(&mut buf).unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
+        conn.write_all(response.as_bytes()).unwrap();
+        request
+    });
+    (url, handle)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_list_refresh_is_explicit_keyed_by_environment_and_never_shows_the_key() {
+    let fx = Fx::new().await;
+    const KEY: &str = "sk-ant-SENTINELREFRESHKEY0001";
+    // 画面を開いても通信しない・状態フォルダーも作らない（キーが無い状態）。
+    let page = fx.get("/settings/worker").await;
+    assert!(
+        page.body.contains("ANTHROPIC_API_KEY が無い"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("<button type=\"submit\" disabled>"));
+    assert!(!fx.base.join("state").exists());
+    // キーが無いと、更新は通信せず理由だけを返す。
+    let r = fx.post("/settings/worker/models", &[]).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER);
+    assert_eq!(r.location(), "/settings/worker?msg=models_nokey");
+    let page = fx.get(&r.location()).await;
+    assert!(page.body.contains("一覧は取得しませんでした"));
+    // CSRF の無い更新は拒否される（他の POST と同じ保護）。
+    let r = fx.post_exact("/settings/worker/models", &[]).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    // キーがあるとボタンが有効になる（値は表示しない）。取得はスタブへ。
+    unsafe { env::set_var("ANTHROPIC_API_KEY", KEY) };
+    let (url, handle) = models_stub(
+        "200 OK",
+        serde_json::json!({"data": [
+            {"id": "claude-zeta-9", "display_name": "Zeta <b>9</b>", "created_at": "2026-05-01T00:00:00Z"},
+            {"id": "claude-alpha-1", "display_name": "Alpha 1", "created_at": "2026-01-01T00:00:00Z"},
+            {"id": "claude-embed-3", "display_name": "E", "created_at": "2026-06-01T00:00:00Z"},
+            {"id": "claude-opus-latest", "display_name": "L", "created_at": "2026-06-02T00:00:00Z"},
+            {"id": "gpt-5", "display_name": "G", "created_at": "2026-06-03T00:00:00Z"}
+        ]})
+        .to_string(),
+    );
+    ui::models::set_endpoint_for_tests(Some(url));
+    let page = fx.get("/settings/worker").await;
+    assert!(page.body.contains("ANTHROPIC_API_KEY があるため"));
+    assert!(!page.body.contains("<button type=\"submit\" disabled>"));
+    assert!(!page.body.contains(KEY));
+    let r = fx.post("/settings/worker/models", &[]).await;
+    assert_eq!(
+        r.location(),
+        "/settings/worker?msg=models_updated",
+        "{}",
+        r.body
+    );
+    let request = handle.join().unwrap().to_ascii_lowercase();
+    assert!(request.contains(&format!("x-api-key: {}", KEY.to_ascii_lowercase())));
+    assert!(request.contains("anthropic-version: 2023-06-01"));
+    let page = fx.get(&r.location()).await;
+    assert!(page.body.contains("モデル一覧を更新しました"));
+    let models = option_values(&page.body, "model");
+    let ids: Vec<&str> = models.iter().map(|(v, _)| v.as_str()).collect();
+    // 固定の一覧の後に、絞り込み・新しい順の取得結果（表示名は併記し、HTML はエスケープされる）。
+    assert_eq!(ids[8..], ["claude-zeta-9", "claude-alpha-1"], "{ids:?}");
+    assert!(page.body.contains("claude-zeta-9 (Zeta "));
+    assert!(!page.body.contains("<b>9</b>"));
+    assert!(!page.body.contains(KEY));
+    // 取得した ID は保存できる（キャッシュ + 固定表に照らす）。
+    let rev = fx.revision();
+    let r = fx
+        .post(
+            "/settings/worker",
+            &worker_pairs(&rev, "claude-zeta-9", "restricted"),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    assert_eq!(fx.config().worker.model, "claude-zeta-9");
+    // 失敗（HTTP 401）では、取得済みの一覧を保ち、キーも本文も出さない。
+    let (url, handle) = models_stub("401 Unauthorized", "{\"error\":\"bad\"}".into());
+    ui::models::set_endpoint_for_tests(Some(url));
+    let r = fx.post("/settings/worker/models", &[]).await;
+    assert_eq!(r.location(), "/settings/worker?msg=models_failed");
+    handle.join().unwrap();
+    let page = fx.get(&r.location()).await;
+    assert!(page.body.contains("取得できませんでした"));
+    assert!(!page.body.contains(KEY));
+    assert!(
+        option_values(&page.body, "model")
+            .iter()
+            .any(|(v, _)| v == "claude-alpha-1")
+    );
+    ui::models::set_endpoint_for_tests(None);
+    unsafe { env::remove_var("ANTHROPIC_API_KEY") };
+}
+
+// ---------------------------------------------------------------------------
+// アプリの更新パネル・トレイの「更新を確認」の移動先
+// ---------------------------------------------------------------------------
+
+/// `/auth?next=` は許可リストの名前だけを受け付け、URL・パスは受け取らない（オープンリダイレクトを作らない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auth_next_is_an_allow_list_of_names_not_urls() {
+    let fx = Fx::new().await;
+    let state = AppState::new(fx.store.clone(), PORT).0;
+    let app = ui::router(state.clone());
+    for (next, expected) in [
+        ("&next=updates", "/?check_updates=1#updates"),
+        ("", "/"),
+        ("&next=unknown", "/"),
+        ("&next=https%3A%2F%2Fevil.example%2F", "/"),
+        ("&next=%2F%2Fevil.example", "/"),
+        ("&next=%2Frepos", "/"),
+        ("&next=Updates", "/"),
+    ] {
+        let key = state.issue_key();
+        let res = app
+            .clone()
+            .oneshot(get(&format!("/auth?key={key}{next}")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SEE_OTHER, "{next}");
+        assert_eq!(res.headers()[header::LOCATION], expected, "{next}");
+        assert!(res.headers().contains_key(header::SET_COOKIE), "{next}");
+    }
+}
+
+/// 更新の確認・インストール・設定の POST は、他の POST と同じ保護（Host・Origin・Cookie・CSRF）を通る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_posts_go_through_the_guard() {
+    let fx = Fx::new().await;
+    for path in ["/updates/check", "/updates/install", "/updates/settings"] {
+        let form = |csrf: &str| {
+            url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("csrf", csrf)
+                .finish()
+        };
+        let post = |host: &str, origin: Option<&str>, cookie: Option<&str>, csrf: &str| {
+            let mut b = Request::post(path)
+                .header(header::HOST, host)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+            if let Some(origin) = origin {
+                b = b.header(header::ORIGIN, origin);
+            }
+            if let Some(cookie) = cookie {
+                b = b.header(header::COOKIE, cookie);
+            }
+            b.body(Body::from(form(csrf))).unwrap()
+        };
+        let good_csrf = fx.csrf.clone();
+        let cases = [
+            // Cookie なし・CSRF 違い・Origin 違い・Host 違い・Origin なし（Sec-Fetch-Site もなし）。
+            (post(HOST, Some(ORIGIN), None, &good_csrf), 401),
+            (
+                post(HOST, Some(ORIGIN), Some(&fx.cookie), &"0".repeat(64)),
+                403,
+            ),
+            (
+                post(
+                    HOST,
+                    Some("http://evil.example"),
+                    Some(&fx.cookie),
+                    &good_csrf,
+                ),
+                403,
+            ),
+            (
+                post(
+                    "evil.example:7468",
+                    Some(ORIGIN),
+                    Some(&fx.cookie),
+                    &good_csrf,
+                ),
+                403,
+            ),
+            (post(HOST, None, Some(&fx.cookie), &good_csrf), 403),
+        ];
+        for (req, expected) in cases {
+            let r = fx.raw(req).await;
+            assert_eq!(r.status.as_u16(), expected, "{path}: {}", r.body);
+        }
+        // GET は経路が無い（POST 専用）。
+        assert_eq!(
+            fx.get(path).await.status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{path}"
+        );
+    }
+    // 拒否では何も作られない。
+    assert!(!fx.base.join("state").exists());
+}
+
+/// Setup 版ではない（このテストの実行ファイルは Velopack 管理外）とき、概要は注意の文だけを出し、確認・
+/// インストール・設定は何もせずに `supported: false` を返す（状態フォルダーにも触れない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_panel_is_unsupported_outside_setup_and_touches_no_state() {
+    let fx = Fx::new().await;
+    let page = fx.get("/").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains(r#"id="updates""#), "{}", page.body);
+    assert!(
+        page.body.contains("Setup 版でのみ使えます"),
+        "{}",
+        page.body
+    );
+    for absent in ["data-update-check", "data-update-install", "tray_autostart"] {
+        assert!(!page.body.contains(absent), "{absent}");
+    }
+    // 概要の閲覧は状態フォルダーを作らない（JS・CSS は同梱の静的ファイルだけ）。
+    assert!(!fx.base.join("state").exists());
+    assert!(fx.get("/assets/app.js").await.body.contains("data-updates"));
+
+    let json_post = |path: &'static str| {
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("csrf", &fx.csrf)
+            .finish();
+        Request::post(path)
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::COOKIE, &fx.cookie)
+            .header(header::ACCEPT, "application/json")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    for path in ["/updates/check", "/updates/install"] {
+        let r = fx.raw(json_post(path)).await;
+        assert_eq!(r.status, StatusCode::OK, "{path}: {}", r.body);
+        assert!(
+            r.headers[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("application/json")
+        );
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        assert_eq!(v["status"], "unsupported", "{path}");
+        if path == "/updates/check" {
+            assert_eq!(v["supported"], false);
+            assert_eq!(v["available"], false);
+        }
+        assert!(
+            v["message"].as_str().unwrap().contains("Setup 版"),
+            "{path}"
+        );
+        // 内部の情報（更新元・パス・環境）を出さない。
+        for forbidden in ["http", "state", "\\", "SCRIPTURA"] {
+            assert!(!r.body.contains(forbidden), "{path}: {forbidden}");
+        }
+    }
+    // JavaScript が無い環境のフォーム送信は、同じ結果を HTML の画面で返す。
+    let r = fx.post("/updates/check", &[]).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.body.contains("Setup 版でのみ使えます"), "{}", r.body);
+    assert!(r.body.contains(r#"href="/#updates""#));
+    let r = fx.post("/updates/install", &[]).await;
+    assert_eq!(r.status, StatusCode::OK);
+    // 設定の保存は拒否する（Setup 版の設定だけ）。
+    let r = fx.post("/updates/settings", &[("auto_update", "1")]).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(!fx.base.join("state").exists());
+    // インストールの要求は、サーバーを止めない（非対応のときは shutdown を通知しない）。
+    assert_eq!(fx.get("/").await.status, StatusCode::OK);
 }

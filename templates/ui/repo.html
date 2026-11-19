@@ -66,17 +66,17 @@
   {% if cursors.is_empty() %}<p class="note">{{ crate::locale::tr("ui.repo.no_cursors") }}</p>{% else %}
   <div class="table-wrap"><table>
     <thead><tr><th>{{ crate::locale::tr("ui.repo.upstream") }}</th><th>{{ crate::locale::tr("ui.repo.updated") }}</th><th>{{ crate::locale::tr("ui.repo.pushed") }}</th><th>{{ crate::locale::tr("ui.title.error") }}</th></tr></thead>
-    <tbody>{% for c in cursors %}<tr><td><code>{{ c.upstream }}</code></td><td>{{ c.updated_at }}</td><td><code>{{ c.pushed_commit }}</code></td><td>{% if !c.error.is_empty() %}<span class="error-text">{{ c.error }}</span>{% endif %}</td></tr>{% endfor %}</tbody>
+    <tbody>{% for c in cursors %}<tr><td><code>{{ c.upstream }}</code></td><td>{% let t = c.updated_at %}{% include "ui/time_secs.html" %}</td><td><code>{{ c.pushed_commit }}</code></td><td>{% if !c.error.is_empty() %}<span class="error-text">{{ c.error }}</span>{% endif %}</td></tr>{% endfor %}</tbody>
   </table></div>
   {% endif %}
 </section>
 <section class="panel">
   <h2>{{ crate::locale::tr("ui.repo.publication") }}</h2>
   {% if let Some(p) = publication %}
-  <p>{{ crate::locale::tr("ui.repo.publication_current") }} <strong>{{ p.phase }}</strong> ({{ p.at }}){% if !p.error.is_empty() %} <span class="error-text">{{ p.error }}</span>{% endif %}{% if !p.warning.is_empty() %} <span class="badge warning">{{ p.warning }}</span>{% endif %}</p>
+  <p>{{ crate::locale::tr("ui.repo.publication_current") }} <strong>{{ p.phase }}</strong> ({% let t = p.at %}{% include "ui/time_secs.html" %}){% if !p.error.is_empty() %} <span class="error-text">{{ p.error }}</span>{% endif %}{% if !p.warning.is_empty() %} <span class="badge warning">{{ p.warning }}</span>{% endif %}</p>
   <div class="table-wrap"><table>
     <thead><tr><th>{{ crate::locale::tr("ui.repo.time") }}</th><th>{{ crate::locale::tr("ui.repo.phase") }}</th><th>{{ crate::locale::tr("ui.repo.errors") }}</th></tr></thead>
-    <tbody>{% for e in events %}<tr><td>{{ e.at }}</td><td>{{ e.phase }}</td><td>{% if !e.error.is_empty() %}<span class="error-text">{{ e.error }}</span>{% endif %}{% if !e.warning.is_empty() %}<span class="badge warning">{{ e.warning }}</span>{% endif %}</td></tr>{% endfor %}</tbody>
+    <tbody>{% for e in events %}<tr><td>{% let t = e.at %}{% include "ui/time_secs.html" %}</td><td>{{ e.phase }}</td><td>{% if !e.error.is_empty() %}<span class="error-text">{{ e.error }}</span>{% endif %}{% if !e.warning.is_empty() %}<span class="badge warning">{{ e.warning }}</span>{% endif %}</td></tr>{% endfor %}</tbody>
   </table></div>
   {% else %}<p class="note">{{ crate::locale::tr("ui.repo.no_publication") }}</p>{% endif %}
 </section>

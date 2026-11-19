@@ -1107,6 +1107,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
+ "ureq",
  "url",
  "uuid",
  "velopack",

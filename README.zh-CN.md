@@ -23,7 +23,7 @@ Scriptura 会在你向自己的仓库 push 之后，于后台维护 `AGENTS.md` 
 
 - **注册是自动的**：在安装时（Windows 上是安装 hook；macOS 和 Linux 上是安装后首次不带参数的启动），Claude Code `settings.json` 中的 Stop hook 会指向 Setup 版的可执行文件。只会替换 Scriptura 自己的 hook（指向旧的独立安装 `%LOCALAPPDATA%\Programs\Scriptura\bin\scriptura.exe` 的 hook 会被替换为 Setup 版的，旧文件不会被删除）。已有的 `agents-maintenance` hook 不会被替换；`status` / `doctor` / 不带参数的启动会提示你使用 `scriptura connect claude-code --apply`。
 - **避免与插件重复**：如果 `settings.json` 的 `enabledPlugins` 中启用了 `scriptura@*`，Setup 版就不会在 `settings.json` 中注册（否则维护会运行两次）。请二选一：继续使用插件，或者停用插件并切换到 Setup 版。停用后，会在不带参数的启动时或下次登录时自动完成注册。
-- **自动更新（默认开启）**：hook 的维护结束后，最多每天检查一次新版本（成功和失败都以 24 小时为间隔进行限流），并且只下载。**只在登录时应用**：登录时运行的 `scriptura update-apply`（Windows 上是 HKCU Run 的值 `<packId> Update`；macOS 上是 LaunchAgent `com.kagayoi.<packId>.update`；Linux 上是 XDG 自动启动项 `com.kagayoi.<packId>.update.desktop`）会确认没有任何 Scriptura hook 或管理界面正在运行，并校验签名者，然后无需重启即可应用更新。只要有任何一个在运行，就什么都不做，把更新留到下次登录（因此正在维护中的 hook 绝不会被终止）。
+- **自动更新（默认开启）**：hook 的维护结束后，最多每天检查一次新版本（成功和失败都以 24 小时为间隔进行限流），并且只下载。**只在登录时应用**：登录时运行的 `scriptura update-apply`（Windows 上是 HKCU Run 的值 `<packId> Update`；macOS 上是 LaunchAgent `com.kagayoi.<packId>.update`；Linux 上是 XDG 自动启动项 `com.kagayoi.<packId>.update.desktop`）会确认没有任何 Scriptura hook 或管理界面正在运行，并校验签名者，然后无需重启即可应用更新。只要有任何一个在运行，就什么都不做，把更新留到下次登录（因此正在维护中的 hook 绝不会被终止）。 也可以在需要时用管理界面中的“安装更新”（见下文）手动应用。
 - 状态保存在状态文件夹（见下文）中：`app-update.json`（`auto_update` 以及上次检查 / 失败的时间）、`app-update.log`（用于诊断）和 `setup-registration.json`（注册结果）。
 
 ```powershell
@@ -235,12 +235,13 @@ scriptura ui --autostart on|off
 这是一个基于浏览器的界面，用于处理设置、更新提案和诊断。支持 9 种语言（ja、en、zh-CN、zh-TW、ko、es、fr、de、pt-BR）。语言按以下顺序确定：界面顶部的语言选择（保存在 cookie 中）→ 浏览器的 `Accept-Language` → 英语。默认不常驻：当你在界面上选择“退出”、按 Ctrl+C，或 60 分钟无操作时，启动它的命令就会结束（加上 `--tray` 则常驻，见下文）。hook 不会检查界面是否打开。它由 cargo feature `ui` 控制（默认启用），使用 `--no-default-features` 构建时不包含它（此时 `scriptura ui` 会拒绝并退出）。
 
 - **监听**：仅监听 `127.0.0.1`（默认端口为 7468；`--port 0` 会选一个空闲端口）。如果端口被占用，则退出。
-- **常驻（`--tray`）**：在 Windows 上以系统托盘图标、在 macOS 上以菜单栏图标的形式常驻（不支持 Linux；`--tray` 会拒绝并退出）。点击图标会打开管理界面，右键菜单提供“打开管理界面”“登录时启动”（仅 Setup 版）和“退出”。常驻期间不会因无操作而退出，而是在 60 分钟无操作后让会话失效（一直开着的标签页会得到 401），并且每次从图标打开界面时都会重新签发一次性密钥（重新签发的密钥 5 分钟后失效，之前未使用的密钥会作废）。在 Windows 上，如果已在默认端口常驻，再次运行 `scriptura ui --tray` 不会启动第二个，而是由常驻的那个打开浏览器。如果是从终端以外（例如开始菜单）启动的，它会以没有控制台窗口的进程重新启动自己。
-- **登录时常驻（仅 Setup 版；默认关闭）**：用 `scriptura ui --autostart on|off`，或图标菜单中的“登录时启动”来切换（状态文件夹中 `app-update.json` 的 `tray_autostart`）。不会增加额外的登录项；常驻界面会在登录时的 `update-apply` 结束后才启动（如果它先启动，安装目录会被视为有其他进程在运行，更新就永远不会被应用）。在应用了更新的那次登录中，更新器会在替换完成后启动新版本的常驻界面。Setup 版的开始菜单项（不带参数的启动）会先显示说明，然后让管理界面常驻并在浏览器中打开。由于常驻期间 Scriptura 会一直在安装目录中运行，已下载的更新要到下一次登录才会被应用。随插件打包的可执行文件和独立 `install` 的可执行文件不能使用 `--autostart`（用 `ui --tray` 常驻仍然可以）。
+- **常驻（`--tray`）**：在 Windows 上以系统托盘图标、在 macOS 上以菜单栏图标的形式常驻（不支持 Linux；`--tray` 会拒绝并退出）。点击图标会打开管理界面，右键菜单提供“打开管理界面”“检查更新”（仅 Setup 版；打开概览界面的“应用更新”面板）和“退出”。常驻期间不会因无操作而退出，而是在 60 分钟无操作后让会话失效（一直开着的标签页会得到 401），并且每次从图标打开界面时都会重新签发一次性密钥（重新签发的密钥 5 分钟后失效，之前未使用的密钥会作废）。在 Windows 上，如果已在默认端口常驻，再次运行 `scriptura ui --tray` 不会启动第二个，而是由常驻的那个打开浏览器。如果是从终端以外（例如开始菜单）启动的，它会以没有控制台窗口的进程重新启动自己。
+- **登录时常驻（仅 Setup 版；默认开启）**：除非用 `scriptura ui --autostart off` 或“应用更新”面板中的复选框关闭，否则会常驻（状态文件夹中 `app-update.json` 的 `tray_autostart`；此前保存的明确关闭设置会保留，缺失或无法读取时按开启处理）。不会增加额外的登录项；常驻界面会在登录时的 `update-apply` 结束后才启动（如果它先启动，安装目录会被视为有其他进程在运行，更新就永远不会被应用）。在应用了更新的那次登录中，更新器会在替换完成后启动新版本的常驻界面。Setup 版的开始菜单项（不带参数的启动）会先显示说明，然后让管理界面常驻并在浏览器中打开。由于常驻期间 Scriptura 会一直在安装目录中运行，已下载的更新要到下一次登录，或点击面板中的“安装更新”（见下文）时才会被应用。随插件打包的可执行文件和独立 `install` 的可执行文件不能使用 `--autostart`（用 `ui --tray` 常驻仍然可以）。
+- **“应用更新”面板（仅 Setup 版）**：概览界面的“应用更新”面板（`#updates`）显示当前版本，提供自动更新和登录时常驻的复选框、“检查更新”按钮，以及“安装更新”按钮（有新版本时显示）。检查会忽略 24 小时的间隔，且不会下载。安装会下载并验证签名者；如果安装目录中没有其他 Scriptura 进程（hook、worker、另一个管理界面）在运行，也没有正在执行的 run-now，就请求更新器应用更新并结束管理界面（否则不做任何事，并提示稍后重试；不会强制终止任何进程）。常驻时由更新器启动新版本，但会话是全新的，已打开的标签页会提示“请从托盘（菜单栏）图标重新打开”。从终端启动的管理界面只会退出。托盘菜单中的“检查更新”会打开此面板并自动开始检查。没有 JavaScript 时，同样的按钮仍可使用，结果显示在单独的界面中。在非 Setup 版中，面板只显示“仅 Setup 版可用”。
 - **防护**：每次启动生成的一次性密钥 URL（`/auth?key=…`）只能兑换一次会话 cookie（`HttpOnly; SameSite=Strict`）（没有该 cookie，响应为 401）。Host 必须只能是 `127.0.0.1:<port>` 或 `localhost:<port>`；如果存在 Origin，则必须同源；POST 要求同源（`Origin` 或 `Sec-Fetch-Site`）以及 CSRF 令牌。响应头会加上 CSP、`nosniff`、`no-store` 等，并且绝不显示机密值。由于浏览器不按端口隔离 cookie，该 cookie 也会发送给同一台 PC 上运行在其他 127.0.0.1 端口的服务（同一用户的进程本来就能接触设置文件，因此唯一的顾虑是权限不同的本地服务）。
 - **冲突**：保存时会比对它所显示的版本，如果文件已在别处被改动，则提示你重新加载。
 - **确认界面**：切换到 push 模式、把权限切换为 `bypass`、把 enrollment 策略改为 `all` / `remote-owner`、添加自定义种类的对象路径、记录同意、移除注册、应用更新提案，以及在 push 模式下的 `run-now`（以及把历史恢复到包含其中任何一项的版本），在第一次提交时都不会写入；它们会显示变更列表，并要求一次性确认（10 分钟内有效）。
-- **界面**：概览 / 仓库（注册、启用、暂停、恢复、移除、模式和对象文档、`run-now`）/ 文档种类（添加、编辑、删除种类；编辑 `templates/` 中的模板）/ 更新提案（查看差异、应用、丢弃）/ Worker / 通用 / 同意 / 历史（变更历史、差异、恢复）/ 诊断。`run-now` 耗时较长，因此在后台运行，你可以在界面上查看其状态。
+- **界面**：页眉有五项：概览 / 仓库（注册、启用、暂停、恢复、移除、模式和对象文档、`run-now`）/ 文档种类（添加、编辑、删除种类；编辑 `templates/` 中的模板）/ 更新提案（查看差异、应用、丢弃）/ 设置。设置以标签页显示：通用 / Worker / 同意 / 历史（变更历史、差异、恢复）/ 诊断。Worker 界面中的模型和 effort 通过列表选择，而不是手动输入：模型列表为内置列表；若已设置环境变量 `ANTHROPIC_API_KEY`，点击“更新模型列表”按钮会从 Anthropic API 将最新模型获取到内存中（Scriptura 不保存也不显示密钥，仅打开界面不会联网，已保存但不在列表中的值会作为“不在列表中”保留）。时间按运行界面的电脑的本地时区显示（`YYYY-MM-DD HH:MM`），保存格式和 CLI 的 JSON 不变。`run-now` 耗时较长，因此在后台运行，你可以在界面上查看其状态。
 
 ## 输出语言
 
@@ -255,7 +256,7 @@ CLI、hook 和安装程序的提示输出支持 9 种语言（ja、en、zh-CN、
 | `enable --repo <path> --accept-consent <version> [--mode propose\|push\|off] [--branches a,b] [--documents AGENTS.md,README.md]` | 注册并启用一个仓库。`--documents` 接受 4 种内置种类（包括 `CHANGELOG.md`；不区分大小写）以及设置中定义的自定义种类的 id。 |
 | `disable --repo <path>` | 移除注册。 |
 | `pause [--repo <path>]` / `resume [--repo <path>]` | 暂停 / 恢复（省略 `--repo` 时为当前目录所在的仓库）。 |
-| `status` | 显示安装状态、设置、同意、注册、worker 设置、更新提案数量，以及 Setup 版的信息（`setup`：是否受管理、packId、版本、可执行文件、自动更新、登录时管理界面是否常驻（`trayAutostart`）、上次检查 / 失败的时间、已下载的版本、注册结果，以及遗留的旧独立安装）。`installedVersion` 来自独立 `install` 的记录（`install.json`，若不存在则取早期版本的 `current.json`）。 |
+| `status` | 显示安装状态、设置、同意、注册、worker 设置、更新提案数量，以及 Setup 版的信息（`setup`：是否受管理、packId、版本、可执行文件、自动更新、登录时管理界面是否常驻（`trayAutostart`）、上次检查 / 失败的时间、已下载的版本、注册结果，以及遗留的旧独立安装）。`installedVersion` 来自独立 `install` 的记录（`install.json`，若不存在则取早期版本的 `current.json`）。 `installForm` 表示正在运行的程序的安装形式（`setup` = Setup 版，`standalone` = 独立 `install`，`other` = 插件内置或开发构建），而 `installed` 仅表示独立 `install` 的安装位置是否存在可执行文件。 |
 | `doctor [--verify]` | 诊断环境和设置（见下文）。 |
 | `run-now [--repo <path>] [--documents <id,...>]` | 不等待 push，立即运行一次维护（仅限已注册且已同意的仓库；忽略时机，处理所有已启用的种类）。`--documents` 用于缩小要处理的种类（未定义的种类，或在该仓库中被禁用的种类，会被拒绝且不启动 worker）。**注意**：缩小范围的 `run-now` 同样会推进已处理位置，而由于每个 commit 对应一个更新提案，范围之外的种类不会针对该次 push 被维护。违反维护后检查的 propose 会返回 `outcome` 为 `rejected`（附带 `reason`；这不算失败，该次 push 计为已处理）。 |
 | `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | 列出文档种类（内置和自定义），并显示其中一种的详情（启用或禁用、对象路径及其是否存在、限制、时机、模板状态、上次完成时间；`show` 还会输出已配置的 guidance 和追加指示。只读，不会输出文档内容）。 |

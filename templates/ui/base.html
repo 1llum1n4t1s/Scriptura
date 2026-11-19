@@ -9,16 +9,14 @@
     <a href="/repos" aria-current="{% if layout.nav == "repos" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.repos") }}</a>
     <a href="/kinds" aria-current="{% if layout.nav == "kinds" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.kinds") }}</a>
     <a href="/proposals" aria-current="{% if layout.nav == "proposals" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.proposals") }}</a>
-    <a href="/settings/worker" aria-current="{% if layout.nav == "worker" %}page{% else %}false{% endif %}">worker</a>
-    <a href="/settings/general" aria-current="{% if layout.nav == "general" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.general") }}</a>
-    <a href="/consent" aria-current="{% if layout.nav == "consent" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.consent") }}</a>
-    <a href="/history" aria-current="{% if layout.nav == "history" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.history") }}</a>
-    <a href="/doctor" aria-current="{% if layout.nav == "doctor" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.doctor") }}</a>
+    <a href="/settings/general" aria-current="{% if layout.in_settings() %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.settings") }}</a>
   </nav>
   <form method="post" action="/language" class="inline language" data-language-selector><input type="hidden" name="csrf" value="{{ layout.csrf }}"><label><span class="visually-hidden">{{ crate::locale::tr("ui.lang.label") }}</span><select name="language" aria-label="{{ crate::locale::tr("ui.lang.label") }}" data-autosubmit>{% for c in crate::ui::views::language_choices() %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label><button class="small" type="submit" data-autosubmit-fallback>{{ crate::locale::tr("ui.lang.apply") }}</button></form>
   <form method="post" action="/shutdown" class="inline"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><button class="small destructive" type="submit">{{ crate::locale::tr("ui.base.exit") }}</button></form>
 </header>
 <main id="main">
+{% if layout.in_settings() %}{% include "ui/settings_nav.html" %}
+{% endif %}
 {% if let Some(text) = layout.flash %}<p class="notice" role="status">{{ text }}</p>{% endif %}
 {% if let Some(reason) = layout.broken %}<p class="notice warning" role="alert">{{ crate::locale::tr1("ui.base.broken", "reason", reason) }}</p>{% endif %}
 {% block content %}{% endblock %}

@@ -326,6 +326,22 @@ impl Default for Defaults {
     }
 }
 
+/// `claude --effort` が受け付ける値（管理画面の選択肢。1 文字違いで worker が動かなくなるため固定表にする）。
+/// 設定の検証（`validate`）は従来どおり「空でない・空白なし」だけで、保存済みの未知の値は壊れた設定にしない。
+pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// `claude --model` の別名（CLI が最新版に解決する）。管理画面のモデル選択の固定の一覧（取得できないときの
+/// フォールバック）の前半。
+pub const MODEL_ALIASES: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
+
+/// 完全名の既定の版（固定の一覧の後半）。
+pub const MODEL_DEFAULTS: [&str; 4] = [
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+    "claude-fable-5-2",
+];
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Worker {

@@ -56,15 +56,15 @@ impl Control {
         self.stopped.load(Ordering::SeqCst)
     }
 
-    /// ログオン時の常駐の設定。Setup 版でなければ None（メニューに項目を出さない）。
-    pub fn autostart(&self) -> Option<bool> {
-        crate::app_update::tray_autostart()
+    /// 「更新を確認」を出すか（Setup 版だけ。それ以外では確認する更新元が無いので、項目を出さない）。
+    pub fn can_check_updates(&self) -> bool {
+        crate::app_update::is_managed()
     }
 
-    /// ログオン時の常駐を切り替える（Setup 版だけ。失敗は黙って無視し、次にメニューを開いたときの表示で分かる）。
-    pub fn toggle_autostart(&self) {
-        if let Some(on) = self.autostart() {
-            let _ = crate::app_update::set_tray_autostart(!on);
-        }
+    /// 管理画面の概要画面の更新パネルを開く。使い捨て鍵を発行し直し、画面が自動で更新の確認を始める
+    /// （`?check_updates=1#updates`）。
+    pub fn check_updates(&self) {
+        let key = self.state.issue_key();
+        super::open_browser(&super::auth_url_updates(self.port, &key));
     }
 }

@@ -23,7 +23,7 @@ Scriptura 會在你 push 到自己的儲存庫之後，於背景維護 `AGENTS.m
 
 - **自動註冊**：安裝時（Windows 為安裝 hook；macOS 與 Linux 為安裝後第一次不帶參數的啟動），Claude Code `settings.json` 中的 Stop hook 會被指向 Setup 版的執行檔。只會取代 Scriptura 自己的 hook（指向舊版單機安裝 `%LOCALAPPDATA%\Programs\Scriptura\bin\scriptura.exe` 的 hook 會被換成 Setup 版的，舊檔案不會被刪除）。既有的 `agents-maintenance` hook 不會被取代；`status` / `doctor` / 不帶參數的啟動會提示你使用 `scriptura connect claude-code --apply`。
 - **避免與外掛程式重複**：若 `settings.json` 的 `enabledPlugins` 中啟用了 `scriptura@*`，Setup 版就不會註冊到 `settings.json`（否則維護會執行兩次）。請擇一：繼續使用外掛程式，或停用外掛程式並改用 Setup 版。停用之後，會在不帶參數的啟動或下一次登入時自動完成註冊。
-- **自動更新（預設開啟）**：hook 的維護結束後，最多每天檢查一次是否有新版本（成功與失敗都以 24 小時為間隔節流），並且只下載。**只會在登入時套用**：登入時執行的 `scriptura update-apply`（Windows 為 HKCU Run 值 `<packId> Update`；macOS 為 LaunchAgent `com.kagayoi.<packId>.update`；Linux 為 XDG autostart 項目 `com.kagayoi.<packId>.update.desktop`）會確認沒有任何 Scriptura hook 或管理介面正在執行，並檢查簽署者，然後在不重新啟動的情況下套用更新。只要有任何一個正在執行，它就什麼都不做，並把更新留到下次登入（因此維護進行中的 hook 絕不會被中止）。
+- **自動更新（預設開啟）**：hook 的維護結束後，最多每天檢查一次是否有新版本（成功與失敗都以 24 小時為間隔節流），並且只下載。**只會在登入時套用**：登入時執行的 `scriptura update-apply`（Windows 為 HKCU Run 值 `<packId> Update`；macOS 為 LaunchAgent `com.kagayoi.<packId>.update`；Linux 為 XDG autostart 項目 `com.kagayoi.<packId>.update.desktop`）會確認沒有任何 Scriptura hook 或管理介面正在執行，並檢查簽署者，然後在不重新啟動的情況下套用更新。只要有任何一個正在執行，它就什麼都不做，並把更新留到下次登入（因此維護進行中的 hook 絕不會被中止）。 也可以在需要時用管理介面中的「安裝更新」（見下文）手動套用。
 - 狀態存放於狀態資料夾（詳見後文）：`app-update.json`（`auto_update` 與最近的檢查／失敗時間）、`app-update.log`（診斷用）、`setup-registration.json`（註冊結果）。
 
 ```powershell
@@ -235,12 +235,13 @@ scriptura ui --autostart on|off
 這是一個以瀏覽器操作的畫面，用來處理設定、更新提案與診斷。提供 9 種語言（ja、en、zh-CN、zh-TW、ko、es、fr、de、pt-BR）。語言依下列順序選擇：畫面頂端的語言選擇器（儲存在 cookie 中）→ 瀏覽器的 `Accept-Language` → 英文。預設不會常駐：當你在畫面上選擇「Quit」、按下 Ctrl+C，或閒置 60 分鐘後，啟動它的指令就會結束（加上 `--tray` 則會常駐，見下文）。hook 不會查看該畫面是否開啟。它由 cargo feature `ui` 控制（預設啟用），以 `--no-default-features` 建置時不會包含（此時 `scriptura ui` 會拒絕並結束）。
 
 - **監聽**：僅限 `127.0.0.1`（預設連接埠為 7468；`--port 0` 會挑選一個空閒連接埠）。若連接埠已被占用，則結束。
-- **常駐（`--tray`）**：在 Windows 以系統匣圖示、在 macOS 以選單列圖示的形式常駐（不支援 Linux；`--tray` 會拒絕並結束）。點擊圖示會開啟管理介面，右鍵選單提供「開啟管理畫面」「登入時啟動」（僅限 Setup 版）與「結束」。常駐期間不會因閒置而結束，而是在閒置 60 分鐘後讓工作階段失效（一直開著的分頁會得到 401），並且每次從圖示開啟畫面時都會重新核發一次性金鑰（重新核發的金鑰 5 分鐘後失效，先前未使用的金鑰會作廢）。在 Windows 上，若已在預設連接埠常駐，再次執行 `scriptura ui --tray` 不會啟動第二個，而是由常駐的那個開啟瀏覽器。若是從終端機以外（例如開始功能表）啟動，它會以沒有主控台視窗的處理程序重新啟動自己。
-- **登入時常駐（僅限 Setup 版；預設為關閉）**：以 `scriptura ui --autostart on|off`，或圖示選單中的「登入時啟動」切換（狀態資料夾中 `app-update.json` 的 `tray_autostart`）。不會增加額外的登入項目；常駐介面會在登入時的 `update-apply` 結束後才啟動（若它先啟動，安裝資料夾會被視為有其他處理程序正在執行，更新就永遠不會被套用）。在套用了更新的那次登入中，更新程式會在替換完成後啟動新版本的常駐介面。Setup 版的開始功能表項目（不帶引數的啟動）會先顯示說明，接著讓管理介面常駐並在瀏覽器中開啟。由於常駐期間 Scriptura 會一直在安裝資料夾中執行，已下載的更新要到下一次登入才會被套用。隨外掛程式封裝的執行檔與單機 `install` 的執行檔不能使用 `--autostart`（以 `ui --tray` 常駐仍然可行）。
+- **常駐（`--tray`）**：在 Windows 以系統匣圖示、在 macOS 以選單列圖示的形式常駐（不支援 Linux；`--tray` 會拒絕並結束）。點擊圖示會開啟管理介面，右鍵選單提供「開啟管理畫面」「檢查更新」（僅限 Setup 版；開啟總覽畫面的「應用程式更新」面板）與「結束」。常駐期間不會因閒置而結束，而是在閒置 60 分鐘後讓工作階段失效（一直開著的分頁會得到 401），並且每次從圖示開啟畫面時都會重新核發一次性金鑰（重新核發的金鑰 5 分鐘後失效，先前未使用的金鑰會作廢）。在 Windows 上，若已在預設連接埠常駐，再次執行 `scriptura ui --tray` 不會啟動第二個，而是由常駐的那個開啟瀏覽器。若是從終端機以外（例如開始功能表）啟動，它會以沒有主控台視窗的處理程序重新啟動自己。
+- **登入時常駐（僅限 Setup 版；預設為開啟）**：除非以 `scriptura ui --autostart off` 或「應用程式更新」面板中的核取方塊關閉，否則會常駐（狀態資料夾中 `app-update.json` 的 `tray_autostart`；先前儲存的明確關閉設定會保留，缺少或無法讀取時視為開啟）。不會增加額外的登入項目；常駐介面會在登入時的 `update-apply` 結束後才啟動（若它先啟動，安裝資料夾會被視為有其他處理程序正在執行，更新就永遠不會被套用）。在套用了更新的那次登入中，更新程式會在替換完成後啟動新版本的常駐介面。Setup 版的開始功能表項目（不帶引數的啟動）會先顯示說明，接著讓管理介面常駐並在瀏覽器中開啟。由於常駐期間 Scriptura 會一直在安裝資料夾中執行，已下載的更新要到下一次登入，或按下面板中的「安裝更新」（見下文）時才會被套用。隨外掛程式封裝的執行檔與單機 `install` 的執行檔不能使用 `--autostart`（以 `ui --tray` 常駐仍然可行）。
+- **「應用程式更新」面板（僅限 Setup 版）**：總覽畫面的「應用程式更新」面板（`#updates`）顯示目前版本，提供自動更新與登入時常駐的核取方塊、「檢查更新」按鈕，以及「安裝更新」按鈕（有新版本時顯示）。檢查會忽略 24 小時的間隔，且不會下載。安裝會下載並驗證簽署者；若安裝資料夾中沒有其他 Scriptura 處理程序（hook、worker、另一個管理介面）在執行，也沒有進行中的 run-now，就請求更新程式套用並結束管理介面（否則不做任何事，並提示稍後再試；不會強制終止任何處理程序）。常駐時由更新程式啟動新版本，但工作階段是全新的，已開啟的分頁會提示「請從系統匣（功能表列）圖示重新開啟」。從終端機啟動的管理介面只會結束。系統匣選單中的「檢查更新」會開啟此面板並自動開始檢查。沒有 JavaScript 時，同樣的按鈕仍可使用，結果顯示在另一個畫面。在非 Setup 版中，面板只顯示「僅 Setup 版可用」。
 - **保護**：每次啟動時產生的一次性金鑰 URL（`/auth?key=…`）會被換成一次性的工作階段 cookie（`HttpOnly; SameSite=Strict`）（沒有 cookie 時，回應為 401）。Host 必須只能是 `127.0.0.1:<port>` 或 `localhost:<port>`；若有 Origin，必須為同源；POST 需要同源（`Origin` 或 `Sec-Fetch-Site`）加上 CSRF 權杖。回應標頭如 CSP、`nosniff` 與 `no-store` 都會加上，且絕不顯示祕密值。由於瀏覽器不會依連接埠隔離 cookie，該 cookie 也會被送往同一台 PC 上其他 127.0.0.1 連接埠上執行的服務（同一位使用者的處理程序本來就能存取設定檔，因此唯一的疑慮是權限不同的本機服務）。
 - **衝突**：儲存時會比對其所顯示的版本，若檔案已在其他地方被變更，會提示你重新載入。
 - **確認畫面**：切換到 push 模式、將權限切換為 `bypass`、將註冊政策變更為 `all` / `remote-owner`、新增自訂種類的目標路徑、記錄同意、移除註冊、套用更新提案，以及在 push 模式下的 `run-now`（還有將歷史還原到包含上述任何一項的版本）都不會在第一次送出時寫入；它們會顯示變更清單，並要求一次性的確認（10 分鐘內有效）。
-- **畫面**：Overview / Repositories（註冊、啟用、暫停、恢復、移除、模式與目標文件、`run-now`）/ Document kinds（新增、編輯與刪除種類；編輯 `templates/` 中的範本）/ Update proposals（檢視差異、套用、捨棄）/ Worker / General / Consent / History（變更歷史、差異、還原）/ Diagnostics。`run-now` 需要時間，因此會在背景執行，你可以在畫面上確認其狀態。
+- **畫面**：頁首有五個項目：Overview / Repositories（註冊、啟用、暫停、恢復、移除、模式與目標文件、`run-now`）/ Document kinds（新增、編輯與刪除種類；編輯 `templates/` 中的範本）/ Update proposals（檢視差異、套用、捨棄）/ Settings。Settings 以分頁呈現：General / Worker / Consent / History（變更歷史、差異、還原）/ Diagnostics。Worker 畫面的模型與 effort 以清單選擇，而非手動輸入：模型清單為內建清單；若已設定環境變數 `ANTHROPIC_API_KEY`，按下「更新模型清單」按鈕會從 Anthropic API 將最新模型取得到記憶體中（Scriptura 不會儲存或顯示金鑰，僅開啟畫面不會連線，已儲存但不在清單中的值會以「不在清單中」保留）。時間依執行畫面的電腦的本地時區顯示（`YYYY-MM-DD HH:MM`），儲存格式與 CLI 的 JSON 不變。`run-now` 需要時間，因此會在背景執行，你可以在畫面上確認其狀態。
 
 ## 輸出語言
 
@@ -255,7 +256,7 @@ CLI、hook 與安裝程式的指引輸出提供 9 種語言（ja、en、zh-CN、
 | `enable --repo <path> --accept-consent <version> [--mode propose\|push\|off] [--branches a,b] [--documents AGENTS.md,README.md]` | 註冊並啟用儲存庫。`--documents` 接受 4 種內建種類（包含 `CHANGELOG.md`；不區分大小寫）以及設定中所定義的自訂種類 id。 |
 | `disable --repo <path>` | 移除註冊。 |
 | `pause [--repo <path>]` / `resume [--repo <path>]` | 暫停／恢復（省略 `--repo` 時為目前工作目錄所在的儲存庫）。 |
-| `status` | 顯示安裝狀態、設定、同意、註冊、worker 設定、更新提案的數量，以及 Setup 版的資訊（`setup`：是否受管理、packId、版本、執行檔、自動更新、登入時管理介面是否常駐（`trayAutostart`）、最近的檢查／失敗時間、已下載的版本、註冊結果，以及遺留的舊版單機安裝）。`installedVersion` 來自單機版 `install` 的記錄（`install.json`，若無則為更早版本的 `current.json`）。 |
+| `status` | 顯示安裝狀態、設定、同意、註冊、worker 設定、更新提案的數量，以及 Setup 版的資訊（`setup`：是否受管理、packId、版本、執行檔、自動更新、登入時管理介面是否常駐（`trayAutostart`）、最近的檢查／失敗時間、已下載的版本、註冊結果，以及遺留的舊版單機安裝）。`installedVersion` 來自單機版 `install` 的記錄（`install.json`，若無則為更早版本的 `current.json`）。 `installForm` 表示執行中程式的安裝形式（`setup` = Setup 版，`standalone` = 單機版 `install`，`other` = 外掛內建或開發建置），而 `installed` 只表示單機版 `install` 的安裝位置是否有執行檔。 |
 | `doctor [--verify]` | 診斷環境與設定（詳見後文）。 |
 | `run-now [--repo <path>] [--documents <id,...>]` | 不等待 push，立即執行一次維護（僅限已註冊且已同意的儲存庫；忽略時機，並處理所有已啟用的種類）。`--documents` 可縮小要處理的種類（未定義的種類，或在該儲存庫中已停用的種類，會在不啟動 worker 的情況下被拒絕）。**注意**：縮小範圍的 `run-now` 同樣會推進已處理位置，且由於每個 commit 只有一個更新提案，縮小範圍之外的種類在該次 push 中不會被維護。違反維護後檢查的 propose 會回傳 `outcome` 為 `rejected`（附帶 `reason`；這不算失敗，該次 push 視為已處理）。 |
 | `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | 列出文件種類（內建與自訂），並顯示單一種類的詳細資訊（啟用或停用、目標路徑及其是否存在、上限、時機、範本狀態、最後完成時間；`show` 也會印出已設定的 guidance 與額外指示。唯讀，且不會印出文件內容）。 |

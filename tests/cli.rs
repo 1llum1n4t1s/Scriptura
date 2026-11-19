@@ -631,6 +631,17 @@ fn status_json_reports_config_repositories_and_worker_without_secrets() {
     assert_eq!(v["consent"], Value::Null);
     assert_eq!(v["proposals"], json!({"pending": 0, "applied": 0}));
     assert!(v["version"].is_string() && v["installed"].is_boolean());
+    // 導入の形（既存の installed は単独 install の有無のまま。新しいキー installForm が実行中の形を表す）。
+    // テストのビルドは Velopack 管理下でも単独導入でもないので other。
+    assert_eq!(v["installForm"], "other");
+    assert_eq!(v["installed"], false);
+    let human = fx.run(&["status"]);
+    assert!(!human.stdout.contains("未導入"), "{}", human.stdout);
+    assert!(
+        human.stdout.contains("プラグイン／開発ビルド"),
+        "{}",
+        human.stdout
+    );
 
     assert_eq!(fx.enable(&["--branches", "main"]).code, 0);
     let v = fx.run(&["status", "--json"]).json();

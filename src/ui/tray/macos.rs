@@ -1,7 +1,7 @@
 // macOS のメニューバー（NSStatusItem）。AppKit はメインスレッドでしか動かせないので、`ui::run_resident` は
 // 呼び出したスレッド（メインスレッド）でこの `run` を回し、サーバーはランタイムのワーカーで動かす。
 //
-// - クリック: 管理画面を開く。右クリック（または Control + クリック）: メニュー（開く・ログオン時に起動・終了）。
+// - クリック: 管理画面を開く。右クリック（または Control + クリック）: メニュー（開く・更新を確認・終了）。
 // - Dock にアイコンを出さない（Accessory）。
 // - サーバーが止まったか（Ctrl+C・画面の「終了」・異常終了）を約 100ms ごとに見て、ループを抜ける。
 // - アイコンは同梱の画像を持たず、システムの記号（SF Symbols の `doc.text`）を使う（暫定の図柄）。
@@ -11,9 +11,9 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSControlStateValueOff, NSControlStateValueOn,
-    NSEventMask, NSEventModifierFlags, NSEventTrackingRunLoopMode, NSEventType, NSImage, NSMenu,
-    NSMenuItem, NSSquareStatusItemLength, NSStatusBar, NSStatusBarButton,
+    NSApplication, NSApplicationActivationPolicy, NSEventMask, NSEventModifierFlags,
+    NSEventTrackingRunLoopMode, NSEventType, NSImage, NSMenu, NSMenuItem, NSSquareStatusItemLength,
+    NSStatusBar, NSStatusBarButton,
 };
 use objc2_foundation::{
     MainThreadMarker, NSDate, NSDefaultRunLoopMode, NSObject, NSRunLoop, NSString, NSTimer,
@@ -43,9 +43,9 @@ define_class!(
             self.control().open();
         }
 
-        #[unsafe(method(toggleAutostart:))]
-        fn toggle_autostart(&self, _sender: &AnyObject) {
-            self.control().toggle_autostart();
+        #[unsafe(method(checkUpdates:))]
+        fn check_updates(&self, _sender: &AnyObject) {
+            self.control().check_updates();
         }
 
         #[unsafe(method(quitResident:))]
@@ -113,18 +113,13 @@ impl TrayTarget {
     fn menu(&self) -> Retained<NSMenu> {
         let menu = NSMenu::initWithTitle(NSMenu::alloc(self.mtm()), ns_string!("Scriptura"));
         menu.setAutoenablesItems(false);
-        // ログオン時の常駐は Setup 版だけ（それ以外では項目を出さない）。
-        let autostart = self.control().autostart();
-        let mut items = vec![(crate::t!("ui.tray.open"), sel!(openManager:), None)];
-        if let Some(on) = autostart {
-            items.push((
-                crate::t!("ui.tray.autostart"),
-                sel!(toggleAutostart:),
-                Some(on),
-            ));
+        // 「更新を確認」は Setup 版だけ（それ以外では確認する更新元が無いので、項目を出さない）。
+        let mut items = vec![(crate::t!("ui.tray.open"), sel!(openManager:))];
+        if self.control().can_check_updates() {
+            items.push((crate::t!("ui.tray.check_updates"), sel!(checkUpdates:)));
         }
-        items.push((crate::t!("ui.tray.quit"), sel!(quitResident:), None));
-        for (title, action, checked) in items {
+        items.push((crate::t!("ui.tray.quit"), sel!(quitResident:)));
+        for (title, action) in items {
             if action == sel!(quitResident:) {
                 menu.addItem(&NSMenuItem::separatorItem(self.mtm()));
             }
@@ -139,13 +134,6 @@ impl TrayTarget {
                 item.setTarget(Some(self));
                 item
             };
-            if let Some(on) = checked {
-                item.setState(if on {
-                    NSControlStateValueOn
-                } else {
-                    NSControlStateValueOff
-                });
-            }
             menu.addItem(&item);
         }
         menu

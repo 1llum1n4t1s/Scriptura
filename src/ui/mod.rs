@@ -37,6 +37,7 @@ mod confirm;
 mod guard;
 mod handlers;
 pub mod locale;
+pub mod models;
 mod read;
 #[cfg(any(windows, target_os = "macos"))]
 mod tray;
@@ -285,6 +286,10 @@ pub fn router(state: AppState) -> Router {
             get(handlers::worker).post(handlers::worker_save),
         )
         .route(
+            "/settings/worker/models",
+            post(handlers::worker_models_refresh),
+        )
+        .route(
             "/settings/general",
             get(handlers::general).post(handlers::general_save),
         )
@@ -296,6 +301,9 @@ pub fn router(state: AppState) -> Router {
         .route("/history", get(handlers::history))
         .route("/history/restore", post(handlers::history_restore))
         .route("/history/{id}", get(handlers::history_detail))
+        .route("/updates/check", post(handlers::update_check))
+        .route("/updates/install", post(handlers::update_install))
+        .route("/updates/settings", post(handlers::update_settings))
         .route("/shutdown", post(handlers::shutdown))
         .route("/language", post(locale::choose))
         .fallback(handlers::not_found)
@@ -466,6 +474,13 @@ async fn bind(port: u16) -> Result<(tokio::net::TcpListener, u16), String> {
 /// 入口の URL（使い捨て鍵つき）。
 fn auth_url(port: u16, key: &str) -> String {
     format!("http://127.0.0.1:{port}/auth?key={key}")
+}
+
+/// 入口の URL（使い捨て鍵つき）で、交換の後に概要画面の更新パネル（`?check_updates=1#updates`。画面が自動で
+/// 確認を始める）へ移る。移動先は `handlers::auth_destination` の許可リストの名前（`updates`）で渡す。
+#[cfg(any(windows, target_os = "macos"))]
+fn auth_url_updates(port: u16, key: &str) -> String {
+    format!("{}&next=updates", auth_url(port, key))
 }
 
 /// URL を標準出力へ出し、指定されていればブラウザーで開く。

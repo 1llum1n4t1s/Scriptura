@@ -4,7 +4,7 @@
 <a class="back" href="/repos/{{ index }}">← {{ crate::locale::tr("ui.job.back") }}</a>
 <section class="panel">
   <h1>run-now #{{ id }}</h1>
-  <dl class="facts"><dt>{{ crate::locale::tr("ui.common.repository") }}</dt><dd><code>{{ root }}</code></dd><dt>{{ crate::locale::tr("ui.job.started") }}</dt><dd>{{ started }}</dd></dl>
+  <dl class="facts"><dt>{{ crate::locale::tr("ui.common.repository") }}</dt><dd><code>{{ root }}</code></dd><dt>{{ crate::locale::tr("ui.job.started") }}</dt><dd>{% let t = started %}{% include "ui/time_secs.html" %}</dd></dl>
   {% if running %}<p class="notice">{{ crate::locale::tr("ui.job.running") }}</p>
   {% else %}
   <p class="notice{% if !ok %} warning{% endif %}">{{ message }}</p>

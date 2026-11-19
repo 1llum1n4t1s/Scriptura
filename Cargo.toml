@@ -40,6 +40,9 @@ velopack = { version = "=1.2.161", default-features = false, features = ["public
 # （8.6 系は 9.0.0 未満が影響を受ける）を解消するため、本体自身は 9.x を使う。velopack =1.2.161
 # （AGENTS.md の恒久契約で固定）経由の zip 8.6 は velopack を更新できるまで残るため、zip は独立した 2 版になる。
 zip = { version = "9.6", default-features = false, features = ["deflate"] }
+# 管理画面のモデル一覧の取得（ui::models。明示の更新操作のときだけ blocking で呼ぶ）。velopack が既に同じ crate を
+# 既定の機能（rustls・gzip）で使っているので、新しい crate は増えない（tokio も引き込まない）。
+ureq = "3.4"
 # 管理画面（feature "ui"）だけが使う。SSR（askama）+ axum + tokio、乱数は OS の CSPRNG（getrandom）。
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "query"], optional = true }
 askama = { version = "0.16.1", default-features = false, features = ["derive", "std"], optional = true }

@@ -13,7 +13,7 @@ use askama::Template;
 use axum::{
     Extension,
     extract::{Path, Query, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{Html, IntoResponse, Redirect, Response},
 };
 use serde::Deserialize;
@@ -22,7 +22,7 @@ use super::{
     AppState,
     confirm::{self, dangers},
     guard::{FormData, SESSION_COOKIE},
-    read,
+    models, read,
     views::{self, *},
 };
 use crate::{
@@ -432,6 +432,17 @@ fn gate(
 #[derive(Deserialize)]
 pub struct AuthQuery {
     key: Option<String>,
+    /// 交換の後の移動先の名前（許可リストの語だけ。URL は受け取らない）。
+    next: Option<String>,
+}
+
+/// `/auth?next=` の名前から移動先を決める。固定の安全なパスだけで、任意の URL へは飛ばさない
+/// （知らない語は既定の `/`）。
+fn auth_destination(next: Option<&str>) -> &'static str {
+    match next {
+        Some("updates") => "/?check_updates=1#updates",
+        _ => "/",
+    }
 }
 
 /// 使い捨て鍵をセッション Cookie に交換する。一度だけ有効（二度目は 401）。
@@ -455,7 +466,7 @@ pub async fn auth(State(state): State<AppState>, Query(q): Query<AuthQuery>) -> 
             .into_response();
     }
     state.touch();
-    let mut response = Redirect::to("/").into_response();
+    let mut response = Redirect::to(auth_destination(q.next.as_deref())).into_response();
     if let Ok(cookie) = HeaderValue::from_str(&format!(
         "{SESSION_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/",
         state.session()
@@ -553,7 +564,7 @@ pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Re
             crate::t!(
                 "ui.overview.consent",
                 version = c.version,
-                at = c.accepted_at,
+                at = views::local_time(&c.accepted_at),
                 source = consent_source(c.source)
             )
         });
@@ -567,11 +578,22 @@ pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Re
         } else {
             warnings(&cur.config)
         };
+        let updates = UpdatePanel {
+            managed: status["installForm"].as_str() == Some("setup"),
+            auto_update: status["setup"]["autoUpdate"].as_bool().unwrap_or(true),
+            tray_supported: cfg!(any(windows, target_os = "macos")),
+            tray_autostart: status["setup"]["trayAutostart"].as_bool().unwrap_or(false),
+        };
         (
             cur.broken,
             OverviewPageData {
                 version: app::VERSION.to_string(),
-                installed: status["installed"].as_bool().unwrap_or(false),
+                install_label: match status["installForm"].as_str() {
+                    Some("setup") => crate::t!("ui.overview.form_setup"),
+                    Some("standalone") => crate::t!("ui.overview.installed"),
+                    _ => crate::t!("ui.overview.form_other"),
+                },
+                install_hint: status["installForm"].as_str() == Some("other"),
                 config_path: s.store.config_file.display().to_string(),
                 config_state,
                 consent,
@@ -579,6 +601,7 @@ pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Re
                 repos,
                 pending,
                 warnings,
+                updates,
             },
         )
     })
@@ -595,7 +618,8 @@ pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Re
             broken,
         ),
         version: d.version,
-        installed: d.installed,
+        install_label: d.install_label,
+        install_hint: d.install_hint,
         config_path: d.config_path,
         config_state: d.config_state,
         consent: d.consent,
@@ -603,12 +627,14 @@ pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Re
         repos: d.repos,
         pending: d.pending,
         warnings: d.warnings,
+        updates: d.updates,
     })
 }
 
 struct OverviewPageData {
     version: String,
-    installed: bool,
+    install_label: &'static str,
+    install_hint: bool,
     config_path: String,
     config_state: String,
     consent: Option<String>,
@@ -616,6 +642,175 @@ struct OverviewPageData {
     repos: Vec<RepoRow>,
     pending: usize,
     warnings: Vec<String>,
+    updates: UpdatePanel,
+}
+
+// ---------------------------------------------------------------------------
+// アプリの更新（概要画面のパネル）
+//
+// 確認・インストールは POST（`guard` が Cookie・Origin・CSRF を検査）。JavaScript は `Accept: application/json` で
+// 呼んで状態表示を更新し、JavaScript が無いときのフォーム送信は同じ処理を HTML の結果画面で返す。
+// 外部通信の失敗は種別の文言だけを返す（更新元の URL・応答の中身は出さない。詳細は `app-update.log`）。
+// ---------------------------------------------------------------------------
+
+/// fetch（JavaScript）からの呼び出しか。
+fn wants_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("application/json"))
+}
+
+/// 更新の操作の応答。JSON（fetch）か HTML の結果画面。`fields` は JSON だけに足す値。
+fn update_reply(
+    state: &AppState,
+    headers: &HeaderMap,
+    status: &str,
+    message: String,
+    fields: serde_json::Value,
+) -> Response {
+    if !wants_json(headers) {
+        return html(UpdateResultPage {
+            layout: layout(state, crate::t!("ui.updates.title"), "overview", None, None),
+            message,
+        });
+    }
+    let mut body = serde_json::json!({ "status": status, "message": message });
+    if let (Some(target), Some(extra)) = (body.as_object_mut(), fields.as_object()) {
+        target.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    (
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// 「更新を確認」。間引きを無視して更新の有無だけを確認する（取得はインストールで行う）。
+pub async fn update_check(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    use crate::app_update::PanelCheck;
+    let Ok(outcome) = blocking(crate::app_update::panel_check).await else {
+        return internal(&state, "/");
+    };
+    let (status, message, latest) = match outcome {
+        PanelCheck::Unmanaged => (
+            "unsupported",
+            crate::t!("ui.updates.unmanaged").to_string(),
+            None,
+        ),
+        PanelCheck::Busy => ("busy", crate::t!("ui.updates.busy").to_string(), None),
+        PanelCheck::Failed => (
+            "failed",
+            crate::t!("ui.updates.check_failed").to_string(),
+            None,
+        ),
+        PanelCheck::UpToDate => (
+            "upToDate",
+            crate::t!("ui.updates.up_to_date").to_string(),
+            None,
+        ),
+        PanelCheck::Available(version) => (
+            "available",
+            crate::t!("ui.updates.available", version = version),
+            Some(version),
+        ),
+    };
+    let fields = serde_json::json!({
+        "available": latest.is_some(),
+        "supported": status != "unsupported",
+        "latest_version": latest,
+        "current_version": app::VERSION,
+    });
+    update_reply(&state, &headers, status, message, fields)
+}
+
+/// 常駐のとき、更新の適用の後に更新器が新しい版の常駐を起動する引数。常駐でなければ None（適用だけで再起動しない）。
+fn restart_args(state: &AppState) -> Option<Vec<String>> {
+    #[cfg(any(windows, target_os = "macos"))]
+    if state.is_resident() {
+        let port = state.port();
+        return Some(super::resident_args(
+            (port != super::DEFAULT_PORT).then_some(port),
+            false,
+        ));
+    }
+    let _ = state;
+    None
+}
+
+/// 「更新をインストール」。確認 → 取得 → 署名者の検証 → 導入先の他プロセスの確認 → 適用の依頼。他のプロセスが動いて
+/// いるときと保守の実行中は適用せずに見送る（強制終了しない）。適用を依頼できたら、応答を返した後にこのサーバーを
+/// 終える（更新器はこのプロセスの終了を待って入れ替える）。常駐なら更新器が新しい版を起動する。
+pub async fn update_install(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    use crate::app_update::PanelInstall;
+    if state.has_running_jobs() {
+        return update_reply(
+            &state,
+            &headers,
+            "jobs",
+            crate::t!("ui.updates.jobs").to_string(),
+            serde_json::json!({}),
+        );
+    }
+    let restart = restart_args(&state);
+    let restarts = restart.is_some();
+    let Ok(outcome) = blocking(move || crate::app_update::panel_install(restart)).await else {
+        return internal(&state, "/");
+    };
+    let (status, message) = match outcome {
+        PanelInstall::Unmanaged => ("unsupported", crate::t!("ui.updates.unmanaged").to_string()),
+        PanelInstall::Busy => ("busy", crate::t!("ui.updates.busy").to_string()),
+        PanelInstall::Failed => ("failed", crate::t!("ui.updates.install_failed").to_string()),
+        PanelInstall::UpToDate => ("upToDate", crate::t!("ui.updates.up_to_date").to_string()),
+        PanelInstall::OthersRunning => ("others", crate::t!("ui.updates.others").to_string()),
+        PanelInstall::Untrusted => ("untrusted", crate::t!("ui.updates.untrusted").to_string()),
+        PanelInstall::Applying(_) => {
+            // 応答を返した後にサーバーを終える（`/shutdown` と同じ経路。実行中の run-now は完了を待つ）。
+            state.shutdown.notify_one();
+            (
+                "applying",
+                if restarts {
+                    crate::t!("ui.updates.applied_resident").to_string()
+                } else {
+                    crate::t!("ui.updates.applied_once").to_string()
+                },
+            )
+        }
+    };
+    let fields = serde_json::json!({ "restarts": restarts && status == "applying" });
+    update_reply(&state, &headers, status, message, fields)
+}
+
+/// 更新の設定（自動更新・ログオン時の常駐）の保存。Setup 版だけ。値は `app_update` の関数が状態フォルダーへ書く
+/// （CLI の `update --auto`・`ui --autostart` と同じ経路）。
+pub async fn update_settings(
+    State(state): State<AppState>,
+    Extension(form): Extension<FormData>,
+) -> Response {
+    let auto = form.checked("auto_update");
+    let tray = form.checked("tray_autostart");
+    let has_tray = form.get("has_tray") == Some("1") && cfg!(any(windows, target_os = "macos"));
+    let result = blocking(move || {
+        if !crate::app_update::is_managed() {
+            return Err(crate::t!("ui.updates.unmanaged").to_string());
+        }
+        crate::app_update::update_command(crate::app_update::UpdateAction::SetAuto(auto))?;
+        if has_tray {
+            crate::app_update::set_tray_autostart(tray)?;
+        }
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Redirect::to("/?msg=update_settings#updates").into_response(),
+        Ok(Err(message)) => error_page(
+            &state,
+            StatusCode::BAD_REQUEST,
+            views::redact(&message),
+            "/#updates",
+        ),
+        Err(_) => internal(&state, "/"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -706,7 +901,7 @@ pub async fn repo_detail(
                             .map(|r| {
                                 format!(
                                     "{}（{}）",
-                                    read::unix_text(r.last_done_at),
+                                    views::local_time(&read::unix_text(r.last_done_at)),
                                     &r.last_commit[..r.last_commit.len().min(12)]
                                 )
                             })
@@ -2187,8 +2382,26 @@ pub async fn worker(State(state): State<AppState>, Query(q): Query<Msg>) -> Resp
     };
     let page = WorkerPage {
         revision: cur.revision.to_string(),
-        model: w.model.clone(),
-        effort: w.effort.clone(),
+        models: models::options(&w.model)
+            .into_iter()
+            .map(|o| {
+                let label = match &o.kind {
+                    models::OptionKind::Alias => crate::t!("ui.worker.opt_alias", id = o.id),
+                    models::OptionKind::Full => o.id.clone(),
+                    models::OptionKind::Fetched(name) if !name.is_empty() => {
+                        format!("{} ({name})", o.id)
+                    }
+                    models::OptionKind::Fetched(_) => o.id.clone(),
+                    models::OptionKind::Unlisted => {
+                        crate::t!("ui.worker.opt_unlisted", value = o.id)
+                    }
+                };
+                Choice::new(o.id.clone(), label, o.id == w.model.trim())
+            })
+            .collect(),
+        efforts: effort_choices(&w.effort),
+        can_refresh: models::has_api_key(),
+        models_note: models_note(),
         timeout_secs: w.timeout_secs.to_string(),
         timeout_min: *TIMEOUT_RANGE.start(),
         timeout_max: *TIMEOUT_RANGE.end(),
@@ -2217,15 +2430,70 @@ pub async fn worker(State(state): State<AppState>, Query(q): Query<Msg>) -> Resp
     html(page)
 }
 
+/// effort の選択肢（固定表 + 保存済みで表に無い値は「一覧にない値」として残す）。
+fn effort_choices(current: &str) -> Vec<Choice> {
+    let mut out: Vec<Choice> = config::EFFORT_LEVELS
+        .iter()
+        .map(|e| Choice::new(*e, *e, *e == current))
+        .collect();
+    if !current.is_empty() && !config::EFFORT_LEVELS.contains(&current) {
+        out.push(Choice::new(
+            current,
+            crate::t!("ui.worker.opt_unlisted", value = current),
+            true,
+        ));
+    }
+    out
+}
+
+/// モデル一覧の出どころの説明（キーの有無と、取得済みかどうか。キーの値は出さない）。
+fn models_note() -> String {
+    let key = if models::has_api_key() {
+        crate::t!("ui.worker.models_key_present")
+    } else {
+        crate::t!("ui.worker.models_key_absent")
+    };
+    let source = match models::cached_len() {
+        Some(count) => crate::t!("ui.worker.models_cached", count = count),
+        None => crate::t!("ui.worker.models_fixed").to_string(),
+    };
+    format!("{key} {source}")
+}
+
+/// モデル一覧の更新（明示の操作のときだけ通信する。結果は固定の文言で返す）。
+pub async fn worker_models_refresh(State(state): State<AppState>) -> Response {
+    let outcome = match blocking(models::refresh).await {
+        Ok(r) => r,
+        Err(_) => return internal(&state, "/settings/worker"),
+    };
+    let code = match outcome {
+        Ok(_) => "models_updated",
+        Err(models::RefreshError::NoKey) => "models_nokey",
+        Err(models::RefreshError::Busy) => "models_busy",
+        Err(_) => "models_failed",
+    };
+    Redirect::to(&format!("/settings/worker?msg={code}")).into_response()
+}
+
 pub async fn worker_save(
     State(state): State<AppState>,
     Extension(form): Extension<FormData>,
 ) -> Response {
     let back = "/settings/worker";
+    // 保存済みの値（壊れた設定・未設定なら空）。一覧に無くても、今の値のままなら保存を拒否しない。
+    let saved = current(&state).config.worker;
     let parsed = (|| -> Result<config::Worker, String> {
+        let model = form.text("model").unwrap_or_default();
+        if !models::is_allowed(&model, &saved.model) {
+            return Err(crate::t!("ui.worker.model_invalid").into());
+        }
+        let effort = form.text("effort").unwrap_or_default();
+        if !config::EFFORT_LEVELS.contains(&effort.as_str()) && effort != saved.effort {
+            return Err(crate::t!("ui.worker.effort_invalid").into());
+        }
         Ok(config::Worker {
-            model: form.text("model").unwrap_or_default(),
-            effort: form.text("effort").unwrap_or_default(),
+            model,
+            effort,
             timeout_secs: form
                 .text("timeout_secs")
                 .unwrap_or_default()
@@ -2408,7 +2676,7 @@ pub async fn consent(State(state): State<AppState>, Query(q): Query<Msg>) -> Res
         crate::t!(
             "ui.consent.current",
             version = c.version,
-            at = c.accepted_at,
+            at = views::local_time(&c.accepted_at),
             source = consent_source(c.source)
         )
     });

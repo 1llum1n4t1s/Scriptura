@@ -13,8 +13,9 @@
 //! - 起動時の自動適用は全サブコマンドで切る（[`startup`]）。
 //! - 確認と取得は、`hook` の本処理の後に同期で 1 回だけ行う（[`after_hook`]）。取得だけで適用しない。
 //!   スレッドにしないのは、hook のプロセスが終わるとスレッドも途中で消えるため。
-//! - 適用はログオン時だけ。`update-apply`（[`update_apply`]）が、導入先に他のプロセスが無いことを確かめ、
-//!   署名者を検証してから、再起動なしで適用する。
+//! - 適用は、ログオン時の `update-apply`（[`update_apply`]）と、利用者が管理画面の「更新をインストール」を押したとき
+//!   （[`panel_install`]）だけ。どちらも [`apply_pending`] で、導入先に他のプロセスが無いことを確かめ、署名者を検証してから
+//!   適用する（`update-apply` は再起動なし。管理画面は応答の後に終了し、常駐なら更新器が新しい版を起動する）。
 //! - Claude Code への登録（settings.json の Stop hook）とログオン時の適用の登録は、全 OS で
 //!   [`registration`] が状態ファイル（`setup-registration.json`）とあわせて行う。Windows では Velopack の
 //!   フック（install / updated / uninstall）からも呼び、いずれも必ず終了コード 0 で終える。macOS・Linux には
@@ -191,10 +192,11 @@ fn record_value(state_dir: &Path, key: &str, value: Value) -> Result<(), String>
 
 // ───────────────────────── 管理画面の常駐（ログオン時の起動） ─────────────────────────
 
-/// 設定ファイル（`app-update.json`）の、ログオン時に管理画面を常駐させるかのキー。未設定は false（既定 OFF）。
+/// 設定ファイル（`app-update.json`）の、ログオン時に管理画面を常駐させるかのキー。未設定は true（既定 ON）。
 const TRAY_AUTOSTART_KEY: &str = "tray_autostart";
 
-/// 状態フォルダーから、ログオン時の常駐の設定を読む（読むだけ。無い・壊れている・型が違えば false）。
+/// 状態フォルダーから、ログオン時の常駐の設定を読む（読むだけ）。既定は ON で、利用者が明示的に false を
+/// 保存したときだけ OFF（ファイルが無い・壊れている・型が違うときは既定の ON）。
 fn load_tray_autostart(state_dir: &Path) -> bool {
     let path = state_dir.join(SETTINGS_FILE);
     match fs::symlink_metadata(&path) {
@@ -202,8 +204,8 @@ fn load_tray_autostart(state_dir: &Path) -> bool {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|value| value.get(TRAY_AUTOSTART_KEY).and_then(Value::as_bool))
-            .unwrap_or(false),
-        _ => false,
+            .unwrap_or(true),
+        _ => true,
     }
 }
 
@@ -689,6 +691,30 @@ pub fn update_apply() -> Result<ApplyOutcome, String> {
     let Some(pending) = manager.get_update_pending_restart() else {
         return Ok(ApplyOutcome::NothingPending);
     };
+    // このプロセスの終了を待って適用する。更新器は別プロセスとして続行する。再起動はしない。ただし、
+    // ログオン時の常駐が ON のときだけ、入れ替えの後に更新器が新しい版の常駐を起動する。
+    apply_pending(
+        &locator,
+        &manager,
+        &pending,
+        resident_restart_args(),
+        &state_dir,
+        "update-apply",
+    )
+}
+
+/// 取得済みの更新を、安全な場合だけ適用する共通の処理（ログオン時の `update-apply` と管理画面の
+/// 「更新をインストール」が使う）。導入先の他プロセス（busy）→ 署名者の検証（untrusted）→ 適用の依頼。
+/// 適用は `WaitPid(自分)`: 更新器はこのプロセスの終了を待って入れ替える（呼び出し元が速やかに終了すること）。
+/// `restart_args` が Some のときだけ、入れ替えの後に更新器がその引数で再起動する。
+fn apply_pending(
+    locator: &VelopackLocator,
+    manager: &UpdateManager,
+    pending: &velopack::VelopackAsset,
+    restart_args: Option<Vec<String>>,
+    state_dir: &Path,
+    label: &str,
+) -> Result<ApplyOutcome, String> {
     // 導入先から動いている自分以外のプロセスが 1 つでもあれば、適用しない。Windows の適用はそれらを強制終了する。
     #[cfg(not(target_os = "linux"))]
     let root = locator.get_root_dir();
@@ -697,9 +723,9 @@ pub fn update_apply() -> Result<ApplyOutcome, String> {
     let others = processes::others_in(&root, std::process::id()).map_err(|e| e.to_string())?;
     if !others.is_empty() {
         log_line(
-            &state_dir,
+            state_dir,
             &format!(
-                "update-apply: skipped, {} other process(es) are running from the install folder",
+                "{label}: skipped, {} other process(es) are running from the install folder",
                 others.len()
             ),
         );
@@ -710,26 +736,156 @@ pub fn update_apply() -> Result<ApplyOutcome, String> {
         return Err("The pending update package is missing.".into());
     }
     if let Err(error) = trust::verify_package(&package) {
-        log_line(&state_dir, &format!("update-apply: refused: {error}"));
+        log_line(state_dir, &format!("{label}: refused: {error}"));
         return Ok(ApplyOutcome::Untrusted(error.to_string()));
     }
-    // このプロセスの終了を待って適用する。更新器は別プロセスとして続行する。再起動はしない。ただし、
-    // ログオン時の常駐が ON のときだけ、入れ替えの後に更新器が新しい版の常駐を起動する。
-    let restart_args = resident_restart_args();
     manager
         .unsafe_apply_updates(
-            &pending,
+            pending,
             true,
             ApplyWaitMode::WaitPid(std::process::id()),
             restart_args.is_some(),
             restart_args.unwrap_or_default(),
         )
         .map_err(|error| format!("update apply failed: {error}"))?;
-    log_line(
-        &state_dir,
-        &format!("update-apply: applying {}", pending.Version),
-    );
+    log_line(state_dir, &format!("{label}: applying {}", pending.Version));
     Ok(ApplyOutcome::Applied(pending.Version.clone()))
+}
+
+// ───────────────────────── 管理画面の「アプリの更新」パネル ─────────────────────────
+
+/// 管理画面の「更新を確認」の結果。外部通信の失敗は種別（[`PanelCheck::Failed`]）だけを返し、URL・応答の中身は出さない
+/// （詳細は診断ログへ）。
+#[derive(Debug, PartialEq, Eq)]
+pub enum PanelCheck {
+    /// Velopack 管理外（Setup 版ではない）。何もしない。
+    Unmanaged,
+    /// 他の確認・取得・適用が実行中（`app-update.lock`）。
+    Busy,
+    /// 確認に失敗した（通信・更新元の不具合）。
+    Failed,
+    /// 最新版を使っている（更新元が空の場合を含む）。
+    UpToDate,
+    /// 新しい版がある（取得はまだ。インストールで取得する）。
+    Available(String),
+}
+
+/// 間引きを無視して、更新の有無だけを確認する（取得しない）。管理画面の POST から `spawn_blocking` で呼ぶ。
+/// 他の確認・取得・適用とは `app-update.lock` で直列化する。管理外のビルドでは状態フォルダーに触れずに戻る。
+pub fn panel_check() -> PanelCheck {
+    if locate().is_none() {
+        return PanelCheck::Unmanaged;
+    }
+    let state_dir = paths::state_dir();
+    let Some(_lock) = try_lock(&state_dir) else {
+        return PanelCheck::Busy;
+    };
+    let checked = manager().and_then(|manager| {
+        manager
+            .check_for_updates()
+            .map_err(|error| format!("update check failed: {error}"))
+    });
+    match checked {
+        Ok(check) => {
+            let _ = record_time(&state_dir, "last_checked_at", now_unix());
+            match check {
+                UpdateCheck::UpdateAvailable(info) => {
+                    let version = info.TargetFullRelease.Version.clone();
+                    log_line(&state_dir, &format!("panel-check: update {version}"));
+                    PanelCheck::Available(version)
+                }
+                UpdateCheck::NoUpdateAvailable | UpdateCheck::RemoteIsEmpty => {
+                    log_line(&state_dir, "panel-check: up to date");
+                    PanelCheck::UpToDate
+                }
+            }
+        }
+        Err(error) => {
+            let _ = record_time(&state_dir, "last_failed_at", now_unix());
+            log_line(&state_dir, &format!("panel-check failed: {error}"));
+            PanelCheck::Failed
+        }
+    }
+}
+
+/// 管理画面の「更新をインストール」の結果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum PanelInstall {
+    Unmanaged,
+    /// 他の確認・取得・適用が実行中。
+    Busy,
+    /// 確認・取得・適用の依頼に失敗した。
+    Failed,
+    /// 適用する更新が無い。
+    UpToDate,
+    /// 導入先から他の Scriptura のプロセスが動いているため、適用しなかった（強制終了しない）。
+    OthersRunning,
+    /// 署名者などの検証に通らず、適用しなかった。
+    Untrusted,
+    /// 適用を依頼した（更新器はこのプロセスの終了を待って入れ替える。呼び出し元は速やかに終了すること）。
+    Applying(String),
+}
+
+/// 確認 → 取得 → 署名者検証 → 他プロセスの確認 → 適用の依頼、を 1 回行う。取得済みの更新があれば、確認に失敗しても
+/// それを適用する。`restart_args` が Some のときだけ、入れ替えの後に更新器がその引数で再起動する（常駐の再起動）。
+/// ロックは依頼が済むまで持つ。呼び出し元（管理画面）は、`Applying` を返した後に自分のサーバーを終了させる。
+pub fn panel_install(restart_args: Option<Vec<String>>) -> PanelInstall {
+    let Some(locator) = locate() else {
+        return PanelInstall::Unmanaged;
+    };
+    let state_dir = paths::state_dir();
+    let Some(_lock) = try_lock(&state_dir) else {
+        return PanelInstall::Busy;
+    };
+    let manager = match manager() {
+        Ok(manager) => manager,
+        Err(error) => {
+            log_line(&state_dir, &format!("panel-install failed: {error}"));
+            return PanelInstall::Failed;
+        }
+    };
+    let fetched = manager
+        .check_for_updates()
+        .map_err(|error| format!("update check failed: {error}"))
+        .and_then(|check| match check {
+            UpdateCheck::UpdateAvailable(info) => manager
+                .download_updates(&info, None)
+                .map_err(|error| format!("update download failed: {error}")),
+            _ => Ok(()),
+        });
+    match &fetched {
+        Ok(()) => {
+            let _ = record_time(&state_dir, "last_checked_at", now_unix());
+        }
+        Err(error) => {
+            let _ = record_time(&state_dir, "last_failed_at", now_unix());
+            log_line(&state_dir, &format!("panel-install failed: {error}"));
+        }
+    }
+    let Some(pending) = manager.get_update_pending_restart() else {
+        return if fetched.is_err() {
+            PanelInstall::Failed
+        } else {
+            PanelInstall::UpToDate
+        };
+    };
+    match apply_pending(
+        &locator,
+        &manager,
+        &pending,
+        restart_args,
+        &state_dir,
+        "panel-install",
+    ) {
+        Ok(ApplyOutcome::Applied(version)) => PanelInstall::Applying(version),
+        Ok(ApplyOutcome::Busy(_)) => PanelInstall::OthersRunning,
+        Ok(ApplyOutcome::Untrusted(_)) => PanelInstall::Untrusted,
+        Ok(_) => PanelInstall::UpToDate,
+        Err(error) => {
+            log_line(&state_dir, &format!("panel-install failed: {error}"));
+            PanelInstall::Failed
+        }
+    }
 }
 
 // ───────────────────────── `scriptura update` ─────────────────────────
@@ -857,7 +1013,10 @@ pub fn setup_status() -> Value {
         "version": context.as_ref().map(|c| c.version.clone()),
         "executable": context.as_ref().map(|c| c.executable.clone()),
         "autoUpdate": settings.auto_update,
-        "trayAutostart": load_tray_autostart(&state_dir),
+        // 常駐に対応するのは Setup 版の Windows・macOS だけ（それ以外では常に false。既定は ON）。
+        "trayAutostart": context.is_some()
+            && cfg!(any(windows, target_os = "macos"))
+            && load_tray_autostart(&state_dir),
         "lastCheckedAt": settings.last_checked_at,
         "lastFailedAt": settings.last_failed_at,
         "pendingVersion": context.as_ref().and_then(|_| pending_version()),
@@ -1027,23 +1186,27 @@ mod tests {
     }
 
     #[test]
-    fn tray_autostart_is_off_unless_explicitly_true() {
+    fn tray_autostart_is_on_unless_explicitly_false() {
         let dir = scratch();
-        // 無い・壊れた JSON・型違いは false（既定 OFF）。
-        assert!(!load_tray_autostart(&dir));
+        // 無い・壊れた JSON・型違い・キー無しは true（既定 ON）。
+        assert!(load_tray_autostart(&dir));
         for body in [
             "{",
-            r#"{"tray_autostart":"yes"}"#,
-            r#"{"tray_autostart":1}"#,
+            "{}",
+            r#"{"auto_update":false}"#,
+            r#"{"tray_autostart":"no"}"#,
+            r#"{"tray_autostart":0}"#,
         ] {
             fs::write(dir.join(SETTINGS_FILE), body).unwrap();
-            assert!(!load_tray_autostart(&dir), "{body}");
+            assert!(load_tray_autostart(&dir), "{body}");
         }
-        // 記録は他のキーを保ち、true だけが ON。
+        // 明示的な false だけが OFF（既存の利用者の選択を保つ）。記録は他のキーを保つ。
         fs::write(dir.join(SETTINGS_FILE), r#"{"auto_update":false}"#).unwrap();
+        record_value(&dir, TRAY_AUTOSTART_KEY, json!(false)).unwrap();
+        assert!(!load_tray_autostart(&dir));
+        assert!(!load_settings(&dir).auto_update);
         record_value(&dir, TRAY_AUTOSTART_KEY, json!(true)).unwrap();
         assert!(load_tray_autostart(&dir));
-        assert!(!load_settings(&dir).auto_update);
         let _ = fs::remove_dir_all(dir);
     }
 

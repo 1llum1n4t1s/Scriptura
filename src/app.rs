@@ -146,21 +146,45 @@ pub fn status() -> Value {
     let app = paths::app_dir();
     let exe = paths::app_executable(&app);
     let installed = installed_version(&paths::state_dir(), &app);
+    let setup = crate::app_update::setup_status();
+    let standalone = exe.is_file();
     json!({
         "version": VERSION,
         "installRoot": app,
         "executable": exe,
-        "installed": exe.is_file(),
+        // 単独 `install` の固定導入先に実行ファイルがあるか（Setup 版・プラグイン・開発ビルドでは偽）。
+        "installed": standalone,
+        // 実行中の「導入の形」: setup（Velopack 管理下）/ standalone（単独 install 済み）/ other（プラグイン・開発ビルド）。
+        "installForm": install_form(setup["managed"].as_bool() == Some(true), standalone),
         "installedVersion": installed,
         "stateDir": paths::state_dir(),
         "stateDb": crate::maintenance::state_db_path(),
-        "setup": crate::app_update::setup_status()
+        "setup": setup
     })
+}
+
+/// 導入の形の判定（Setup 版を優先し、次に単独導入、どちらでもなければ other）。
+pub fn install_form(setup_managed: bool, standalone_present: bool) -> &'static str {
+    if setup_managed {
+        "setup"
+    } else if standalone_present {
+        "standalone"
+    } else {
+        "other"
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_form_prefers_setup_then_standalone_then_other() {
+        assert_eq!(install_form(true, true), "setup");
+        assert_eq!(install_form(true, false), "setup");
+        assert_eq!(install_form(false, true), "standalone");
+        assert_eq!(install_form(false, false), "other");
+    }
 
     #[test]
     fn installed_version_prefers_install_json_and_falls_back_to_current_json() {

@@ -6,7 +6,7 @@
   <dl class="facts">
     <dt>{{ crate::locale::tr("ui.common.repository") }}</dt><dd><code>{{ row.root }}</code></dd>
     <dt>{{ crate::locale::tr("ui.proposal.commit") }}</dt><dd><code>{{ row.sha }}</code></dd>
-    <dt>{{ crate::locale::tr("ui.proposal.created") }}</dt><dd>{{ row.created_at }}</dd>
+    <dt>{{ crate::locale::tr("ui.proposal.created") }}</dt><dd>{% let t = row.created_at %}{% include "ui/time.html" %}</dd>
     <dt>{{ crate::locale::tr("ui.proposal.documents") }}</dt><dd>{{ row.documents }}</dd>
     <dt>{{ crate::locale::tr("ui.proposal.diffstat") }}</dt><dd><pre class="diffstat">{{ row.diffstat }}</pre></dd>
     <dt>{{ crate::locale::tr("ui.proposal.state") }}</dt><dd>{% if row.applied %}{{ crate::locale::tr("ui.proposal.applied") }}{% else %}{{ crate::locale::tr("ui.proposal.pending") }}{% endif %}</dd>

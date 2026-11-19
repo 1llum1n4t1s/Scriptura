@@ -971,10 +971,14 @@ fn render(command: &str, v: &Value) -> String {
                 crate::t!(
                     "cli.status.version",
                     version = text(v, "version"),
-                    installed = if v["installed"] == json!(true) {
-                        crate::t!("cli.status.installed")
-                    } else {
-                        crate::t!("cli.status.not_installed")
+                    installed = match v["installForm"].as_str() {
+                        Some("setup") => crate::t!("cli.status.form_setup"),
+                        Some("standalone") => crate::t!("cli.status.installed"),
+                        // installForm の無い旧い形は、従来どおり installed の真偽で決める。
+                        None if v["installed"] == json!(true) => {
+                            crate::t!("cli.status.installed")
+                        }
+                        _ => crate::t!("cli.status.form_other"),
                     }
                 ),
                 crate::t!(

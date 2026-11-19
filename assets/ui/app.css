@@ -95,6 +95,9 @@ input:focus, select:focus, textarea:focus, button:focus-visible, a:focus-visible
 .topbar nav { display: flex; flex-wrap: wrap; gap: 4px; flex: 1; }
 .topbar nav a { padding: 8px 10px; font-size: 13px; font-weight: 600; text-decoration: none; border-bottom: 2px solid transparent; }
 .topbar nav a[aria-current="page"] { background: var(--soft); border-bottom-color: var(--accent); color: var(--accent-strong); }
+.subnav { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 16px; border-bottom: 1px solid var(--line); }
+.subnav a { padding: 6px 12px; font-size: 13px; font-weight: 600; text-decoration: none; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.subnav a[aria-current="page"] { background: var(--soft); border-bottom-color: var(--accent); color: var(--accent-strong); }
 form.inline { margin: 0; }
 main { max-width: 1240px; margin: 0 auto; padding: 28px 24px 60px; min-height: calc(100vh - 140px); }
 footer { max-width: 1240px; margin: auto; padding: 18px 24px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }

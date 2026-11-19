@@ -1,6 +1,6 @@
 // Windows のタスクトレイ。非表示のウィンドウを 1 つ作り、通知アイコンのメッセージを同じスレッドで処理する。
 //
-// - 左クリック: 管理画面を開く。右クリック: メニュー（開く・ログオン時に起動・終了）。
+// - 左クリック: 管理画面を開く。右クリック: メニュー（開く・更新を確認・終了）。
 // - Explorer の再起動（`TaskbarCreated`）でアイコンを登録し直す。
 // - サーバーが止まったか（Ctrl+C・画面の「終了」・異常終了）を 200ms ごとのタイマーで見て、ループを抜ける。
 // - 2 つ目の常駐は起動しない。既存の常駐のウィンドウをクラス名で探し、「開く」をメッセージで頼む。
@@ -36,7 +36,7 @@ const ICON_MESSAGE: u32 = WM_APP + 1;
 const OPEN_MESSAGE: u32 = WM_APP + 2;
 const STOP_TIMER: usize = 1;
 const MENU_OPEN: usize = 1;
-const MENU_AUTOSTART: usize = 2;
+const MENU_CHECK_UPDATES: usize = 2;
 const MENU_QUIT: usize = 3;
 
 fn wide(value: &str) -> Vec<u16> {
@@ -248,14 +248,13 @@ impl TrayState<'_> {
             return;
         }
         let menu = Menu(handle);
-        let autostart = self.control.autostart();
         let mut items = vec![(MENU_OPEN, crate::t!("ui.tray.open"), MF_STRING)];
-        // ログオン時の常駐は Setup 版だけ（それ以外では項目を出さない）。
-        if let Some(on) = autostart {
+        // 「更新を確認」は Setup 版だけ（それ以外では確認する更新元が無いので、項目を出さない）。
+        if self.control.can_check_updates() {
             items.push((
-                MENU_AUTOSTART,
-                crate::t!("ui.tray.autostart"),
-                MF_STRING | if on { MF_CHECKED } else { MF_UNCHECKED },
+                MENU_CHECK_UPDATES,
+                crate::t!("ui.tray.check_updates"),
+                MF_STRING,
             ));
         }
         items.push((0, "", MF_SEPARATOR));
@@ -286,7 +285,7 @@ impl TrayState<'_> {
         };
         match selected {
             MENU_OPEN => self.control.open(),
-            MENU_AUTOSTART => self.control.toggle_autostart(),
+            MENU_CHECK_UPDATES => self.control.check_updates(),
             MENU_QUIT => self.control.quit(),
             _ => {}
         }

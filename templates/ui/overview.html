@@ -7,7 +7,7 @@
 <section class="panel">
   <h2>{{ crate::locale::tr("ui.overview.setup") }}</h2>
   <dl class="facts">
-    <dt>{{ crate::locale::tr("ui.overview.version") }}</dt><dd>{{ version }}{% if installed %}{{ crate::locale::tr("ui.overview.installed") }}{% else %}{{ crate::locale::tr("ui.overview.not_installed") }} <code>scriptura install</code>{% endif %}</dd>
+    <dt>{{ crate::locale::tr("ui.overview.version") }}</dt><dd>{{ version }}{{ install_label }}{% if install_hint %} <span class="note">{{ crate::locale::tr("ui.overview.install_hint") }} <code>scriptura install</code></span>{% endif %}</dd>
     <dt>{{ crate::locale::tr("ui.overview.config_file") }}</dt><dd><code>{{ config_path }}</code></dd>
     <dt>{{ crate::locale::tr("ui.overview.config_state") }}</dt><dd>{{ config_state }}</dd>
     <dt>{{ crate::locale::tr("ui.nav.consent") }}</dt><dd>{% if let Some(c) = consent %}{{ c }}{% if !consent_current %}{{ crate::locale::tr("ui.overview.consent_old") }}{% endif %}{% else %}{{ crate::locale::tr("ui.consent.none") }} (<a href="/consent">{{ crate::locale::tr("ui.nav.consent") }}</a>){% endif %}</dd>
@@ -26,4 +26,25 @@
   {% endif %}
 </section>
 </div>
+<section class="panel" id="updates" data-updates data-confirm="{{ crate::locale::tr("ui.updates.confirm") }}" data-msg-checking="{{ crate::locale::tr("ui.updates.checking") }}" data-msg-installing="{{ crate::locale::tr("ui.updates.installing") }}" data-msg-waiting="{{ crate::locale::tr("ui.updates.waiting") }}" data-msg-done="{{ crate::locale::tr("ui.updates.done_reopen") }}" data-msg-failed="{{ crate::locale::tr("ui.updates.request_failed") }}">
+  <h2>{{ crate::locale::tr("ui.updates.title") }}</h2>
+  {% if updates.managed %}
+  <dl class="facts"><dt>{{ crate::locale::tr("ui.updates.current") }}</dt><dd>{{ version }}</dd></dl>
+  <p class="note" role="status" aria-live="polite" data-update-status></p>
+  <form method="post" action="/updates/settings" class="stack" data-update-settings>
+    <input type="hidden" name="csrf" value="{{ layout.csrf }}">
+    <label class="checkbox"><input type="checkbox" name="auto_update" value="1"{% if updates.auto_update %} checked{% endif %} data-autosubmit>{{ crate::locale::tr("ui.updates.auto") }}</label>
+    {% if updates.tray_supported %}<input type="hidden" name="has_tray" value="1">
+    <label class="checkbox"><input type="checkbox" name="tray_autostart" value="1"{% if updates.tray_autostart %} checked{% endif %} data-autosubmit>{{ crate::locale::tr("ui.updates.tray") }}</label>{% endif %}
+    <div class="actions" data-autosubmit-fallback><button type="submit">{{ crate::locale::tr("ui.common.save") }}</button></div>
+  </form>
+  <div class="actions wrap">
+    <form method="post" action="/updates/check" data-update-check><input type="hidden" name="csrf" value="{{ layout.csrf }}"><button type="submit">{{ crate::locale::tr("ui.updates.check") }}</button></form>
+    <form method="post" action="/updates/install" data-update-install><input type="hidden" name="csrf" value="{{ layout.csrf }}"><button class="primary" type="submit">{{ crate::locale::tr("ui.updates.install") }}</button></form>
+  </div>
+  <p class="note">{{ crate::locale::tr("ui.updates.restart_note") }}</p>
+  {% else %}
+  <p class="note">{{ crate::locale::tr("ui.updates.unmanaged") }}</p>
+  {% endif %}
+</section>
 {% endblock %}
