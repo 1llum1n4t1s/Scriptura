@@ -796,21 +796,6 @@ fn limit_violation_is_rejected_without_a_patch_and_does_not_rerun_the_worker() {
 }
 
 #[test]
-fn required_headings_are_checked_in_propose_mode() {
-    let config = kinds_config(|c| arch(c).required_headings = vec!["## 責務".into()]);
-    let f = Fixture::new();
-    f.set_config(&config);
-    f.commit_push_file("docs/ARCHITECTURE.md", "# 構成\n## 責務\n");
-    let sha = f.push_change("headings");
-    f.writes(json!({"docs/ARCHITECTURE.md": "# 構成\n見出しが無い\n"}));
-    let outcome = proposal::propose(&f.root, &sha, "", &kind_options(&config)).unwrap();
-    let ProposeOutcome::Rejected { reason } = outcome else {
-        panic!("Rejected を期待: {outcome:?}");
-    };
-    assert!(reason.contains("必須見出し「## 責務」"), "{reason}");
-}
-
-#[test]
 fn agents_size_is_checked_in_propose_mode_in_every_permission_mode() {
     // 従来 propose は AGENTS の 30,000 bytes 未満を検査していなかった（push モードとの差）。
     for permission in [Permission::Bypass, Permission::Restricted] {

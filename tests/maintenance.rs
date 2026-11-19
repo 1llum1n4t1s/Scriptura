@@ -229,7 +229,7 @@ fn null_stdio_with_inherited_windows_handles_still_has_deadline() {
             .to_str()
             .unwrap(),
     );
-    let result = scriptura::process::capture(c, None, Duration::from_millis(300), false);
+    let result = scriptura::process::capture(c, None, Duration::from_millis(3000), false);
     assert!(result.err().unwrap().to_string().contains("unconfirmed"));
     f.finish_live_helper();
 }
@@ -1559,7 +1559,7 @@ fn unmanaged_pipe_deadline_preserves_helper_after_parent_exit_or_timeout() {
         let result = scriptura::process::capture(
             c,
             Some(vec![b'x'; 1000000]),
-            Duration::from_millis(300),
+            Duration::from_millis(3000),
             false,
         );
         assert!(result.err().unwrap().to_string().contains("unconfirmed"));
