@@ -28,7 +28,7 @@
 //!   二重の解消は除く）。
 //!
 //! 複数のプロセスが同時に起動しても二重に登録しないよう、`setup-registration.lock` を try-lock する。
-use super::{SetupContext, atomic_write, log_line, logon, try_lock_named};
+use super::{SetupContext, log_line, logon, try_lock_named};
 use crate::connect::{self, SetupRegistration};
 use serde_json::{Value, json};
 use std::{fs, path::Path};
@@ -121,7 +121,7 @@ pub fn load(state_dir: &Path) -> State {
 fn save(state_dir: &Path, state: &State) -> Result<(), String> {
     let mut bytes = serde_json::to_vec_pretty(&state.to_json()).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
-    atomic_write(&state_dir.join(STATE_FILE), &bytes).map_err(|e| e.to_string())
+    crate::config::write_atomic(&state_dir.join(STATE_FILE), &bytes).map_err(|e| e.to_string())
 }
 
 /// 状態ファイルを消す（インストールとアンインストール用。次に導入したときに登録し直すため）。無ければ何もしない。

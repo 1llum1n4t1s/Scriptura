@@ -670,7 +670,8 @@ fn write_config(path: &Path, config: &Config) -> io::Result<Vec<u8>> {
 
 /// 同じフォルダーの一時ファイルへ書いて rename する。設定本体と変更履歴の退避の両方で使う。
 /// 失敗時は一時ファイルだけを片付け、既存のファイルには触れない。
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// 親フォルダーが空・ファイル名が無いパスは拒否する（呼び出し元はいずれも「フォルダー.join(固定名)」）。
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1452,4 +1453,44 @@ pub fn resolve_for_os(
 /// 設定ファイルの場所（paths::config_file）を返す補助。表示用。
 pub fn config_path() -> PathBuf {
     paths::config_file()
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::write_atomic;
+    use std::fs;
+
+    fn scratch() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("scriptura-atomic-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn atomic_write_replaces_without_leaving_temporary_files() {
+        let dir = scratch();
+        let path = dir.join("nested").join("x.json");
+        write_atomic(&path, b"one").unwrap();
+        write_atomic(&path, b"two").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"two");
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_rename_leaves_no_temporary_file_and_keeps_the_target() {
+        let dir = scratch();
+        // 対象がディレクトリなので rename は失敗する。
+        let target = dir.join("target");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep.txt"), b"original").unwrap();
+        assert!(write_atomic(&target, b"new").is_err());
+        assert_eq!(fs::read(target.join("keep.txt")).unwrap(), b"original");
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["target".to_string()]);
+        let _ = fs::remove_dir_all(dir);
+    }
 }

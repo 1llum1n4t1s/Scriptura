@@ -14,7 +14,6 @@
 // status の読み取りのフォールバックとしてだけ使う（書かない・消さない）。
 use crate::paths;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{fs, io::Write, path::Path};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -23,13 +22,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const INSTALL_RECORD: &str = "install.json";
 /// 以前の版の記録（導入先直下）。読み取りのフォールバックだけに使う。
 pub const LEGACY_INSTALL_RECORD: &str = "current.json";
-
-fn digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {
@@ -110,10 +102,11 @@ pub fn install() -> Result<Value, String> {
     let target = paths::app_executable(&app);
     // 導入先の実行ファイル自身から呼ばれた場合は、同じ内容なので何も変わらない。
     let placement = place_executable(&target, &bytes)?;
-    let record = json!({"version":VERSION,"sha256":digest(&bytes),"executable":target});
+    let record =
+        json!({"version":VERSION,"sha256":crate::maintenance::hash(&bytes),"executable":target});
     let state = paths::state_dir();
     fs::create_dir_all(&state).map_err(|e| e.to_string())?;
-    crate::app_update::atomic_write(
+    crate::config::write_atomic(
         &state.join(INSTALL_RECORD),
         &serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?,
     )

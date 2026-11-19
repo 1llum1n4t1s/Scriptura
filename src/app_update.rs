@@ -77,34 +77,6 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 // ───────────────────────── 共通の小さな補助 ─────────────────────────
 
-/// 一時ファイルへ書いてから rename で置き換える（途中で止まっても壊れたファイルを残さない）。
-/// 一時ファイル名は呼び出しごとに変え、並行する書き込み同士で取り違えない。
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let directory = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("the path has no parent folder"))?;
-    fs::create_dir_all(directory)?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let temporary = directory.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
 /// 利用者のホームフォルダー（macOS の LaunchAgents と Linux の autostart の既定の置き場に使う）。
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn home_dir() -> PathBuf {
@@ -187,7 +159,7 @@ fn record_value(state_dir: &Path, key: &str, value: Value) -> Result<(), String>
     current[key] = value;
     let mut bytes = serde_json::to_vec_pretty(&current).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
-    atomic_write(&path, &bytes).map_err(|e| e.to_string())
+    crate::config::write_atomic(&path, &bytes).map_err(|e| e.to_string())
 }
 
 // ───────────────────────── 管理画面の常駐（ログオン時の起動） ─────────────────────────
@@ -1382,16 +1354,5 @@ mod tests {
             ApplyOutcome::Unmanaged.to_json(),
             json!({"status":"unmanaged"})
         );
-    }
-
-    #[test]
-    fn atomic_write_replaces_without_leaving_temporary_files() {
-        let dir = scratch();
-        let path = dir.join("nested").join("x.json");
-        atomic_write(&path, b"one").unwrap();
-        atomic_write(&path, b"two").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"two");
-        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
-        let _ = fs::remove_dir_all(dir);
     }
 }

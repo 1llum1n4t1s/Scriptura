@@ -3555,7 +3555,13 @@ pub fn publish_locked_with(
                 );
             }
             operation = "commit";
-            let mut a = vec!["commit", "--only", "-m", "リポジトリ文書を保守する", "--"];
+            let mut a = vec![
+                "commit",
+                "--only",
+                "-m",
+                crate::changelog::OWN_COMMIT_SUBJECT,
+                "--",
+            ];
             a.extend(changed.iter().map(String::as_str));
             git(root, &a)?;
             let committed = gt(root, &["rev-parse", "HEAD"])?;

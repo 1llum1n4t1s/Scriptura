@@ -2089,7 +2089,6 @@ fn check_template(content: &str) -> Result<(), String> {
 
 /// テンプレートを設定フォルダーの `templates/` へアトミックに書く。リンク・通常でないファイルは拒否。
 fn write_template(dir: &FsPath, name: &str, content: &str) -> Result<(), String> {
-    use std::io::Write;
     let link_or_odd = |p: &FsPath, want_dir: bool| match std::fs::symlink_metadata(p) {
         Ok(m) => {
             crate::maintenance::linked(&m) || (if want_dir { !m.is_dir() } else { !m.is_file() })
@@ -2104,21 +2103,8 @@ fn write_template(dir: &FsPath, name: &str, content: &str) -> Result<(), String>
     if link_or_odd(&target, false) {
         return Err(crate::t!("ui.template.target_odd").into());
     }
-    let tmp = dir.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
-    let written = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, &target)
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    written.map_err(|e| crate::t!("ui.template.save_failed", error = e))
+    crate::config::write_atomic(&target, content.as_bytes())
+        .map_err(|e| crate::t!("ui.template.save_failed", error = e))
 }
 
 pub async fn template_save(

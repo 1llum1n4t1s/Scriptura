@@ -245,7 +245,7 @@ mod xdg {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        crate::app_update::atomic_write(path, body.as_bytes())
+        crate::config::write_atomic(path, body.as_bytes())
     }
 
     pub fn register_in(dir: &Path, app_id: &str, executable: &Path) -> io::Result<Registration> {
@@ -484,7 +484,7 @@ mod macos {
     }
 
     fn write(path: &Path, body: &str) -> io::Result<()> {
-        crate::app_update::atomic_write(path, body.as_bytes())
+        crate::config::write_atomic(path, body.as_bytes())
     }
 
     pub fn register_in(dir: &Path, app_id: &str, executable: &Path) -> io::Result<Registration> {
@@ -843,10 +843,43 @@ mod windows {
     mod tests {
         use super::*;
 
-        fn scratch_hive() -> RegKey {
+        /// テスト専用のハイブと、その置き場の一時フォルダー。drop でハイブを閉じてからフォルダーを消す。
+        /// ハイブのファイルは最後のハンドルが閉じるまで使用中なので、テスト内で開いたサブキーは
+        /// この値より後に宣言して先に drop させる（宣言の逆順に drop される）。
+        struct ScratchHive {
+            key: Option<RegKey>,
+            dir: std::path::PathBuf,
+        }
+
+        impl std::ops::Deref for ScratchHive {
+            type Target = RegKey;
+            fn deref(&self) -> &RegKey {
+                self.key.as_ref().expect("the hive is open until drop")
+            }
+        }
+
+        impl Drop for ScratchHive {
+            fn drop(&mut self) {
+                // REG_PROCESS_APPKEY のハイブは最後のハンドルを閉じるとアンロードされる。
+                // アンロードがファイルの解放に追いつくまで、短く待って数回試す（失敗はテストを落とさない）。
+                drop(self.key.take());
+                for _ in 0..20 {
+                    if std::fs::remove_dir_all(&self.dir).is_ok() || !self.dir.exists() {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+
+        fn scratch_hive() -> ScratchHive {
             let dir = std::env::temp_dir().join(format!("scriptura-run-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).unwrap();
-            RegKey::load_app_hive(&dir.join("hive.dat")).unwrap()
+            let key = RegKey::load_app_hive(&dir.join("hive.dat")).unwrap();
+            ScratchHive {
+                key: Some(key),
+                dir,
+            }
         }
 
         #[test]
