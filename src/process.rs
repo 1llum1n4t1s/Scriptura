@@ -147,9 +147,12 @@ pub fn capture(
         Err(error) => {
             if !managed {
                 // 正常な Git/SSH helper を終了させず、結果不明として呼出元へ戻す。
-                // 残る pipe thread は、この単発 hook process の終了で解放する。
+                // helper が pipe を握っている間は読み取り thread が残る（helper が終わると解放される。
+                // 常駐の `ui --tray` の run-now では、その間 thread がプロセス内に残り得る）。
+                // kill した子は zombie を残さないよう短い期限つきで回収し、結果は捨てる。
                 if child.try_wait().ok().flatten().is_none() {
                     let _ = child.kill();
+                    let _ = child.wait_timeout(Duration::from_secs(1));
                 }
                 return Err(io::Error::other("process result unconfirmed"));
             }
@@ -276,5 +279,38 @@ impl Drop for Job {
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.0);
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unmanaged_timeout_reaps_the_killed_child() {
+        let dir = std::env::temp_dir().join(format!("scriptura-process-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        let script = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        let mut cmd = command("sh");
+        cmd.arg("-c").arg(script);
+        let error = capture(cmd, None, Duration::from_millis(1500), false)
+            .err()
+            .expect("timeout expected");
+        assert_eq!(error.to_string(), "process result unconfirmed");
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_owned();
+        // 回収済みなら `ps` に行が無い（未回収の zombie なら状態が Z で残る）。
+        let ps = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&ps.stdout).trim().is_empty(),
+            "the killed child was not reaped"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
