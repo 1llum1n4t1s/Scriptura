@@ -5,8 +5,8 @@ use scriptura::config::{Document, When};
 use scriptura::kinds::{ResolvedKind, ResolvedTiming, builtin_kind};
 use scriptura::maintenance::MaintenanceOptions;
 use scriptura::timing::{
-    TimingInput, always_due, changelog_has_release_section, due_kinds, interval_elapsed,
-    matching_tags, narrow_options, paths_match, release_pending, release_tag_glob,
+    TimingInput, always_due, due_kinds, interval_elapsed, matching_tags, narrow_options,
+    paths_match, release_tag_glob,
 };
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -221,52 +221,6 @@ fn release_tag_matching_and_changelog_sections() {
         .collect();
     assert_eq!(matching_tags(&tags, "v*"), ["v1.0.0", "v2.0.0"]);
     assert_eq!(matching_tags(&tags, "release-*"), ["release-2"]);
-
-    // 節の見出し: Keep a Changelog 形式・素の版・タグ名そのもの。
-    for heading in [
-        "## [1.2.0] - 2026-01-01",
-        "## [v1.2.0]",
-        "## [1.2.0](https://example.invalid/compare)",
-        "## 1.2.0 - 2026-01-01",
-        "## v1.2.0",
-        "  ## 1.2.0",
-    ] {
-        let text = format!("# Changelog\n\n## [Unreleased]\n\n{heading}\n- 変更\n");
-        assert!(changelog_has_release_section(&text, "v1.2.0"), "{heading}");
-    }
-    // 似ているが別の版・別の階層・コードブロック内は「無い」。
-    for text in [
-        "## [1.2.1]\n",
-        "## 1.2.0-beta\n",
-        "### [1.2.0]\n",
-        "# 1.2.0\n",
-        "```\n## [1.2.0]\n```\n",
-        "本文に 1.2.0 とだけ書いてある\n",
-    ] {
-        assert!(!changelog_has_release_section(text, "v1.2.0"), "{text}");
-    }
-    // 先頭が v でないタグ名もそのまま照合できる。
-    assert!(changelog_has_release_section(
-        "## [release-2]\n",
-        "release-2"
-    ));
-
-    // release 条件の純粋部分。
-    let v = |s: &[&str]| s.iter().map(|t| t.to_string()).collect::<Vec<_>>();
-    assert!(!release_pending(&[], Some("")));
-    assert!(!release_pending(&[], None));
-    assert!(release_pending(&v(&["v1.0.0"]), None));
-    assert!(release_pending(&v(&["v1.0.0"]), Some("## [Unreleased]\n")));
-    assert!(!release_pending(&v(&["v1.0.0"]), Some("## [1.0.0]\n")));
-    // 到達できるタグのどれかに節が無ければ対象（P3 の判定。範囲の絞り込みは P4）。
-    assert!(release_pending(
-        &v(&["v1.0.0", "v2.0.0"]),
-        Some("## [1.0.0]\n")
-    ));
-    assert!(!release_pending(
-        &v(&["v1.0.0", "v2.0.0"]),
-        Some("## [2.0.0]\n## [1.0.0]\n")
-    ));
 }
 
 #[test]

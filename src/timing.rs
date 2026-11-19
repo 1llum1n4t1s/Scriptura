@@ -166,26 +166,6 @@ pub fn matching_tags(tags: &[String], glob: &str) -> Vec<String> {
         .collect()
 }
 
-/// CHANGELOG 本文に、タグに対応する版の節の見出しがあるか（純粋関数）。
-///
-/// 照合の本体は `changelog::has_version_section`（不変検査・資料と同じ節分割）。
-/// フェンス付きコードブロックの外にある `## ` 見出し（Unreleased 以外）のうち、版の名前が次のどれかなら「ある」:
-/// - `[<版>]` / `[<タグ名>]`（Keep a Changelog 形式。`<版>` はタグ名から先頭の `v`/`V` を除いたもの）
-/// - `<版>` / `<タグ名>`（`## 1.2.0 - 2026-01-01`、`## v1.2.0` など。見出しの最初の語）
-pub fn changelog_has_release_section(changelog: &str, tag: &str) -> bool {
-    crate::changelog::has_version_section(changelog, tag)
-}
-
-/// release 条件の純粋部分: 与えられたタグ（glob 照合済み）のどれかに対応する節が CHANGELOG に無ければ真。
-/// タグが 1 つも無ければ偽（リリースが無い）。CHANGELOG が無ければ（None）タグがある限り真。
-/// どのタグを渡すか（範囲の絞り込み）は呼び出し側（`release_due_in_repo`）が決める。
-pub fn release_pending(tags: &[String], changelog: Option<&str>) -> bool {
-    tags.iter().any(|tag| match changelog {
-        Some(text) => !changelog_has_release_section(text, tag),
-        None => true,
-    })
-}
-
 /// 現在時刻（UNIX 秒）。
 pub fn now_secs() -> f64 {
     SystemTime::now()
@@ -266,10 +246,8 @@ pub fn release_due_in_repo(root: &Path, pushed: &str, prior: &str, kind: &Resolv
         return false;
     }
     // 節とタグの対応はタグ glob の固定接頭辞（`release-*` など）も考慮する（不変検査・資料と同じ照合）。
-    names.iter().any(|tag| match changelog.as_deref() {
-        Some(text) => !crate::changelog::has_version_section_for(text, tag, glob),
-        None => true,
-    })
+    // 資料の生成（`changelog::pending_releases_for`）と同じ関数を通す。
+    !crate::changelog::pending_releases_for(changelog.as_deref(), &names, glob).is_empty()
 }
 
 // ---------------------------------------------------------------------------

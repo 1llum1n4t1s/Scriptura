@@ -249,7 +249,8 @@ pub fn parse(text: &str) -> Parsed {
 }
 
 /// CHANGELOG 本文に、タグに対応する版の節（Unreleased 以外）があるか。
-/// `timing::changelog_has_release_section` の本体（release の期限判定もこれを通る）。
+/// 照合の本体は `has_version_section_for`。release の期限判定（`timing::release_due_in_repo`）と資料の生成は
+/// `pending_releases_for` を通り、不変検査はこの節分割（`parse`）を使う。
 pub fn has_version_section(text: &str, tag: &str) -> bool {
     has_version_section_for(text, tag, "")
 }

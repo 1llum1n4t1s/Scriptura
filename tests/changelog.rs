@@ -60,6 +60,82 @@ fn version_sections_match_tags_with_or_without_the_v_prefix() {
         ["v1.1.0"]
     );
     assert_eq!(pending_releases(None, &v(&["v1.0.0"])), ["v1.0.0"]);
+
+    // 節の見出し: Keep a Changelog 形式・素の版・タグ名そのもの。
+    for heading in [
+        "## [1.2.0] - 2026-01-01",
+        "## [v1.2.0]",
+        "## [1.2.0](https://example.invalid/compare)",
+        "## 1.2.0 - 2026-01-01",
+        "## v1.2.0",
+        "  ## 1.2.0",
+    ] {
+        let text = format!("# Changelog\n\n## [Unreleased]\n\n{heading}\n- 変更\n");
+        assert!(has_version_section(&text, "v1.2.0"), "{heading}");
+    }
+    // 似ているが別の版・別の階層・コードブロック内は「無い」。
+    for text in [
+        "## [1.2.1]\n",
+        "## 1.2.0-beta\n",
+        "### [1.2.0]\n",
+        "# 1.2.0\n",
+        "```\n## [1.2.0]\n```\n",
+        "本文に 1.2.0 とだけ書いてある\n",
+    ] {
+        assert!(!has_version_section(text, "v1.2.0"), "{text}");
+    }
+    // 先頭が v でないタグ名もそのまま照合できる。
+    assert!(has_version_section("## [release-2]\n", "release-2"));
+}
+
+#[test]
+fn pending_releases_covers_the_release_due_cases() {
+    // release の期限判定（`timing::release_due_in_repo`）はこの関数の結果が空でないかで決まる。
+    assert!(pending_releases(Some(""), &[]).is_empty());
+    assert!(pending_releases(None, &[]).is_empty());
+    assert!(!pending_releases(None, &v(&["v1.0.0"])).is_empty());
+    assert!(
+        !pending_releases(
+            Some(
+                "## [Unreleased]
+"
+            ),
+            &v(&["v1.0.0"])
+        )
+        .is_empty()
+    );
+    assert!(
+        pending_releases(
+            Some(
+                "## [1.0.0]
+"
+            ),
+            &v(&["v1.0.0"])
+        )
+        .is_empty()
+    );
+    // 到達できるタグのどれかに節が無ければ対象（範囲の絞り込みは呼び出し側）。
+    assert!(
+        !pending_releases(
+            Some(
+                "## [1.0.0]
+"
+            ),
+            &v(&["v1.0.0", "v2.0.0"])
+        )
+        .is_empty()
+    );
+    assert!(
+        pending_releases(
+            Some(
+                "## [2.0.0]
+## [1.0.0]
+"
+            ),
+            &v(&["v1.0.0", "v2.0.0"])
+        )
+        .is_empty()
+    );
 }
 
 #[test]
