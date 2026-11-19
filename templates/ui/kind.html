@@ -57,12 +57,12 @@
 </section>
 {% if let Some(t) = editor %}
 <section class="panel">
-  <h2>{{ crate::locale::tr1("ui.kind.template_content", "name", t.name) }}</h2>
+  <h2 id="template-editor-title">{{ crate::locale::tr1("ui.kind.template_content", "name", t.name) }}</h2>
   <p class="note"><code>{{ t.path }}</code>{% if !t.exists %}{{ crate::locale::tr("ui.kind.template_not_yet") }}{% endif %} {{ crate::locale::tr1("ui.kind.template_rules", "max", template_max) }} <code>&lt;&lt;&lt;</code></p>
   {% if !t.problem.is_empty() %}<p class="notice warning">{{ t.problem }}</p>{% else %}
   <form method="post" action="/templates/save" class="stack">
     <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="kind" value="{{ form.id }}"><input type="hidden" name="name" value="{{ t.name }}">
-    <textarea class="code-editor" name="content" rows="16" data-max-bytes="{{ template_max }}">{{ t.content }}</textarea><span class="counter" data-for="content"></span>
+    <textarea class="code-editor" name="content" rows="16" aria-labelledby="template-editor-title" data-max-bytes="{{ template_max }}">{{ t.content }}</textarea><span class="counter" data-for="content"></span>
     <div class="actions"><button type="submit">{{ crate::locale::tr("ui.kind.template_save") }}</button></div>
   </form>
   {% endif %}

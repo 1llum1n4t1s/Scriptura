@@ -1201,6 +1201,12 @@ async fn kinds_are_edited_and_user_text_is_escaped() {
     // 編集画面にテンプレートの内容が出る。
     let page = fx.get("/kinds/architecture").await;
     assert!(page.body.contains("## 概要"));
+    // 編集欄は見出しで名前が付く（textarea の aria-labelledby が見出しの id を指す）。
+    assert!(page.body.contains(r#"<h2 id="template-editor-title">"#));
+    assert!(
+        page.body
+            .contains(r#"aria-labelledby="template-editor-title""#)
+    );
     // カスタム種類の削除。
     let rev = fx.revision();
     let r = fx
