@@ -4543,7 +4543,9 @@ fn agents_reruns_stop_after_three_even_while_the_excess_keeps_shrinking() {
     f.commit_push_file("AGENTS.md", &"a".repeat(31_000));
     f.hook("UserPromptSubmit");
     f.push_change("slow");
-    let sizes: Vec<Value> = [30_800, 30_600, 30_400, 30_200, 30_100]
+    // スタブへは環境変数で渡す。Linux は 1 つの環境変数を 128 KiB（MAX_ARG_STRLEN）までしか渡せないので、
+    // 起動 4 回分（最初の起動 + 再実行 3 回）の 4 件だけにして、合計を 128 KiB 未満に収める。
+    let sizes: Vec<Value> = [30_500, 30_400, 30_300, 30_200]
         .iter()
         .map(|n| json!({agents_path(&f): "a".repeat(*n)}))
         .collect();
