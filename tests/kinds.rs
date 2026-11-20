@@ -1136,3 +1136,293 @@ fn reserved_kind_id_new_is_rejected_everywhere() {
     ok("[kinds.news]\nguidance = \"g\"\npaths = [\"docs/a.md\"]\n");
     ok("[kinds.new-arch]\nguidance = \"g\"\npaths = [\"docs/a.md\"]\n");
 }
+
+// ---------------------------------------------------------------------------
+// 分割先（split_dir）・構造化した違反・再実行用のプロンプト
+// ---------------------------------------------------------------------------
+
+#[test]
+fn split_dir_defaults_to_docs_id_only_for_kinds_with_a_limit() {
+    let config = ok(
+        "schema = 2\n[defaults]\ndocuments = [\"AGENTS.md\", \"README.md\", \"DESIGN.md\", \"CHANGELOG.md\"]\n\
+         [kinds.readme]\nmax_chars = 3000\n[kinds.agents]\nmax_bytes = 20000\n[kinds.changelog]\nmax_chars = 9000\n",
+    );
+    let kinds = kinds::resolve_kinds(&config, &config.defaults.documents);
+    let dir = |id: &str| {
+        kinds
+            .iter()
+            .find(|k| k.id() == id)
+            .unwrap()
+            .split_dir
+            .clone()
+    };
+    assert_eq!(dir("readme").as_deref(), Some("docs/readme"));
+    assert_eq!(dir("agents").as_deref(), Some("docs/agents"));
+    // 上限の無い種類・CHANGELOG は分割しない。
+    assert_eq!(dir("design"), None);
+    assert_eq!(dir("changelog"), None);
+    // 明示した値が優先される。
+    let config = ok(
+        "schema = 2\n[defaults]\ndocuments = [\"README.md\"]\n[kinds.readme]\nmax_chars = 3000\nsplit_dir = \"guide/parts\"\n",
+    );
+    let kinds = kinds::resolve_kinds(&config, &config.defaults.documents);
+    assert_eq!(kinds[0].split_dir.as_deref(), Some("guide/parts"));
+    // 上限が無ければ明示しても分割しない。
+    let config = ok(
+        "schema = 2\n[defaults]\ndocuments = [\"README.md\"]\n[kinds.readme]\nsplit_dir = \"guide\"\n",
+    );
+    let kinds = kinds::resolve_kinds(&config, &config.defaults.documents);
+    assert_eq!(kinds[0].split_dir, None);
+}
+
+#[test]
+fn split_dir_validation_rejects_unsafe_overlapping_and_changelog_values() {
+    let base = |dir: &str| {
+        format!(
+            "schema = 2\n[defaults]\ndocuments = [\"README.md\", \"architecture\"]\n[kinds.readme]\nmax_chars = 3000\nsplit_dir = \"{dir}\"\n{ARCH}"
+        )
+    };
+    ok(&base("docs/readme"));
+    ok(&base("a/b/c"));
+    for bad in [
+        "",
+        "/docs",
+        "docs/",
+        "docs//x",
+        "../docs",
+        "docs/../x",
+        "docs/.git",
+        "docs/a b",
+        "docs/設計",
+        "a/b/c/d",
+        "docs/con",
+        "README.md",
+        // 他の種類の対象パス（docs/ARCHITECTURE.md）を含む・同じ
+        "docs",
+        "docs/ARCHITECTURE.md",
+    ] {
+        invalid(&base(bad));
+    }
+    // CHANGELOG には指定できない。
+    invalid("schema = 2\n[kinds.changelog]\nsplit_dir = \"docs/changelog\"\n");
+    // 他の種類の明示した分割先と重なる。
+    invalid(
+        "schema = 2\n[kinds.readme]\nsplit_dir = \"docs/x\"\n[kinds.design]\nsplit_dir = \"docs/x/y\"\n",
+    );
+    // 機密パターンに一致する分割先。
+    invalid("schema = 2\n[kinds.readme]\nsplit_dir = \"secrets\"\n");
+    // 既定の分割先が他の種類の対象と重なるときは、拒否せず分割しない側に倒す。
+    let config = ok(
+        "schema = 2\n[defaults]\ndocuments = [\"README.md\"]\n[kinds.readme]\nmax_chars = 3000\n[kinds.other]\nguidance = \"x\"\npaths = [\"docs/readme/a.md\"]\n",
+    );
+    let kinds = kinds::resolve_kinds(&config, &config.defaults.documents);
+    assert_eq!(kinds[0].split_dir, None);
+}
+
+#[test]
+fn split_candidates_come_from_tracked_files_and_h2_headings() {
+    let root = runtime_dir("split");
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "t@example.com"],
+        vec!["config", "user.name", "t"],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(&args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    write(
+        &root,
+        "README.md",
+        "# 題\n## Install guide\n本文\n## 日本語の見出し\n```\n## コード内\n```\n## readme\n## Install guide\n",
+    );
+    write(&root, "docs/readme/existing.md", "x");
+    write(&root, "docs/readme/not-md.txt", "x");
+    write(&root, "docs/readme/untracked.md", "x");
+    assert!(
+        Command::new("git")
+            .args([
+                "add",
+                "README.md",
+                "docs/readme/existing.md",
+                "docs/readme/not-md.txt"
+            ])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let kinds = resolve("[kinds.readme]\nmax_chars = 100\n", "\"README.md\"");
+    let scope = Scope {
+        readme: vec![root.join("README.md")],
+        ..Scope::default()
+    };
+    let got = kinds::split_candidates(&root, &scope, &kinds[0]);
+    assert_eq!(
+        got,
+        vec![
+            // 既に追跡されている直下の *.md（未追跡・md 以外は入らない）
+            "docs/readme/existing.md",
+            // ASCII の slug が 3 文字以上ならそれ、取れなければ section-NN（通し番号は見出し順）
+            "docs/readme/install-guide.md",
+            "docs/readme/section-02.md",
+            // 組み込みの対象名は -section を付ける（重複した見出しは 1 件）
+            "docs/readme/readme-section.md",
+        ]
+    );
+    // 許可パスにも入る（分割先が無い種類は入らない）。
+    let plan = rel(&root, &plan_documents(&root, &scope, &kinds, &[]));
+    assert!(plan.contains(&"README.md".to_string()));
+    assert!(plan.contains(&"docs/readme/section-02.md".to_string()));
+    let none = resolve("", "\"README.md\"");
+    assert!(kinds::split_candidates(&root, &scope, &none[0]).is_empty());
+    // 1 種類 20 件まで。
+    let many: String = (1..=30).map(|i| format!("## topic number {i}\n")).collect();
+    write(&root, "README.md", &many);
+    assert_eq!(
+        kinds::split_candidates(&root, &scope, &kinds[0]).len(),
+        kinds::MAX_SPLIT_FILES
+    );
+}
+
+#[test]
+fn files_in_the_split_dir_share_the_limits_but_not_the_required_headings() {
+    let root = runtime_dir("split-limits");
+    write(&root, "README.md", "# 題\n## 概要\n");
+    write(&root, "docs/readme/part.md", "ありあまるほど長い本文");
+    let kinds = resolve(
+        "[kinds.readme]\nmax_chars = 5\nrequired_headings = [\"## 概要\"]\n",
+        "\"README.md\"",
+    );
+    assert_eq!(
+        kind_of_path(&kinds, "docs/readme/part.md").map(|k| k.id().to_string()),
+        Some("readme".to_string())
+    );
+    // 入れ子のディレクトリ・md 以外は分割先の文書ではない。
+    assert!(kind_of_path(&kinds, "docs/readme/sub/part.md").is_none());
+    assert!(kind_of_path(&kinds, "docs/readme/part.txt").is_none());
+    let files = vec!["README.md".to_string(), "docs/readme/part.md".to_string()];
+    let found = kinds::check_documents(&root, &kinds, &files);
+    // 本文は文字数も見出しも検査し、分割先のファイルは文字数だけ（見出しは本文だけ）。
+    assert!(found.iter().all(|v| v.is_soft()));
+    let paths: Vec<_> = found
+        .iter()
+        .map(|v| match v {
+            kinds::Violation::MaxChars { path, .. } => format!("chars:{path}"),
+            kinds::Violation::MissingHeading { path, .. } => format!("heading:{path}"),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        paths,
+        vec![
+            "chars:README.md".to_string(),
+            "chars:docs/readme/part.md".to_string()
+        ],
+        "{paths:?}"
+    );
+    // 検査不能（UTF-8 でない）はソフトではない（再実行しても直らない）。
+    fs::write(root.join("docs/readme/part.md"), [0xff, 0xfe]).unwrap();
+    let found = kinds::check_documents(&root, &kinds, &files);
+    assert!(found.iter().any(|v| !v.is_soft()));
+}
+
+#[test]
+fn fixup_prompt_names_each_violation_with_numbers_and_the_editable_paths() {
+    let kinds = resolve(
+        "[kinds.readme]\nmax_chars = 1000\nrequired_headings = [\"## 概要\"]\n",
+        "\"README.md\", \"CHANGELOG.md\"",
+    );
+    let violations = vec![
+        kinds::Violation::MaxChars {
+            name: "README".into(),
+            path: "README.md".into(),
+            count: 1500,
+            max: 1000,
+        },
+        kinds::Violation::MissingHeading {
+            name: "README".into(),
+            path: "README.md".into(),
+            heading: "## 概要".into(),
+        },
+    ];
+    let agents = vec![kinds::AgentsOver {
+        path: "AGENTS.md".into(),
+        size: 31_000,
+    }];
+    let allowed = vec!["README.md".to_string(), "docs/readme/a.md".to_string()];
+    let prompt = kinds::fixup_prompt(&kinds, &violations, &agents, &allowed);
+    for needle in [
+        "README.md: currently 1500 characters, but at most 1000",
+        "Remove at least 500 characters; aim for at most 900 characters",
+        "the required heading \"## 概要\" is missing",
+        "AGENTS.md: currently 31000 bytes",
+        "aim for at most 26999 bytes",
+        "Fix only these violations and do not redo the rest of the maintenance",
+        "files under `docs/readme/`",
+        "[\"README.md\",\"docs/readme/a.md\"]",
+    ] {
+        assert!(prompt.contains(needle), "{needle}\n{prompt}");
+    }
+    // CHANGELOG の違反にはリリース済みの節を変えない注記が付く。
+    let kinds = resolve("[kinds.changelog]\nmax_chars = 100\n", "\"CHANGELOG.md\"");
+    let prompt = kinds::fixup_prompt(
+        &kinds,
+        &[kinds::Violation::MaxChars {
+            name: "CHANGELOG".into(),
+            path: "CHANGELOG.md".into(),
+            count: 200,
+            max: 100,
+        }],
+        &[],
+        &["CHANGELOG.md".to_string()],
+    );
+    assert!(prompt.contains("Only the Unreleased section"), "{prompt}");
+    assert!(!prompt.contains("files under"), "{prompt}");
+}
+
+#[test]
+fn fixup_budget_shares_the_worker_timeout() {
+    use std::time::Duration;
+    let secs = Duration::from_secs;
+    assert_eq!(kinds::fixup_budget(1200, secs(0)), Some(secs(1200)));
+    assert_eq!(kinds::fixup_budget(1200, secs(600)), Some(secs(600)));
+    // 残りが 120 秒未満なら再実行しない（ちょうど 120 秒は行う）。
+    assert_eq!(kinds::fixup_budget(1200, secs(1080)), Some(secs(120)));
+    assert_eq!(kinds::fixup_budget(1200, secs(1081)), None);
+    // 期限を過ぎていても panic しない。
+    assert_eq!(kinds::fixup_budget(100, secs(500)), None);
+}
+
+#[test]
+fn settings_frame_demands_the_limit_and_lists_the_split_files() {
+    let root = runtime_dir("frame");
+    write(&root, "README.md", "# 題\n## 概要\n本文\n## Usage notes\n");
+    let kinds = resolve("[kinds.readme]\nmax_chars = 100\n", "\"README.md\"");
+    let scope = Scope {
+        readme: vec![root.join("README.md")],
+        ..Scope::default()
+    };
+    let active: Vec<&ResolvedKind> = kinds.iter().collect();
+    let frame = settings_frame(&root, &scope, &active, &[]);
+    for needle in [
+        "at most 100 characters",
+        "bringing it within the limit is itself a required part of this task",
+        "aim for at most 90% of the limit",
+        "files under `docs/readme/`",
+        "docs/readme/section-01.md",
+        "docs/readme/usage-notes.md",
+        "relative link",
+    ] {
+        assert!(frame.contains(needle), "{needle}\n{frame}");
+    }
+    // 上限の無い構成は枠ごと出ない（従来 3 種の既定構成のプロンプトを変えない）。
+    let kinds = resolve("", "\"README.md\"");
+    let active: Vec<&ResolvedKind> = kinds.iter().collect();
+    assert_eq!(settings_frame(&root, &scope, &active, &[]), "");
+}

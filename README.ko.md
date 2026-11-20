@@ -134,6 +134,7 @@ paused = false
 | `create_if_missing` | 대상이 없을 때 생성해도 되는지 여부(내장 종류는 true, 커스텀 종류는 false). false이면 대상이 존재하지 않는 동안에는 허용 경로에도 프롬프트에도 나타나지 않습니다. |
 | `template` | `"builtin"` / `"none"` / `"templates/<name>.md"`. 아래를 참조하십시오. |
 | `max_chars` / `max_bytes` | 문서의 상한(문자 수와 바이트 수). 둘 다 지정하면 둘 다 적용됩니다. `agents`의 `max_bytes`는 29,999 이하로만 설정할 수 있습니다. |
+| `split_dir` | 한도를 넘는 세부 내용을 옮길 수 있는 폴더(기본값 `docs/<id>`, `max_chars` / `max_bytes`를 설정한 종류에서만 유효, `changelog`에는 사용할 수 없음). 파일 하나에 주제 하나, 최대 20개입니다. |
 | `instructions` | 추가 편집 지시(최대 2000자). `[defaults] instructions`(모든 종류가 공유)와 함께 2단계로 프롬프트 끝의 "사용자 설정에서 온" 부분에만 들어갑니다. 대상 경로, 안전 규칙, commit과 push의 처리 방식은 바꿀 수 없습니다. |
 | `language` | 문서의 언어(`ja` / `en-US` 등). 생략하면 기존 문서의 언어를 따릅니다. 이는 생성되는 문서의 언어이며 화면과 출력의 언어와는 별개입니다(worker의 프롬프트는 영어이지만 `language`의 동작은 변하지 않습니다). |
 | `required_headings` | 유지 관리 후에 존재 여부를 검사하는 제목(최대 20개). |
@@ -144,7 +145,7 @@ paused = false
 
 ### 유지 관리 후 검사
 
-한도(`max_chars` / `max_bytes`), `required_headings`, AGENTS가 30,000바이트 미만일 것, 릴리스된 CHANGELOG 항목의 불변성은 worker의 권한 모드(`restricted` / `bypass`)와 관계없이 Rust가 검사합니다. 위반하면 commit하지 않으며(변경은 작업 트리에 남고, 다음 hook이 같은 검사를 거칩니다) 같은 push에 대해 worker를 다시 실행하지 않습니다.
+한도(`max_chars` / `max_bytes`), `required_headings`, AGENTS가 30,000바이트 미만일 것, 릴리스된 CHANGELOG 항목의 불변성은 worker의 권한 모드(`restricted` / `bypass`)와 관계없이 Rust가 검사합니다. 한도나 필수 제목이 계속 위반이면 같은 hook 안에서 그 위반만 고치도록 worker를 최대 2번 다시 실행하고, 그래도 남으면 경고와 함께 commit하고 push합니다(경고는 hook 알림, `run-now --json`의 `warnings`, 기록에 표시됩니다). AGENTS가 30,000바이트 이상으로 남거나 릴리스된 CHANGELOG 항목이 바뀌면 worker의 출력을 폐기하고 commit 없이 유지보수를 마칩니다.
 
 ### 시점(`[kinds.<id>.timing]`)
 

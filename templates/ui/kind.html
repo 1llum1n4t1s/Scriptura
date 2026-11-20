@@ -27,6 +27,7 @@
       <label>{{ crate::locale::tr("ui.kind.max_bytes") }}<input name="max_bytes" inputmode="numeric" value="{{ form.max_bytes }}" placeholder="{{ form.ph_max_bytes }}"></label>
       <label>{{ crate::locale::tr("ui.kind.language") }}<input name="language" value="{{ form.language }}" placeholder="{{ form.ph_language }}"></label>
     </div>
+    {% if !form.is_changelog %}<label>{{ crate::locale::tr("ui.kind.split_dir") }}<input name="split_dir" value="{{ form.split_dir }}" placeholder="{{ form.ph_split_dir }}"></label>{% endif %}
     <label>{{ crate::locale::tr1("ui.kind.instructions", "max", instructions_max) }}<textarea name="instructions" rows="4" data-max="{{ instructions_max }}" placeholder="{{ form.ph_none }}">{{ form.instructions }}</textarea><span class="counter" data-for="instructions"></span></label>
     <label>{{ crate::locale::tr("ui.kind.required_headings") }}<textarea name="required_headings" rows="3" placeholder="{{ form.ph_none }}">{{ form.required_headings }}</textarea></label>
     <fieldset class="choices"><legend>{{ crate::locale::tr("ui.kind.summary_timing") }}</legend>

@@ -134,6 +134,7 @@ paused = false
 | `create_if_missing` | 対象が無いとき新規作成してよいか（組み込みは true、カスタムは false）。false なら、対象が無い間は許可パスにもプロンプトにも出しません。 |
 | `template` | `"builtin"` / `"none"` / `"templates/<名前>.md"`。後述。 |
 | `max_chars` / `max_bytes` | 文書の上限（文字数・バイト数）。両方書けば両方適用します。`agents` の `max_bytes` は 29,999 以下にすることだけできます。 |
+| `split_dir` | 上限を超える詳細を移してよいフォルダー（既定は `docs/<id>`。`max_chars` / `max_bytes` を設定した種類だけ。`changelog` には使えません）。1 ファイル 1 話題で 20 件までです。 |
 | `instructions` | 追加の編集指示（2000 字以内）。`[defaults] instructions`（全種類共通）と 2 段で、プロンプト末尾の「利用者設定由来」の枠にだけ入ります。対象パス・安全規則・commit と push の扱いは変えられません。 |
 | `language` | 文書の言語（`ja` / `en-US` など）。省略時は既存の文書に従います。画面・出力の言語とは別で、worker へのプロンプトは英語ですが、この設定の挙動は変わりません。 |
 | `required_headings` | 保守後に存在を検査する見出し（20 件以内）。 |
@@ -144,7 +145,7 @@ paused = false
 
 ### 保守後の検査
 
-上限（`max_chars` / `max_bytes`）・`required_headings`・AGENTS が 30,000 バイト未満であること・リリース済みの CHANGELOG エントリの不変は、worker の権限モード（`restricted` / `bypass`）に関係なく Rust が検査します。違反したときは commit しません（変更は作業ツリーに残り、次の hook が同じ検査を通ります）。同じ push で worker は再実行しません。
+上限（`max_chars` / `max_bytes`）・`required_headings`・AGENTS が 30,000 バイト未満であること・リリース済みの CHANGELOG エントリの不変は、worker の権限モード（`restricted` / `bypass`）に関係なく Rust が検査します。上限・必須見出しが残って違反しているときは、同じ hook の中で違反だけを直す worker の再実行を最大 2 回行い、それでも残れば警告つきで commit・push します（警告は hook の通知、`run-now --json` の `warnings`、履歴に出ます）。AGENTS が 30,000 バイト以上のまま、またはリリース済みの CHANGELOG エントリを変えたときは、worker の出力を破棄して commit せずに完了します。
 
 ### タイミング（`[kinds.<id>.timing]`）
 

@@ -1352,6 +1352,10 @@ fn docs_list_and_show_report_resolved_kinds_read_only() {
     assert_eq!(readme["builtin"], true);
     assert_eq!(readme["maxChars"], 8000);
     assert_eq!(readme["maxBytes"], Value::Null);
+    // 上限を設定した種類は既定で docs/<id> へ分割できる（上限の無い種類・CHANGELOG は分割しない）。
+    assert_eq!(readme["splitDir"], "docs/readme");
+    assert_eq!(kind_of(&v, "agents")["splitDir"], Value::Null);
+    assert_eq!(kind_of(&v, "changelog")["splitDir"], Value::Null);
     assert_eq!(
         readme["paths"],
         json!([{"path": "README.md", "exists": true}])
@@ -1370,6 +1374,7 @@ fn docs_list_and_show_report_resolved_kinds_read_only() {
     assert_eq!(arch["template"]["spec"], "templates/architecture.md");
     assert_eq!(arch["template"]["state"], "ok");
     assert_eq!(arch["maxChars"], 15000);
+    assert_eq!(arch["splitDir"], "docs/architecture");
     assert_eq!(
         arch["timing"],
         json!({"when": "push", "paths": ["src/**"], "minIntervalHours": 24})
@@ -1555,9 +1560,9 @@ fn run_now_documents_narrows_the_kinds_and_refuses_unknown_or_disabled_ones() {
 }
 
 #[test]
-fn run_now_fails_without_committing_when_the_post_maintenance_checks_are_violated() {
+fn run_now_commits_with_a_warning_when_the_limits_are_still_violated_after_reruns() {
     let fx = Fx::new();
-    // README の上限を 5 文字にする。worker が長い README を書くと保守後の検査に違反する。
+    // README の上限を 5 文字にする。worker が長い README を書き続けても、保守は止めず警告つきで完了する。
     define_kinds(&fx, |c| {
         c.kinds.insert(
             "readme".into(),
@@ -1570,22 +1575,26 @@ fn run_now_fails_without_committing_when_the_post_maintenance_checks_are_violate
     assert_eq!(fx.enable(&["--documents", "README.md"]).code, 0);
     fx.push_change("rejected change");
     let head = fx.git(&["rev-parse", "HEAD"]).trim().to_string();
-    let writes = json!({"README.md": "this readme is far too long\n"}).to_string();
+    let writes = json!({"README.md": "this readme is far too long
+"})
+    .to_string();
     let out = fx.exec(
         &["run-now", "--json"],
         &[("HOOK_STUB_WRITES", &writes)],
         None,
         Some(&fx.repo),
     );
-    // 検査に違反した結果は commit せず、失敗として理由を返す（更新案という結果は無い）。
-    assert_eq!(out.code, 1, "{}{}", out.stdout, out.stderr);
+    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
     let v = out.json();
-    assert_eq!(v["ok"], false);
-    let error = v["error"].as_str().unwrap();
-    assert!(error.contains("README.md") && error.contains("上限"), "{v}");
-    assert_eq!(fx.git(&["rev-parse", "HEAD"]).trim(), head, "commit しない");
-    assert_eq!(fx.git(&["rev-parse", "origin/main"]).trim(), head);
-    assert!(!fx.base.join("state").join("proposals").exists());
+    assert_eq!(v["ok"], true);
+    let warning = v["warnings"][0].as_str().unwrap();
+    assert!(
+        warning.contains("README.md") && warning.contains("上限"),
+        "{v}"
+    );
+    let now = fx.git(&["rev-parse", "HEAD"]).trim().to_string();
+    assert_ne!(now, head, "警告つきで commit する");
+    assert_eq!(fx.git(&["rev-parse", "origin/main"]).trim(), now);
 }
 
 #[test]

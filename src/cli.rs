@@ -488,11 +488,18 @@ fn run_now(p: &Parsed) -> R {
         .map(|raw| parse_documents(raw))
         .transpose()?;
     // 本体（設定の読み込み・判定・poll ロック・保守）は ops。ここは結果を従来の JSON にするだけ。
-    match ops::run_now_for(&store(), &root, documents.as_deref())? {
-        RunNow::Completed => Ok(json!({
-            "ok": true, "repo": repo, "outcome": "completed",
-            "message": crate::t!("cli.run_now.completed"),
-        })),
+    match ops::run_now_reported(&store(), &root, documents.as_deref())? {
+        (RunNow::Completed, warnings) => {
+            let mut out = json!({
+                "ok": true, "repo": repo, "outcome": "completed",
+                "message": crate::t!("cli.run_now.completed"),
+            });
+            // 上限を超えたまま commit した警告・出力を破棄した旨（無ければキーを足さない）。
+            if !warnings.is_empty() {
+                out["warnings"] = json!(warnings);
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -538,6 +545,7 @@ fn kind_json(v: &ops::KindView, detail: bool) -> Value {
         "template": template,
         "maxChars": k.max_chars,
         "maxBytes": k.max_bytes,
+        "splitDir": k.split_dir,
         "timing": {
             "when": when_str(k.timing.when),
             "paths": k.timing.paths,

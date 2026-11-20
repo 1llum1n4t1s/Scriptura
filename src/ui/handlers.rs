@@ -1453,6 +1453,7 @@ fn kind_form(id: &str, s: &KindSettings, is_new: bool) -> KindForm {
         instructions: s.instructions.clone().unwrap_or_default(),
         language: s.language.clone().unwrap_or_default(),
         required_headings: s.required_headings.join("\n"),
+        split_dir: s.split_dir.clone().unwrap_or_default(),
         timing_when: opt_choices(
             timing.when.map(|w| match w {
                 When::Push => "push",
@@ -1515,6 +1516,7 @@ fn kind_form(id: &str, s: &KindSettings, is_new: bool) -> KindForm {
         } else {
             crate::t!("ui.kind.ph.no_limit").to_string()
         },
+        ph_split_dir: crate::t!("ui.kind.ph.split_dir", value = kinds::default_split_dir(id)),
         ph_language: crate::t!("ui.kind.ph.language").to_string(),
         ph_min_interval: crate::t!(
             "ui.kind.ph.interval",
@@ -1574,6 +1576,11 @@ fn parse_kind_form(form: &FormData, id: &str) -> Result<KindSettings, String> {
     s.instructions = normalized(form, "instructions");
     s.language = form.text("language");
     s.required_headings = lines_of(form.get("required_headings"));
+    s.split_dir = if id == "changelog" {
+        None
+    } else {
+        form.text("split_dir")
+    };
     let timing = Timing {
         when: match form.get("timing_when") {
             Some("push") => Some(When::Push),

@@ -58,8 +58,25 @@ fn main() {
         if let Ok(seconds) = env::var("HOOK_STUB_SLEEP") {
             std::thread::sleep(std::time::Duration::from_secs(seconds.parse().unwrap_or(0)));
         }
+        // 起動回数を数え、各回のプロンプトを `<HOOK_STUB_PROMPT>.<n>` に残す（再実行のテスト用）。
+        let prompt_path = PathBuf::from(env::var_os("HOOK_STUB_PROMPT").unwrap());
+        let count_path = prompt_path.with_extension("runs");
+        let run_number = fs::read_to_string(&count_path)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+            + 1;
+        fs::write(&count_path, run_number.to_string()).unwrap();
+        let mut numbered = prompt_path.clone().into_os_string();
+        numbered.push(format!(".{run_number}"));
+        fs::copy(&prompt_path, PathBuf::from(numbered)).unwrap();
         if let Ok(p) = env::var("HOOK_STUB_WRITES") {
-            let writes: Value = serde_json::from_str(&p).unwrap();
+            let parsed: Value = serde_json::from_str(&p).unwrap();
+            // 配列なら n 回目の起動で n 番目（足りなければ最後）を書く。オブジェクトなら毎回同じ。
+            let writes: Value = match parsed.as_array() {
+                Some(list) => list[(run_number - 1).min(list.len() - 1)].clone(),
+                None => parsed,
+            };
             for (path, value) in writes.as_object().unwrap() {
                 let target = PathBuf::from(path);
                 if let Some(p) = target.parent() {

@@ -134,6 +134,7 @@ Ils ne sont lus que depuis le `config.toml` de l'utilisateur. Chaque champ est f
 | `create_if_missing` | Indique si la cible peut être créée lorsqu'elle n'existe pas (true pour les types intégrés, false pour les types personnalisés). Lorsque c'est false, la cible n'apparaît ni dans les chemins autorisés ni dans le prompt tant qu'elle n'existe pas. |
 | `template` | `"builtin"` / `"none"` / `"templates/<name>.md"`. Voir ci-dessous. |
 | `max_chars` / `max_bytes` | Limites du document (caractères et octets). Si les deux sont donnés, les deux s'appliquent. Pour `agents`, `max_bytes` ne peut être fixé qu'à 29 999 ou moins. |
+| `split_dir` | Dossier où déplacer le détail qui dépasse les limites (par défaut `docs/<id>` ; uniquement pour les types ayant `max_chars` / `max_bytes` ; pas pour `changelog`). Jusqu'à 20 fichiers, un sujet par fichier. |
 | `instructions` | Instructions d'édition supplémentaires (2000 caractères au plus). Avec `[defaults] instructions` (partagé par tous les types), en deux niveaux, elles ne vont que dans la section « issu des paramètres utilisateur » à la fin du prompt. Elles ne peuvent modifier ni les chemins cibles, ni les règles de sécurité, ni la manière dont commit et push sont gérés. |
 | `language` | La langue du document (`ja` / `en-US`, etc.). En cas d'omission, la langue du document existant est suivie. Il s'agit de la langue des documents générés, distincte de la langue des écrans et des sorties (les prompts du worker sont en anglais, mais le comportement de `language` ne change pas). |
 | `required_headings` | Titres dont la présence est vérifiée après la maintenance (20 au plus). |
@@ -144,7 +145,7 @@ Ils ne sont lus que depuis le `config.toml` de l'utilisateur. Chaque champ est f
 
 ### Vérifications après maintenance
 
-Les limites (`max_chars` / `max_bytes`), `required_headings`, le fait qu'AGENTS reste sous 30 000 octets et l'immutabilité des entrées publiées du CHANGELOG sont vérifiés par Rust quel que soit le mode de permission du worker (`restricted` / `bypass`). En cas de violation, aucun commit n'est fait (les modifications restent dans l'arbre de travail, et le prochain hook exécute les mêmes vérifications), et le worker n'est pas relancé pour le même push.
+Les limites (`max_chars` / `max_bytes`), `required_headings`, le fait qu'AGENTS reste sous 30 000 octets et l'immutabilité des entrées publiées du CHANGELOG sont vérifiés par Rust quel que soit le mode de permission du worker (`restricted` / `bypass`). Si les limites ou les titres requis restent en infraction, le worker est relancé jusqu'à deux fois dans le même hook pour corriger uniquement ces infractions ; si elles persistent, le résultat est commité et poussé avec un avertissement (affiché dans le message du hook, dans `warnings` de `run-now --json` et dans l'historique). Si AGENTS reste à 30 000 octets ou plus, ou si des entrées publiées du CHANGELOG ont été modifiées, la sortie du worker est abandonnée et la maintenance se termine sans commit.
 
 ### Timing (`[kinds.<id>.timing]`)
 

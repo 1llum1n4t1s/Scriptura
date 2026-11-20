@@ -1198,15 +1198,26 @@ fn oversized_worker_output_is_not_committed() {
     let f = Fixture::new();
     let before = f.git(&["rev-parse", "HEAD"]);
     f.writes(json!({f.root.join("AGENTS.md").to_str().unwrap():"a".repeat(30000)}));
-    assert!(f.maintain().unwrap().contains("サイズ超過"));
+    // 再実行しても直らないので、worker の出力を破棄して完了にする（commit しない・止まり続けない）。
+    assert_eq!(f.maintain(), None);
     assert_eq!(f.git(&["rev-parse", "HEAD"]), before);
-    assert_eq!(f.state()["phase"], "ready");
+    assert_eq!(f.state()["phase"], "complete");
+    assert!(
+        f.state()["discarded"]
+            .as_str()
+            .unwrap()
+            .contains("サイズ超過")
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("AGENTS.md")).unwrap(),
+        "instructions"
+    );
 }
 #[test]
-fn stopped_ready_state_does_not_grow_validation_dirs() {
+fn repeated_discards_do_not_grow_validation_dirs() {
     let f = Fixture::new();
     f.writes(json!({f.root.join("AGENTS.md").to_str().unwrap():"a".repeat(30000)}));
-    assert!(f.maintain().unwrap().contains("サイズ超過"));
+    assert_eq!(f.maintain(), None);
     let count = |f: &Fixture| -> Vec<String> {
         f.state()["validation_dirs"]
             .as_array()
@@ -1217,8 +1228,8 @@ fn stopped_ready_state_does_not_grow_validation_dirs() {
     };
     let first = count(&f);
     for _ in 0..4 {
-        assert!(f.maintain().is_some());
-        assert_eq!(f.state()["phase"], "ready");
+        assert_eq!(f.maintain(), None);
+        assert_eq!(f.state()["phase"], "complete");
         let dirs = count(&f);
         let mut unique = dirs.clone();
         unique.sort();
@@ -1428,7 +1439,14 @@ fn ignored_personal_override_is_counted_and_never_owned() {
     f.git(&["commit", "-m", "personal override"]);
     f.git(&["push"]);
     fs::write(f.root.join("AGENTS.override.md"), "x".repeat(30000)).unwrap();
-    assert!(f.maintain().unwrap().contains("サイズ超過"));
+    // 個人用ファイルは worker の編集対象ではない（直せないので再実行もしない）。出力を破棄して完了にする。
+    assert_eq!(f.maintain(), None);
+    assert!(
+        f.state()["discarded"]
+            .as_str()
+            .unwrap()
+            .contains("サイズ超過")
+    );
     assert!(f.state()["before"].get("AGENTS.override.md").is_none());
     assert_eq!(
         fs::read(f.root.join("AGENTS.override.md")).unwrap().len(),
@@ -2496,42 +2514,8 @@ fn deleted_custom_document_is_reported_as_previously_existing() {
 }
 
 #[test]
-fn limit_violation_keeps_ready_and_never_commits_in_any_permission_mode() {
-    for permission in [Permission::Bypass, Permission::Restricted] {
-        let config = kinds_config(|c| {
-            c.worker.permission = permission;
-            arch(c).max_chars = Some(10);
-        });
-        let f = Fixture::with_config(Some(config));
-        f.commit_push_file("docs/ARCHITECTURE.md", "short");
-        f.hook("UserPromptSubmit");
-        f.push_change("limit");
-        let head = f.git(&["rev-parse", "HEAD"]);
-        let remote = f.git(&["rev-parse", "origin/main"]);
-        f.writes(json!({f.arch_path(): "x".repeat(20)}));
-        let message = f.hook("Stop").expect("上限超過の通知があるはず");
-        assert!(
-            message.contains("上限") && message.contains("docs/ARCHITECTURE.md"),
-            "{permission:?}: {message}"
-        );
-        // AGENTS の上限超過と同じ扱い: commit も push もせず、phase は ready のまま・error を残す。
-        assert_eq!(f.git(&["rev-parse", "HEAD"]), head, "{permission:?}");
-        assert_eq!(
-            f.git(&["rev-parse", "origin/main"]),
-            remote,
-            "{permission:?}"
-        );
-        let state = f.state();
-        assert_eq!(state["phase"], "ready", "{permission:?}");
-        assert!(state["error"].as_str().unwrap().contains("上限"));
-        // 失敗した保守は種類ごとの最終完了時刻（kind_runs）を記録しない。
-        assert!(f.kind_runs().is_empty(), "{permission:?}");
-    }
-}
-
-#[test]
-fn limit_violation_is_checked_again_when_a_ready_checkpoint_resumes() {
-    // 中断復旧（ready の記録から再開）でも、同じ検査を通ってから commit する。
+fn limit_violation_is_classified_again_when_a_ready_checkpoint_resumes() {
+    // 中断復旧（ready の記録から再開）でも、同じ検査を通ってから（警告つきで）commit する。
     let mut config = kinds_config(|_| {});
     config.kinds.insert(
         "readme".into(),
@@ -2551,21 +2535,26 @@ fn limit_violation_is_checked_again_when_a_ready_checkpoint_resumes() {
         kinds: scriptura::kinds::resolve_kinds(&config, &[Document::Readme]),
         ..options_with(Permission::Bypass)
     };
-    let message = maintain_and_publish_with(
-        &f.root,
-        "",
-        &[f.root.join("README.md")],
-        Some("fixture"),
-        &[f.root.clone()],
-        &options,
-    )
-    .expect("上限超過で止まるはず");
-    assert!(
-        message.contains("上限") && message.contains("README.md"),
-        "{message}"
+    // 止まった ready の記録から再開しても止まらず、警告つきで commit・push して完了する。
+    assert_eq!(
+        maintain_and_publish_with(
+            &f.root,
+            "",
+            &[f.root.join("README.md")],
+            Some("fixture"),
+            &[f.root.clone()],
+            &options,
+        ),
+        None
     );
-    assert_eq!(f.git(&["rev-parse", "HEAD"]), head);
-    assert_eq!(f.state()["phase"], "ready");
+    assert_ne!(f.git(&["rev-parse", "HEAD"]), head);
+    let state = f.state();
+    assert_eq!(state["phase"], "complete");
+    let warning = state["limit_warning"].as_str().unwrap();
+    assert!(
+        warning.contains("上限") && warning.contains("README.md"),
+        "{warning}"
+    );
 }
 
 #[test]
@@ -2591,10 +2580,12 @@ fn required_headings_are_checked_after_the_worker() {
                 "docs/ARCHITECTURE.md\n"
             );
         } else {
-            let message = message.expect("必須見出しの通知があるはず");
+            // 再実行しても補えなければ、警告つきで commit して完了する。
+            let message = message.expect("必須見出しの警告があるはず");
             assert!(message.contains("必須見出し「## 責務」"), "{message}");
-            assert_eq!(f.git(&["rev-parse", "HEAD"]), head);
-            assert_eq!(f.state()["phase"], "ready");
+            assert_eq!(f.worker_runs(), 3);
+            assert_ne!(f.git(&["rev-parse", "HEAD"]), head);
+            assert_eq!(f.state()["phase"], "complete");
         }
     }
 }
@@ -2999,7 +2990,7 @@ fn min_interval_takes_effect_on_the_next_push_after_it_elapses() {
 #[test]
 fn unfinished_publication_resumes_with_every_kind_when_some_kind_is_due() {
     // 未完了の保守（ready の記録）から再開するときは種類を絞らない。絞ると保守後検査が期限前の種類
-    // （ここでは architecture）の上限超過を見落として commit してしまう。再開では kind_runs も記録しない。
+    // （ここでは architecture）の上限超過を見落として、警告なしで commit してしまう。再開では kind_runs も記録しない。
     let config = kinds_config(|c| {
         let k = arch(c);
         k.timing = timing(config::When::Push, &["src/**"], None);
@@ -3018,13 +3009,14 @@ fn unfinished_publication_resumes_with_every_kind_when_some_kind_is_due() {
         json!(document_hash(&f.root, "docs/ARCHITECTURE.md").unwrap());
     f.save(&mut state);
     let head = f.head();
-    let message = f.hook("Stop").expect("上限超過で止まるはず");
+    // 種類を絞らないので期限前の architecture の上限超過も検査に入り、警告が付く（ソフト違反は止めずに commit する）。
+    let message = f.hook("Stop").expect("上限超過の警告があるはず");
     assert!(
         message.contains("上限") && message.contains("docs/ARCHITECTURE.md"),
         "{message}"
     );
-    assert_eq!(f.head(), head);
-    assert_eq!(f.state()["phase"], "ready");
+    assert_ne!(f.head(), head);
+    assert_eq!(f.state()["phase"], "complete");
     assert!(f.kind_runs().is_empty());
 }
 
@@ -3196,16 +3188,17 @@ fn released_changelog_entries_are_protected_in_every_permission_mode() {
         f.writes(
             json!({f.changelog_path(): KAC_CHANGELOG.replace("- 初版", "- 初版（書き換え）")}),
         );
-        let message = f.hook("Stop").expect("不変検査の違反で止まるはず");
+        let message = f.hook("Stop").expect("不変検査の違反で破棄されるはず");
         assert!(
             // 違反した節は見出しの文字列ではなく番号で示す（[1.0.0] は 2 番目の節）。
             message.contains("リリース済み") && message.contains("2 番目の版の節"),
             "{permission:?}: {message}"
         );
-        // 上限超過と同じ扱い: commit せず phase は ready のまま。
+        // 再実行せず worker の出力を破棄して完了にする（commit しない・位置は進む）。
         assert_eq!(f.head(), head);
         assert_eq!(f.git(&["rev-parse", "origin/main"]), remote);
-        assert_eq!(f.state()["phase"], "ready");
+        assert_eq!(f.state()["phase"], "complete");
+        assert_eq!(f.worker_runs(), 1);
         assert!(f.kind_runs().is_empty());
         // 範囲内のタグに対応しない版の節の追加も同じ扱い（タグが 1 つも無い）。
         drop(f);
@@ -3221,10 +3214,10 @@ fn released_changelog_entries_are_protected_in_every_permission_mode() {
             "## [Unreleased]\n\n- 新機能 A\n\n",
             "## [Unreleased]\n\n## [9.9.9] - 2026-02-01\n\n- 新機能 A\n\n",
         )}));
-        let message = f.hook("Stop").expect("範囲外の版で止まるはず");
+        let message = f.hook("Stop").expect("範囲外の版で破棄されるはず");
         assert!(message.contains("範囲内のタグに対応しない"), "{message}");
         assert_eq!(f.head(), head);
-        assert_eq!(f.state()["phase"], "ready");
+        assert_eq!(f.state()["phase"], "complete");
     }
 }
 
@@ -3246,10 +3239,11 @@ fn differently_cased_changelog_is_still_checked() {
     f.push_change("rewrite released through another spelling");
     let head = f.head();
     f.writes(json!({f.changelog_path(): KAC_CHANGELOG.replace("- 初版", "- 初版!")}));
-    let message = f.hook("Stop").expect("不変検査の違反で止まるはず");
+    let message = f.hook("Stop").expect("不変検査の違反で破棄されるはず");
     assert!(message.contains("リリース済み"), "{message}");
     assert_eq!(f.head(), head, "commit しない");
-    assert_eq!(f.state()["phase"], "ready");
+    assert_eq!(f.state()["phase"], "complete");
+    assert!(f.state()["discarded"].is_string());
     // Unreleased への追記だけなら、同じ綴りの違いでも commit される。
     drop(f);
     let f = Fixture::with_config(Some(changelog_config(
@@ -3687,22 +3681,19 @@ fn runs_that_never_start_the_worker_are_not_recorded() {
 }
 
 #[test]
-fn repeated_held_runs_are_merged_into_one_row_with_attempts() {
-    let config = kinds_config(|c| arch(c).max_chars = Some(10));
-    let f = Fixture::with_config(Some(config));
-    f.commit_push_file("docs/ARCHITECTURE.md", "short");
+fn repeated_failed_runs_are_merged_into_one_row_with_attempts() {
+    let f = Fixture::with_config(Some(Config::legacy_all_push()));
     f.hook("UserPromptSubmit");
-    f.push_change("limit");
-    f.writes(json!({f.arch_path(): "x".repeat(20)}));
+    f.push_change("worker fails");
+    unsafe { env::set_var("HOOK_STUB_EXIT", "9") };
     assert!(f.hook("Stop").is_some());
     let runs = f.runs();
     assert_eq!(runs.len(), 1, "{runs:?}");
     assert_eq!(
         (runs[0].run.outcome.as_str(), runs[0].attempts),
-        ("held", 1)
+        ("failed", 1)
     );
-    assert!(runs[0].run.message.as_deref().unwrap().contains("上限"));
-    // 同じ失敗の再試行（ready からの再開）は新しい行を作らず、attempts と終了時刻を進める。
+    // 同じ失敗の再試行は新しい行を作らず、attempts と終了時刻を進める。
     assert!(f.hook("Stop").is_some());
     let runs = f.runs();
     assert_eq!(runs.len(), 1, "{runs:?}");
@@ -3908,4 +3899,325 @@ fn run_now_is_recorded_with_the_run_now_origin() {
     assert_eq!(runs[0].run.origin, "hook");
     assert_eq!(runs[1].run.origin, "run_now");
     assert_eq!(runs[1].run.outcome, "committed");
+}
+
+// ---------------------------------------------------------------------------
+// 上限超過で止めない: 再実行・警告つき commit・出力の破棄・止まった記録の解消・分割
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// worker の起動回数（スタブが数える）。
+    fn worker_runs(&self) -> usize {
+        fs::read_to_string(self.base.join("prompt.runs"))
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    }
+    /// n 回目（1 始まり）の worker のプロンプト。
+    fn prompt_of_run(&self, n: usize) -> String {
+        let raw = fs::read(self.base.join(format!("prompt.json.{n}"))).unwrap();
+        let v: Value = serde_json::from_slice(&raw).unwrap();
+        v["prompt"].as_str().unwrap().to_owned()
+    }
+    fn readme_path(&self) -> String {
+        self.root.join("README.md").to_str().unwrap().to_owned()
+    }
+}
+
+fn readme_limit_config(permission: Permission, max_chars: u64) -> Config {
+    let mut config = Config::legacy_all_push();
+    config.worker.permission = permission;
+    config.defaults.documents = vec![Document::Readme];
+    config.kinds.insert(
+        "readme".into(),
+        config::KindSettings {
+            max_chars: Some(max_chars),
+            ..Default::default()
+        },
+    );
+    config
+}
+
+#[test]
+fn a_rerun_with_numbers_fixes_a_limit_violation_and_commits_without_a_warning() {
+    let config = kinds_config(|c| arch(c).max_chars = Some(10));
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("docs/ARCHITECTURE.md", "short");
+    f.hook("UserPromptSubmit");
+    f.push_change("limit");
+    let head = f.head();
+    // 1 回目は 20 文字（超過）、2 回目で 8 文字に収める。
+    f.writes(json!([
+        {f.arch_path(): "x".repeat(20)},
+        {f.arch_path(): "x".repeat(8)},
+    ]));
+    assert_eq!(f.hook("Stop"), None, "警告なしで完了するはず");
+    assert_eq!(f.worker_runs(), 2);
+    let second = f.prompt_of_run(2);
+    assert!(
+        second.contains("docs/ARCHITECTURE.md: currently 20 characters, but at most 10")
+            && second.contains("Remove at least 10 characters")
+            && second.contains("Fix only these violations"),
+        "{second}"
+    );
+    assert_ne!(f.head(), head);
+    assert_eq!(
+        fs::read_to_string(f.root.join("docs/ARCHITECTURE.md")).unwrap(),
+        "x".repeat(8)
+    );
+    let state = f.state();
+    assert_eq!(state["phase"], "complete");
+    assert_eq!(state["fixups"], 1);
+    assert!(state.get("limit_warning").is_none());
+    assert!(!f.kind_runs().is_empty());
+    let last = f.runs().pop().unwrap().run;
+    assert_eq!(
+        (last.outcome.as_str(), last.detail.fixups),
+        ("committed", 1)
+    );
+}
+
+#[test]
+fn a_violation_that_survives_the_reruns_is_committed_with_a_warning() {
+    for permission in [Permission::Bypass, Permission::Restricted] {
+        let config = kinds_config(|c| {
+            c.worker.permission = permission;
+            arch(c).max_chars = Some(10);
+        });
+        let f = Fixture::with_config(Some(config));
+        f.commit_push_file("docs/ARCHITECTURE.md", "short");
+        f.hook("UserPromptSubmit");
+        f.push_change("limit");
+        let head = f.head();
+        f.writes(json!({f.arch_path(): "x".repeat(20)}));
+        let message = f.hook("Stop").expect("警告の通知があるはず");
+        assert!(
+            message.contains("上限") && message.contains("docs/ARCHITECTURE.md"),
+            "{permission:?}: {message}"
+        );
+        // 最初の起動と再実行 2 回の合計 3 回。警告つきで commit・push して完了し、位置も進む。
+        assert_eq!(f.worker_runs(), 3, "{permission:?}");
+        assert_ne!(f.head(), head, "{permission:?}");
+        assert_eq!(f.git(&["rev-parse", "origin/main"]).trim(), f.head());
+        let state = f.state();
+        assert_eq!(state["phase"], "complete", "{permission:?}");
+        assert!(state["warning"].as_str().unwrap().contains("上限"));
+        assert_eq!(state["fixups"], 2);
+        assert!(!f.kind_runs().is_empty(), "{permission:?}");
+        let last = f.runs().pop().unwrap().run;
+        assert_eq!(last.outcome, "committed", "{permission:?}");
+        assert!(last.message.unwrap().contains("上限"));
+        assert_eq!(last.detail.fixups, 2);
+        // 次の push はそのまま処理される（止まり続けない）。
+        f.push_change("next");
+        f.writes(json!({f.arch_path(): "x".repeat(9)}));
+        assert_eq!(f.hook("Stop"), None, "{permission:?}");
+    }
+}
+
+#[test]
+fn a_document_already_over_its_limit_is_fixed_even_if_the_worker_did_not_touch_it() {
+    let config = readme_limit_config(Permission::Bypass, 20);
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("README.md", &"r".repeat(100));
+    f.hook("UserPromptSubmit");
+    f.push_change("later");
+    // 1 回目は何も書かない（元から超過している README を触らない）。2 回目で収める。
+    f.writes(json!([{}, {f.readme_path(): "short"}]));
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.worker_runs(), 2);
+    assert!(
+        f.prompt_of_run(2)
+            .contains("README.md: currently 100 characters"),
+        "{}",
+        f.prompt_of_run(2)
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "short"
+    );
+}
+
+#[test]
+fn the_first_prompt_demands_the_limit_and_names_the_split_files() {
+    let config = readme_limit_config(Permission::Bypass, 50);
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("README.md", "# 題\n## 概要\n本文\n");
+    f.hook("UserPromptSubmit");
+    f.push_change("later");
+    assert_eq!(f.hook("Stop"), None);
+    let prompt = f.prompt_text();
+    for needle in [
+        "bringing it within the limit is itself a required part of this task",
+        "files under `docs/readme/`",
+        "docs/readme/section-01.md",
+    ] {
+        assert!(prompt.contains(needle), "{needle}\n{prompt}");
+    }
+}
+
+#[test]
+fn split_files_are_allowed_committed_and_checked_per_file() {
+    let config = readme_limit_config(Permission::Restricted, 40);
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("README.md", "# 題\n## 概要\n本文\n");
+    f.hook("UserPromptSubmit");
+    f.push_change("later");
+    let head = f.head();
+    let part = f.root.join("docs/readme/section-01.md");
+    f.writes(json!({
+        f.readme_path(): "# 題\n[概要](docs/readme/section-01.md)\n",
+        part.to_str().unwrap(): "詳細な説明".repeat(5),
+    }));
+    assert_eq!(f.hook("Stop"), None);
+    assert_ne!(f.head(), head);
+    let files = f.head_files();
+    assert!(
+        files.contains(&"README.md".to_string())
+            && files.contains(&"docs/readme/section-01.md".to_string()),
+        "{files:?}"
+    );
+    // restricted の許可規則に、分割先の新規ファイルが完全一致で入る。
+    assert!(
+        f.allowed_rules()
+            .iter()
+            .any(|r| r.contains("docs/readme/section-01.md")),
+        "{:?}",
+        f.allowed_rules()
+    );
+    assert_eq!(f.state()["phase"], "complete");
+}
+
+#[test]
+fn a_file_in_the_split_dir_that_was_not_listed_is_a_worker_violation() {
+    let config = readme_limit_config(Permission::Restricted, 1000);
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("README.md", "# 題\n## 概要\n本文\n");
+    f.hook("UserPromptSubmit");
+    f.push_change("later");
+    let head = f.head();
+    let other = f.root.join("docs/readme/other.md");
+    f.writes(json!({other.to_str().unwrap(): "列挙されていない名前"}));
+    let message = f.hook("Stop").expect("許可パス外の変更で失敗するはず");
+    assert!(message.contains("docs/readme/other.md"), "{message}");
+    assert_eq!(f.head(), head);
+    assert_eq!(f.state()["phase"], "worker_failed");
+}
+
+#[test]
+fn an_agents_file_over_30000_bytes_is_discarded_and_maintenance_completes() {
+    let f = Fixture::with_config(Some(Config::legacy_all_push()));
+    f.hook("UserPromptSubmit");
+    f.push_change("big agents");
+    let head = f.head();
+    f.writes(json!({agents_path(&f): "a".repeat(30000)}));
+    let message = f.hook("Stop").expect("破棄の通知があるはず");
+    assert!(
+        message.contains("サイズ超過") && message.contains("破棄"),
+        "{message}"
+    );
+    // 再実行（最初の起動 + 2 回）でも直らないので、worker の出力を破棄して完了にする。
+    assert_eq!(f.worker_runs(), 3);
+    assert!(
+        f.prompt_of_run(2)
+            .contains("AGENTS files must stay under 30000 bytes"),
+        "{}",
+        f.prompt_of_run(2)
+    );
+    assert_eq!(f.head(), head, "commit しない");
+    assert_eq!(
+        fs::read_to_string(f.root.join("AGENTS.md")).unwrap(),
+        "instructions",
+        "worker の出力は元に戻す"
+    );
+    let state = f.state();
+    assert_eq!(state["phase"], "complete");
+    assert!(state["error"].is_null());
+    let last = f.runs().pop().unwrap().run;
+    assert_eq!(last.outcome, "rejected");
+    // 棄却は完了に数えない。位置は進むので、次の push は止まらず処理される。
+    assert!(f.kind_runs().is_empty());
+    f.push_change("next");
+    f.writes(json!({f.readme_path(): "documented"}));
+    assert_eq!(f.hook("Stop"), None);
+    assert_ne!(f.head(), f.git(&["rev-parse", "HEAD~1"]).trim());
+    assert_eq!(
+        f.git(&["show", "--name-only", "--format=", "HEAD"]),
+        "README.md\n"
+    );
+}
+
+#[test]
+fn released_changelog_changes_are_discarded_without_a_rerun() {
+    let f = Fixture::with_config(Some(changelog_config(
+        Permission::Bypass,
+        vec![Document::Changelog],
+    )));
+    f.commit_push_file("CHANGELOG.md", KAC_CHANGELOG);
+    f.hook("UserPromptSubmit");
+    f.push_change("rewrite released");
+    let head = f.head();
+    f.writes(json!({f.changelog_path(): KAC_CHANGELOG.replace("- 初版", "- 初版!")}));
+    let message = f.hook("Stop").expect("破棄の通知があるはず");
+    assert!(
+        message.contains("リリース済み") && message.contains("破棄"),
+        "{message}"
+    );
+    assert_eq!(f.worker_runs(), 1, "リリース済みの節の変更は再実行しない");
+    assert_eq!(f.head(), head);
+    assert_eq!(
+        fs::read_to_string(f.root.join("CHANGELOG.md")).unwrap(),
+        KAC_CHANGELOG
+    );
+    assert_eq!(f.state()["phase"], "complete");
+    assert_eq!(f.runs().pop().unwrap().run.outcome, "rejected");
+}
+
+#[test]
+fn a_stuck_ready_state_is_discarded_and_a_new_push_is_processed() {
+    let config = readme_limit_config(Permission::Bypass, 1000);
+    let f = Fixture::with_config(Some(config));
+    f.hook("UserPromptSubmit");
+    // 旧版が残した「違反で ready のまま止まった」記録を作る（worker の出力 README が未コミットで残っている）。
+    let mut state = f.checkpoint("ready");
+    fs::write(f.root.join("README.md"), "stale worker output").unwrap();
+    state["after"]["README.md"] = json!(document_hash(&f.root, "README.md").unwrap());
+    state["error"] = json!("old error");
+    f.save(&mut state);
+    f.push_change("new push moves HEAD");
+    f.writes(json!({f.readme_path(): "fresh output"}));
+    // 古い出力を破棄した旨が通知される。
+    let message = f.hook("Stop").expect("破棄の通知があるはず");
+    assert!(message.contains("前回の保守の出力を破棄"), "{message}");
+    // 古い出力は破棄され、新しい push の保守として commit される。
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "fresh output"
+    );
+    assert_ne!(f.head(), state["head"].as_str().unwrap());
+    assert_eq!(
+        f.git(&["show", "--name-only", "--format=", "HEAD"]),
+        "README.md\n"
+    );
+    assert_eq!(f.state()["phase"], "complete");
+}
+
+#[test]
+fn a_stuck_state_never_touches_files_that_no_longer_match_the_record() {
+    let config = readme_limit_config(Permission::Bypass, 1000);
+    let f = Fixture::with_config(Some(config));
+    f.hook("UserPromptSubmit");
+    let mut state = f.checkpoint("ready");
+    fs::write(f.root.join("README.md"), "worker output").unwrap();
+    state["after"]["README.md"] = json!(document_hash(&f.root, "README.md").unwrap());
+    f.save(&mut state);
+    // 記録のあとに利用者が README を書き換えた（記録と一致しない）。
+    fs::write(f.root.join("README.md"), "the user's own edit").unwrap();
+    f.push_change("new push moves HEAD");
+    // 利用者の変更が README に残っているので、README は編集を許す対象にならず、触られない。
+    let _ = f.hook("Stop");
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "the user's own edit"
+    );
 }

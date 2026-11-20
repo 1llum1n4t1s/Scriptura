@@ -117,6 +117,9 @@ pub struct ResolvedKind {
     pub timing: ResolvedTiming,
     /// changelog 種類のときだけ Some。
     pub changelog: Option<ResolvedChangelog>,
+    /// 上限を超える詳細を移してよい分割先ディレクトリ（リポジトリルート相対・`/` 区切り）。
+    /// 上限（`max_chars` / `max_bytes`）を設定した CHANGELOG 以外の種類だけが持ち、既定は `docs/<id>`。
+    pub split_dir: Option<String>,
 }
 
 impl ResolvedKind {
@@ -158,7 +161,59 @@ fn blank_kind(
         required_headings: Vec::new(),
         timing: ResolvedTiming::default(),
         changelog,
+        split_dir: None,
     }
+}
+
+/// 分割先の既定（`docs/<id>`）。
+pub fn default_split_dir(id: &str) -> String {
+    format!("docs/{id}")
+}
+
+/// 2 つのディレクトリ（またはディレクトリとその配下のファイル）が重なるか（区切り単位・大文字小文字無視）。
+fn paths_overlap(a: &str, b: &str) -> bool {
+    let (a, b) = (a.to_ascii_lowercase(), b.to_ascii_lowercase());
+    a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+}
+
+/// 機密パターン（既定 + defaults.exclude + 全リポジトリの exclude の加算）の照合器。
+fn config_sensitive(config: &Config) -> GlobSet {
+    let mut extra: Vec<&[String]> = vec![&config.defaults.exclude];
+    extra.extend(config.repository.iter().map(|r| r.exclude.as_slice()));
+    sensitive_matcher(&config::effective_exclude(&extra))
+}
+
+/// `id` の種類の分割先 `dir` が、他の種類の対象パス・明示された分割先と重ならないか。
+fn split_dir_conflicts(config: &Config, id: &str, dir: &str) -> bool {
+    config.kinds.iter().any(|(other, s)| {
+        s.paths.iter().any(|p| paths_overlap(p, dir))
+            || (other != id
+                && s.split_dir
+                    .as_deref()
+                    .is_some_and(|d| paths_overlap(d, dir)))
+    })
+}
+
+/// 種類の実効の分割先。上限を設定した CHANGELOG 以外の種類だけが持つ。明示（`split_dir`）が無ければ
+/// `docs/<id>`。ただし既定は、他の種類の対象・分割先や機密パターンと重なるときは持たない
+/// （明示した値の衝突は設定の検証が拒否する）。
+fn resolve_split_dir(config: &Config, kind: &ResolvedKind) -> Option<String> {
+    if kind.document == Document::Changelog
+        || (kind.max_chars.is_none() && kind.max_bytes.is_none())
+    {
+        return None;
+    }
+    if let Some(dir) = config
+        .kinds
+        .get(kind.id())
+        .and_then(|s| s.split_dir.clone())
+    {
+        return Some(dir);
+    }
+    let dir = default_split_dir(kind.id());
+    let blocked = is_sensitive(&config_sensitive(config), &format!("{dir}/x.md"))
+        || split_dir_conflicts(config, kind.id(), &dir);
+    (!blocked).then_some(dir)
 }
 
 /// 設定を持たない呼び出し口用: `documents` を組み込み既定だけで解決する（カスタムは落とす）。
@@ -218,6 +273,7 @@ pub fn resolve_kind(config: &Config, document: &Document) -> Option<ResolvedKind
             base.backfill_max_commits = c.backfill_max_commits.unwrap_or(base.backfill_max_commits);
         }
     }
+    kind.split_dir = resolve_split_dir(config, &kind);
     Some(kind)
 }
 
@@ -464,6 +520,64 @@ pub fn validate_custom_path(field: &str, path: &str, sensitive: &GlobSet) -> Res
     Ok(())
 }
 
+/// 分割先 `split_dir` の検証（設定読み込み時）。形式は対象パスと同じ安全字種・相対・`..` と `.git` と
+/// Windows 予約名なし、深さは 3 階層まで。CHANGELOG には指定できず、他の種類の対象パス・分割先、
+/// 組み込みの対象名、機密パターンと重ならない。
+fn validate_split_dir(
+    config: &Config,
+    id: &str,
+    field: &str,
+    dir: &str,
+    sensitive: &GlobSet,
+) -> Result<(), String> {
+    let bad = |why: &str| {
+        Err(crate::t!(
+            "kinds.path_invalid",
+            field = field,
+            why = why,
+            path = dir
+        ))
+    };
+    if id == "changelog" {
+        return bad(crate::t!("kinds.split_why_changelog"));
+    }
+    if dir.is_empty() || dir.len() > 100 {
+        return bad(crate::t!("kinds.path_why_length"));
+    }
+    if !dir
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+    {
+        return bad(crate::t!("kinds.path_why_chars"));
+    }
+    if dir.starts_with('/') || dir.ends_with('/') || dir.contains("//") {
+        return bad(crate::t!("kinds.path_why_relative"));
+    }
+    let segments: Vec<&str> = dir.split('/').collect();
+    if segments.len() > 3 {
+        return bad(crate::t!("kinds.split_why_depth"));
+    }
+    for seg in &segments {
+        if matches!(*seg, "." | "..") {
+            return bad(crate::t!("kinds.path_why_dots"));
+        }
+        if seg.eq_ignore_ascii_case(".git") {
+            return bad(crate::t!("kinds.path_why_git"));
+        }
+        if seg.ends_with('.') || windows_reserved(seg) {
+            return bad(crate::t!("kinds.path_why_windows"));
+        }
+    }
+    let lower = dir.to_ascii_lowercase();
+    if RESERVED_NAMES.contains(&lower.as_str()) || is_sensitive(sensitive, &format!("{dir}/x.md")) {
+        return bad(crate::t!("kinds.path_why_builtin"));
+    }
+    if split_dir_conflicts(config, id, dir) {
+        return bad(crate::t!("kinds.split_why_overlap"));
+    }
+    Ok(())
+}
+
 /// glob の一覧を検証する（`check_globs` の文字検査 + glob としてコンパイルできること）。
 fn validate_glob_list(field: &str, globs: &[String]) -> Result<(), String> {
     config::check_globs(field, globs)?;
@@ -642,6 +756,9 @@ pub fn validate_kinds(config: &Config) -> Result<(), String> {
                     max = REQUIRED_HEADING_MAX_CHARS
                 ));
             }
+        }
+        if let Some(dir) = &s.split_dir {
+            validate_split_dir(config, id, &format!("{at}.split_dir"), dir, &sensitive)?;
         }
         if let Some(t) = &s.timing {
             validate_timing(id, t)?;
@@ -836,9 +953,134 @@ pub fn plan_documents(
         if kind.document == Document::Agents {
             docs.extend(scope.size_only.iter().cloned());
         }
+        docs.extend(
+            split_candidates(root, scope, kind)
+                .iter()
+                .map(|p| root.join(p)),
+        );
     }
     docs.extend(deleted.iter().cloned());
     docs
+}
+
+/// 1 種類の分割先に置いてよいファイル数の上限。
+pub const MAX_SPLIT_FILES: usize = 20;
+/// 分割先の既定の予約名（組み込みの対象名と衝突させない）。
+const SPLIT_RESERVED_STEMS: &[&str] = &["agents", "design", "readme", "changelog"];
+
+/// 本文（フェンス付きコードブロックの外）の `## ` 見出しの文字列。
+pub fn h2_headings(text: &str) -> Vec<String> {
+    let mut fence: Option<char> = None;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if line.len() - trimmed.len() > 3 {
+            continue;
+        }
+        if let Some(marker) = ['`', '~']
+            .into_iter()
+            .find(|m| trimmed.starts_with(&m.to_string().repeat(3)))
+        {
+            match fence {
+                None => fence = Some(marker),
+                Some(open) if open == marker => fence = None,
+                _ => {}
+            }
+            continue;
+        }
+        if fence.is_some() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            out.push(rest.trim().trim_end_matches('#').trim().to_string());
+        }
+    }
+    out
+}
+
+/// 見出しから分割先のファイル名（拡張子なし）を作る。ASCII の英数字を小文字にして `-` でつなぎ、
+/// 3 文字以上取れなければ `section-NN`（NN は見出しの通し番号）。組み込みの対象名・Windows 予約名と
+/// 一致するときは `-section` を付ける。
+fn split_stem(heading: &str, index: usize) -> String {
+    let mut slug = String::new();
+    for c in heading.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    let mut slug = slug.trim_matches('-').to_string();
+    slug.truncate(40);
+    let mut slug = slug.trim_matches('-').to_string();
+    if slug.len() < 3 {
+        slug = format!("section-{index:02}");
+    }
+    if SPLIT_RESERVED_STEMS.contains(&slug.as_str()) || windows_reserved(&slug) {
+        slug.push_str("-section");
+    }
+    slug
+}
+
+/// 種類の分割先に worker が置いてよいファイル（リポジトリルート相対）。
+/// (1) 分割先の直下に既に追跡されている `*.md`、(2) 本文の `## ` 見出しから作る新規ファイル名
+/// （既存と重複しないもの）。合計 `MAX_SPLIT_FILES` 件まで。分割先が無い種類・リンクなどの危険な実体は含めない。
+pub fn split_candidates(root: &Path, scope: &Scope, kind: &ResolvedKind) -> Vec<String> {
+    let Some(dir) = &kind.split_dir else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut push = |out: &mut Vec<String>, rel: String| {
+        if out.len() < MAX_SPLIT_FILES && seen.insert(rel.to_ascii_lowercase()) {
+            out.push(rel);
+        }
+    };
+    let prefix = format!("{dir}/");
+    let mut tracked: Vec<String> = crate::maintenance::run_git(
+        root,
+        &["-c", "core.quotepath=false", "ls-files", "-z", "--", dir],
+    )
+    .map(|raw| {
+        String::from_utf8_lossy(&raw)
+            .split('\0')
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default();
+    tracked.sort();
+    for name in tracked {
+        let Some(rest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let safe = !rest.contains('/')
+            && rest.to_ascii_lowercase().ends_with(".md")
+            && rest.len() > ".md".len()
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            && !windows_reserved(rest)
+            && !rest.ends_with('.');
+        if safe && matches!(path_state(root, &name), PathState::File) {
+            push(&mut out, name);
+        }
+    }
+    let mut index = 0usize;
+    for file in scope.files(&kind.document) {
+        let Ok(data) = fs::read(file) else { continue };
+        for heading in h2_headings(&String::from_utf8_lossy(&data)) {
+            index += 1;
+            let name = format!("{prefix}{}.md", split_stem(&heading, index));
+            if matches!(
+                path_state(root, &name),
+                PathState::File | PathState::Missing
+            ) {
+                push(&mut out, name);
+            }
+        }
+    }
+    out
 }
 
 /// push で削除されたパスを「削除された対象」として扱うか（AGENTS・DESIGN だけ。種類が有効なときのみ）。
@@ -856,12 +1098,24 @@ pub fn keeps_deleted(kinds: &[ResolvedKind], name: &str) -> bool {
 pub fn kind_of_path<'a>(kinds: &'a [ResolvedKind], rel: &str) -> Option<&'a ResolvedKind> {
     let lower = rel.replace('\\', "/").to_lowercase();
     let file = lower.rsplit('/').next().unwrap_or("");
+    if let Some(k) = kinds.iter().find(|k| is_split_child(k, &lower)) {
+        return Some(k);
+    }
     kinds.iter().find(|k| match &k.document {
         Document::Custom(_) => k.paths.iter().any(|p| p.to_lowercase() == lower),
         Document::Changelog => lower == "changelog.md",
         Document::Readme => lower == "readme.md",
         Document::Design => file == "design.md",
         Document::Agents => file == "agents.md" || file == "agents.override.md",
+    })
+}
+
+/// 相対パス（小文字・`/` 区切り）が、種類の分割先の直下にある Markdown か。
+pub fn is_split_child(kind: &ResolvedKind, lower_rel: &str) -> bool {
+    kind.split_dir.as_deref().is_some_and(|d| {
+        lower_rel
+            .strip_prefix(&format!("{}/", d.to_ascii_lowercase()))
+            .is_some_and(|rest| !rest.contains('/') && rest.ends_with(".md"))
     })
 }
 
@@ -1026,15 +1280,104 @@ pub fn has_heading(text: &str, wanted: &str) -> bool {
     false
 }
 
+/// 保守後検査の違反 1 件。人向けの文（辞書）と worker 向けの英語文を、値から別々に作る。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Violation {
+    MaxChars {
+        name: String,
+        path: String,
+        count: u64,
+        max: u64,
+    },
+    MaxBytes {
+        name: String,
+        path: String,
+        size: u64,
+        max: u64,
+    },
+    MissingHeading {
+        name: String,
+        path: String,
+        heading: String,
+    },
+    /// 状態・読み取りを確認できない、UTF-8 ではない（検査不能。fail-closed）。
+    Unverifiable { path: String, why: &'static str },
+}
+
+impl Violation {
+    /// 再実行で直せる利用者設定の違反か（上限・必須見出し）。検査不能は直せない。
+    pub fn is_soft(&self) -> bool {
+        !matches!(self, Violation::Unverifiable { .. })
+    }
+
+    /// 人が読む文（表示言語）。
+    pub fn message(&self) -> String {
+        match self {
+            Violation::MaxBytes {
+                name,
+                path,
+                size,
+                max,
+            } => crate::t!(
+                "kinds.limit_bytes",
+                name = name,
+                path = path,
+                size = size,
+                max = max
+            ),
+            Violation::MaxChars {
+                name,
+                path,
+                count,
+                max,
+            } => crate::t!(
+                "kinds.limit_chars",
+                name = name,
+                path = path,
+                count = count,
+                max = max
+            ),
+            Violation::MissingHeading {
+                name,
+                path,
+                heading,
+            } => crate::t!(
+                "kinds.limit_heading",
+                name = name,
+                path = path,
+                heading = heading
+            ),
+            Violation::Unverifiable { path, why } => match *why {
+                "stat" => crate::t!("kinds.limit_stat", path = path),
+                "read" => crate::t!("kinds.limit_read", path = path),
+                _ => crate::t!("kinds.limit_not_utf8", path = path),
+            },
+        }
+    }
+}
+
+/// 違反の一覧を 1 つの文にまとめる（複数は「、」区切り）。
+pub fn violations_message(violations: &[Violation]) -> String {
+    crate::t!(
+        "kinds.limit_violation",
+        problems = violations
+            .iter()
+            .map(Violation::message)
+            .collect::<Vec<_>>()
+            .join(crate::t!("list.separator"))
+    )
+}
+
 /// 上限（文字数・バイト数）と必須見出しの保守後検査。`files` は検査する相対パス（`/` 区切り）で、
-/// 種類は `kind_of_path` で引く。違反があれば日本語のメッセージ（複数あれば「、」区切り）、無ければ None。
+/// 種類は `kind_of_path` で引く。違反を構造化して返す（無ければ空）。
 ///
 /// - `max_chars` は Unicode スカラー値の数、`max_bytes` はバイト数。両方指定なら両方適用する。
 /// - 存在しないファイルは検査しない（作成されなかっただけ）。通常ファイルでないものも対象外。
-/// - 読み取れない・UTF-8 でない（文字数や見出しの検査が要るとき）場合は違反として扱う（fail-closed）。
+/// - 読み取れない・UTF-8 でない（文字数や見出しの検査が要るとき）場合は検査不能の違反として扱う（fail-closed）。
+/// - 分割先の直下のファイルは本文と同じ上限を 1 ファイルごとに受け、必須見出しは本文だけに求める。
 /// - 権限モード（bypass / restricted）に関係なく呼ぶこと。
-pub fn limit_error(root: &Path, kinds: &[ResolvedKind], files: &[String]) -> Option<String> {
-    let mut problems: Vec<String> = Vec::new();
+pub fn check_documents(root: &Path, kinds: &[ResolvedKind], files: &[String]) -> Vec<Violation> {
+    let mut problems: Vec<Violation> = Vec::new();
     for rel in files {
         let Some(kind) = kind_of_path(kinds, rel) else {
             continue;
@@ -1044,11 +1387,15 @@ pub fn limit_error(root: &Path, kinds: &[ResolvedKind], files: &[String]) -> Opt
             continue;
         }
         let path = root.join(rel);
+        let unverifiable = |why: &'static str| Violation::Unverifiable {
+            path: rel.clone(),
+            why,
+        };
         let meta = match fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => {
-                problems.push(crate::t!("kinds.limit_stat", path = rel));
+                problems.push(unverifiable("stat"));
                 continue;
             }
         };
@@ -1058,58 +1405,158 @@ pub fn limit_error(root: &Path, kinds: &[ResolvedKind], files: &[String]) -> Opt
         let data = match fs::read(&path) {
             Ok(d) => d,
             Err(_) => {
-                problems.push(crate::t!("kinds.limit_read", path = rel));
+                problems.push(unverifiable("read"));
                 continue;
             }
         };
-        let name = kind.document.name();
+        let name = kind.document.name().to_string();
         if let Some(max) = kind.max_bytes
             && data.len() as u64 > max
         {
-            problems.push(crate::t!(
-                "kinds.limit_bytes",
-                name = name,
-                path = rel,
-                size = data.len(),
-                max = max
-            ));
+            problems.push(Violation::MaxBytes {
+                name: name.clone(),
+                path: rel.clone(),
+                size: data.len() as u64,
+                max,
+            });
         }
-        if kind.max_chars.is_none() && kind.required_headings.is_empty() {
+        let headings_wanted =
+            !kind.required_headings.is_empty() && !is_split_child(kind, &rel.to_lowercase());
+        if kind.max_chars.is_none() && !headings_wanted {
             continue;
         }
         let Ok(text) = String::from_utf8(data) else {
-            problems.push(crate::t!("kinds.limit_not_utf8", path = rel));
+            problems.push(unverifiable("utf8"));
             continue;
         };
         if let Some(max) = kind.max_chars {
             let count = text.chars().count() as u64;
             if count > max {
-                problems.push(crate::t!(
-                    "kinds.limit_chars",
-                    name = name,
-                    path = rel,
-                    count = count,
-                    max = max
-                ));
+                problems.push(Violation::MaxChars {
+                    name: name.clone(),
+                    path: rel.clone(),
+                    count,
+                    max,
+                });
             }
         }
-        for heading in &kind.required_headings {
-            if !has_heading(&text, heading) {
-                problems.push(crate::t!(
-                    "kinds.limit_heading",
-                    name = name,
-                    path = rel,
-                    heading = heading
+        if headings_wanted {
+            for heading in &kind.required_headings {
+                if !has_heading(&text, heading) {
+                    problems.push(Violation::MissingHeading {
+                        name: name.clone(),
+                        path: rel.clone(),
+                        heading: heading.clone(),
+                    });
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// `check_documents` の違反を日本語などの表示言語の 1 文にしたもの（無ければ None）。
+pub fn limit_error(root: &Path, kinds: &[ResolvedKind], files: &[String]) -> Option<String> {
+    let problems = check_documents(root, kinds, files);
+    (!problems.is_empty()).then(|| violations_message(&problems))
+}
+
+/// 再実行の最大回数（最初の起動を除く）。
+pub const MAX_FIXUPS: u32 = 2;
+/// 再実行を始めるのに残っているべき最短の秒数。
+pub const MIN_FIXUP_SECS: u64 = 120;
+/// 上限を超えた文書を収める目標（上限に対する割合）。
+pub const FIXUP_TARGET_PERCENT: u64 = 90;
+
+/// 再実行に使える時間。期限は最初の起動から `timeout_secs` を共有し、残りが `MIN_FIXUP_SECS` 未満なら
+/// 再実行しない（None）。
+pub fn fixup_budget(
+    timeout_secs: u64,
+    elapsed: std::time::Duration,
+) -> Option<std::time::Duration> {
+    let remaining = std::time::Duration::from_secs(timeout_secs).checked_sub(elapsed)?;
+    (remaining.as_secs() >= MIN_FIXUP_SECS).then_some(remaining)
+}
+
+/// 再実行で直す、AGENTS の 30,000 バイト超過（ファイルと現在のバイト数）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentsOver {
+    pub path: String,
+    pub size: u64,
+}
+
+/// 違反を直すための再実行用プロンプト（worker が読む文なので英語に固定）。
+/// 最初のプロンプトの繰り返しではなく、違反だけを具体的な数値つきで示す。
+pub fn fixup_prompt(
+    kinds: &[ResolvedKind],
+    violations: &[Violation],
+    agents: &[AgentsOver],
+    allowed: &[String],
+) -> String {
+    let target = |max: u64| max * FIXUP_TARGET_PERCENT / 100;
+    let mut lines: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut note = |text: String| {
+        if !notes.contains(&text) {
+            notes.push(text);
+        }
+    };
+    for v in violations {
+        let (path, line) = match v {
+            Violation::MaxChars {
+                path, count, max, ..
+            } => (
+                path,
+                format!(
+                    "- {path}: currently {count} characters, but at most {max} are allowed. Remove at least {} characters; aim for at most {} characters.",
+                    count.saturating_sub(*max),
+                    target(*max)
+                ),
+            ),
+            Violation::MaxBytes {
+                path, size, max, ..
+            } => (
+                path,
+                format!(
+                    "- {path}: currently {size} bytes, but at most {max} are allowed. Remove at least {} bytes; aim for at most {} bytes.",
+                    size.saturating_sub(*max),
+                    target(*max)
+                ),
+            ),
+            Violation::MissingHeading { path, heading, .. } => (
+                path,
+                format!("- {path}: the required heading \"{heading}\" is missing. Add it."),
+            ),
+            Violation::Unverifiable { .. } => continue,
+        };
+        lines.push(line);
+        if let Some(kind) = kind_of_path(kinds, path) {
+            if kind.document == Document::Changelog {
+                note("Only the Unreleased section of the CHANGELOG may change; never edit released version sections.".into());
+            }
+            if let Some(dir) = &kind.split_dir
+                && matches!(v, Violation::MaxChars { .. } | Violation::MaxBytes { .. })
+            {
+                note(format!(
+                    "If detail must be kept, you may move it into files under `{dir}/` that are in the editable paths below, one topic per file, leaving a one- or two-sentence summary and a relative link in the main document."
                 ));
             }
         }
     }
-    (!problems.is_empty()).then(|| {
-        crate::t!(
-            "kinds.limit_violation",
-            problems = problems.join(crate::t!("list.separator"))
-        )
-    })
+    for a in agents {
+        lines.push(format!(
+            "- {}: currently {} bytes, but AGENTS files must stay under 30000 bytes. Remove duplication and low-value detail; aim for at most {} bytes.",
+            a.path,
+            a.size,
+            target(AGENTS_MAX_BYTES)
+        ));
+    }
+    format!(
+        "The maintenance result for this push still violates checks that the program enforces after every run. Fix only these violations and do not redo the rest of the maintenance:\n{}\nReduce size by removing duplication, outdated statements and low-value detail and by tightening wording; do not simply cut text off.{}\nThe only editable paths are those in this JSON array: {}. Do not edit any other path.",
+        lines.join("\n"),
+        notes.iter().map(|n| format!(" {n}")).collect::<String>(),
+        serde_json::json!(allowed)
+    )
 }
 
 /// 種類の表示名（カスタムは id とパスを併記する）。プロンプト・メッセージ用。
@@ -1174,9 +1621,21 @@ pub fn settings_frame(
                 format!(" (currently: {})", now.join("; "))
             };
             lines.push(format!(
-                "- Limits: {}{current}. They are checked after maintenance; changes that exceed them are not accepted.",
+                "- Limits: {}{current}. These are requirements that the program checks after maintenance. If a file already exceeds a limit, bringing it within the limit is itself a required part of this task: remove duplication and outdated statements, tighten wording and drop low-value detail, and aim for at most {FIXUP_TARGET_PERCENT}% of the limit.",
                 limits.join(", ")
             ));
+            let split = split_candidates(root, scope, kind);
+            if let Some(dir) = kind.split_dir.as_deref().filter(|_| !split.is_empty()) {
+                let agents_rule = if kind.document == Document::Agents {
+                    " Keep the rules that apply to all work in AGENTS.md and move only details, adding a line such as \"Before changing X, read docs/agents/x.md\" for each moved topic."
+                } else {
+                    ""
+                };
+                lines.push(format!(
+                    "- Splitting: if detail cannot fit within the limits, move it into files under `{dir}/`. Create or edit only these files: {}. Use one topic per file, and leave a one- or two-sentence summary with a relative link to the new file in the main document.{agents_rule}",
+                    split.join(", ")
+                ));
+            }
         }
         if let Some(lang) = &kind.language {
             lines.push(format!("- Language: write in {lang}."));
@@ -1189,7 +1648,7 @@ pub fn settings_frame(
                 .collect::<Vec<_>>()
                 .join(", ");
             lines.push(format!(
-                "- Required headings: {list}. Add any that are missing (they are checked after maintenance; changes missing them are not accepted)."
+                "- Required headings: {list}. Add any that are missing (they are checked after maintenance by the program)."
             ));
         }
         // 組み込みテンプレート（CHANGELOG の Keep a Changelog 形式）は新規作成のときと、形式に

@@ -134,6 +134,7 @@ paused = false
 | `create_if_missing` | 目標不存在時是否允許建立（內建種類為 true，自訂種類為 false）。為 false 時，目標不存在的期間，既不會出現在允許路徑中，也不會出現在提示詞中。 |
 | `template` | `"builtin"` / `"none"` / `"templates/<name>.md"`。詳見後文。 |
 | `max_chars` / `max_bytes` | 文件的上限（字元數與位元組數）。若兩者都指定，則兩者皆適用。對 `agents` 而言，`max_bytes` 只能設定為 29,999 以下。 |
+| `split_dir` | 可將超出上限的細節移入的目錄（預設 `docs/<id>`；僅對設定了 `max_chars` / `max_bytes` 的類型有效；不能用於 `changelog`）。每個檔案一個主題，最多 20 個。 |
 | `instructions` | 額外的編輯指示（最多 2000 個字元）。它與 `[defaults] instructions`（所有種類共用）構成兩層，只會放進提示詞結尾的「來自使用者設定」區段。它們無法變更目標路徑、安全規則，或 commit 與 push 的處理方式。 |
 | `language` | 文件的語言（`ja` / `en-US` 等）。省略時會沿用既有文件的語言。這是所產生文件的語言，與畫面和輸出的語言無關（worker 的提示詞為英文，但 `language` 的行為不變）。 |
 | `required_headings` | 維護後會檢查其是否存在的標題（最多 20 個）。 |
@@ -144,7 +145,7 @@ paused = false
 
 ### 維護後檢查
 
-上限（`max_chars` / `max_bytes`）、`required_headings`、AGENTS 小於 30,000 位元組，以及已發布 CHANGELOG 項目的不變性，無論 worker 的權限模式（`restricted` / `bypass`）為何，都由 Rust 檢查。違規時不會 commit（變更會留在工作樹中，下一次 hook 會執行相同的檢查），也不會針對同一次 push 重新執行 worker。
+上限（`max_chars` / `max_bytes`）、`required_headings`、AGENTS 小於 30,000 位元組，以及已發布 CHANGELOG 項目的不變性，無論 worker 的權限模式（`restricted` / `bypass`）為何，都由 Rust 檢查。上限或必要標題仍然違規時，會在同一次 hook 內重新執行 worker（最多 2 次）只修正這些違規；仍未解決則帶警告 commit 並 push（警告會出現在 hook 通知、`run-now --json` 的 `warnings` 與歷程中）。若 AGENTS 仍不小於 30,000 位元組，或已發布的 CHANGELOG 項目被更動，則捨棄 worker 的輸出並在不 commit 的情況下完成維護。
 
 ### 時機（`[kinds.<id>.timing]`）
 

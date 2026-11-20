@@ -134,6 +134,7 @@ Diese werden nur aus der `config.toml` des Benutzers gelesen. Jedes Feld ist opt
 | `create_if_missing` | Ob das Ziel angelegt werden darf, wenn es nicht existiert (true bei eingebauten Arten, false bei benutzerdefinierten Arten). Ist der Wert false, erscheint das Ziel weder in den erlaubten Pfaden noch im Prompt, solange es nicht existiert. |
 | `template` | `"builtin"` / `"none"` / `"templates/<name>.md"`. Siehe unten. |
 | `max_chars` / `max_bytes` | Grenzen für das Dokument (Zeichen und Bytes). Sind beide angegeben, gelten beide. Für `agents` kann `max_bytes` nur auf 29.999 oder weniger gesetzt werden. |
+| `split_dir` | Ordner, in den Details über den Grenzen verschoben werden dürfen (Standard `docs/<id>`; nur für Arten mit `max_chars` / `max_bytes`; nicht für `changelog`). Bis zu 20 Dateien, ein Thema pro Datei. |
 | `instructions` | Zusätzliche Bearbeitungsanweisungen (höchstens 2000 Zeichen). Zusammen mit `[defaults] instructions` (gilt für alle Arten) in zwei Stufen gelangen sie nur in den Abschnitt „aus den Benutzereinstellungen“ am Ende des Prompts. Sie können weder die Zielpfade noch die Sicherheitsregeln noch den Umgang mit Commit und Push ändern. |
 | `language` | Die Sprache des Dokuments (`ja` / `en-US` usw.). Wird sie weggelassen, folgt das Dokument der Sprache des bestehenden Dokuments. Dies ist die Sprache der erzeugten Dokumente und unabhängig von der Sprache der Oberflächen und Ausgaben (die Prompts des Workers sind auf Englisch, das Verhalten von `language` bleibt jedoch unverändert). |
 | `required_headings` | Überschriften, deren Vorhandensein nach der Wartung geprüft wird (höchstens 20). |
@@ -144,7 +145,7 @@ Diese werden nur aus der `config.toml` des Benutzers gelesen. Jedes Feld ist opt
 
 ### Prüfungen nach der Wartung
 
-Limits (`max_chars` / `max_bytes`), `required_headings`, dass AGENTS unter 30.000 Bytes bleibt, und die Unveränderlichkeit veröffentlichter CHANGELOG-Einträge werden von Rust unabhängig vom Berechtigungsmodus des Workers (`restricted` / `bypass`) geprüft. Bei einem Verstoß wird nichts committet (die Änderungen bleiben im Arbeitsverzeichnis, und der nächste Hook führt dieselben Prüfungen aus), und der Worker wird für denselben Push nicht erneut gestartet.
+Limits (`max_chars` / `max_bytes`), `required_headings`, dass AGENTS unter 30.000 Bytes bleibt, und die Unveränderlichkeit veröffentlichter CHANGELOG-Einträge werden von Rust unabhängig vom Berechtigungsmodus des Workers (`restricted` / `bypass`) geprüft. Verstoßen Limits oder erforderliche Überschriften weiterhin, wird der Worker im selben Hook bis zu zweimal erneut gestartet, um nur diese Verstöße zu beheben; bleiben sie bestehen, wird mit einer Warnung committet und gepusht (die Warnung erscheint in der Hook-Meldung, als `warnings` in `run-now --json` und im Verlauf). Bleibt AGENTS bei 30.000 Bytes oder mehr oder wurden veröffentlichte CHANGELOG-Einträge geändert, wird die Ausgabe des Workers verworfen und die Pflege ohne Commit abgeschlossen.
 
 ### Timing (`[kinds.<id>.timing]`)
 

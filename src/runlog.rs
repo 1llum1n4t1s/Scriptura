@@ -48,6 +48,13 @@ pub struct Detail {
     pub kinds: Vec<String>,
     #[serde(default)]
     pub documents: Vec<DocChange>,
+    /// 違反を直すために worker を再実行した回数（0 なら記録しない）。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fixups: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// 記録する 1 回分。

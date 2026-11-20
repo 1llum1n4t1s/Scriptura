@@ -2468,6 +2468,7 @@ fn sample_run(root: &str, outcome: &str, message: Option<&str>) -> scriptura::ru
                 added: 3,
                 removed: 1,
             }],
+            ..Default::default()
         },
         message: message.map(str::to_string),
     }
@@ -2628,4 +2629,73 @@ async fn settings_history_moved_under_settings_and_old_urls_are_not_it() {
         "{}",
         r.location()
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_dir_field_is_saved_validated_and_hidden_for_changelog() {
+    let fx = Fx::new().await;
+    // 既定は値ではなくプレースホルダーで示す（空のまま保存しても設定には何も書かれない）。
+    let design = fx.get("/settings/documents/design").await;
+    assert!(
+        design.body.contains(
+            r#"name="split_dir" value="" placeholder="docs/design（既定・上限を設定したとき）""#
+        ),
+        "{}",
+        design.body
+    );
+    // CHANGELOG は分割しないので欄を出さない。
+    let changelog = fx.get("/settings/documents/changelog").await;
+    assert_eq!(changelog.status, StatusCode::OK);
+    assert!(!changelog.body.contains(r#"name="split_dir""#));
+    // 上限・言語・分割先を保存すると、フォームにそのまま値として出る（旧設定の値が消えて見えない回帰の防止）。
+    let rev = fx.revision();
+    let r = fx
+        .post(
+            "/settings/documents/readme",
+            &[
+                ("revision", &rev),
+                ("max_chars", "3000"),
+                ("language", "ja"),
+                ("split_dir", "guide/parts"),
+            ],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    let k = fx.config().kinds["readme"].clone();
+    assert_eq!(k.split_dir.as_deref(), Some("guide/parts"));
+    let page = fx.get("/settings/documents/readme").await;
+    for needle in [
+        r#"name="max_chars" inputmode="numeric" value="3000""#,
+        r#"name="language" value="ja""#,
+        r#"name="split_dir" value="guide/parts""#,
+    ] {
+        assert!(page.body.contains(needle), "{needle}\n{}", page.body);
+    }
+    // 検証に通らない分割先（.. を含む・他の種類の分割先と重なる）は 400 で書かない。
+    let rev = fx.revision();
+    let r = fx
+        .post(
+            "/settings/documents/readme",
+            &[
+                ("revision", &rev),
+                ("max_chars", "3000"),
+                ("split_dir", "../outside"),
+            ],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(fx.revision(), rev);
+    // 利用者の文字列は自動エスケープを通る。
+    let r = fx
+        .post(
+            "/settings/documents/readme",
+            &[
+                ("revision", &rev),
+                ("max_chars", "3000"),
+                ("split_dir", "<b>x</b>"),
+            ],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert!(!r.body.contains("<b>x</b>"), "{}", r.body);
 }

@@ -541,6 +541,15 @@ pub fn run_now_for(
     root: &Path,
     documents: Option<&[Document]>,
 ) -> Result<RunNow, String> {
+    run_now_reported(store, root, documents).map(|(result, _)| result)
+}
+
+/// `run_now_for` と同じ処理で、成功した保守の通知（上限を超えたまま commit した警告・出力を破棄した旨）も返す。
+pub fn run_now_reported(
+    store: &Store,
+    root: &Path,
+    documents: Option<&[Document]>,
+) -> Result<(RunNow, Vec<String>), String> {
     let config = match config::load_from(&store.config_file) {
         Loaded::Ok(c) => c,
         Loaded::Missing => {
@@ -563,10 +572,11 @@ pub fn run_now_for(
     if let Some(wanted) = documents {
         options = narrow_to_documents(&config, &decision.documents, options, wanted)?;
     }
-    match maintenance::run_now(root, options)? {
+    let report = maintenance::run_now_reported(root, options)?;
+    match report.message {
         // Some は失敗や実行中の通知（成功時は None）。
         Some(message) => Err(message),
-        None => Ok(RunNow::Completed),
+        None => Ok((RunNow::Completed, report.notes)),
     }
 }
 

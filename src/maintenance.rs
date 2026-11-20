@@ -517,12 +517,42 @@ fn dedup_dirs(dirs: &mut Vec<PathBuf>) {
     dirs.retain(|d| seen.insert(d.clone()));
 }
 
+/// AGENTS の大きさの検査で見つかった問題。`File` は 1 ファイルが 30,000 バイト以上、`Chain` は階層の合計が
+/// 30,000 バイト以上、`Unverifiable` は確認できなかった理由。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentsProblem {
+    File { path: String, size: usize },
+    Chain { path: String, size: usize },
+    Unverifiable(String),
+}
+impl AgentsProblem {
+    pub fn message(&self) -> String {
+        match self {
+            AgentsProblem::File { path, size } => {
+                crate::t!("maint.agents_too_large", path = path, size = size)
+            }
+            AgentsProblem::Chain { path, size } => {
+                crate::t!("maint.agents_chain_too_large", path = path, size = size)
+            }
+            AgentsProblem::Unverifiable(error) => {
+                crate::t!("maint.agents_size_unverifiable", error = error)
+            }
+        }
+    }
+}
 pub fn agents_size_error(
     root: &Path,
     directories: &[PathBuf],
     validate_sizes: bool,
 ) -> Option<String> {
-    let work = || -> Result<Option<String>> {
+    agents_problem(root, directories, validate_sizes).map(|p| p.message())
+}
+pub fn agents_problem(
+    root: &Path,
+    directories: &[PathBuf],
+    validate_sizes: bool,
+) -> Option<AgentsProblem> {
+    let work = || -> Result<Option<AgentsProblem>> {
         let tracked = text(
             run_git(root, &["ls-files", "-z"]).ok_or(crate::t!("maint.agents_tracked_list"))?,
         )?;
@@ -570,11 +600,10 @@ pub fn agents_size_error(
                             let data = fs::read(&p).map_err(err)?;
                             let size = data.len();
                             if size >= LIMIT {
-                                return Ok(Some(crate::t!(
-                                    "maint.agents_too_large",
-                                    path = p.display(),
-                                    size = size
-                                )));
+                                return Ok(Some(AgentsProblem::File {
+                                    path: p.display().to_string(),
+                                    size,
+                                }));
                             }
                             sizes.insert(
                                 name,
@@ -595,17 +624,16 @@ pub fn agents_size_error(
                     .copied()
                     .unwrap_or(0);
                 if chain >= LIMIT {
-                    return Ok(Some(crate::t!(
-                        "maint.agents_chain_too_large",
-                        path = d.display(),
-                        size = chain
-                    )));
+                    return Ok(Some(AgentsProblem::Chain {
+                        path: d.display().to_string(),
+                        size: chain,
+                    }));
                 }
             }
         }
         Ok(None)
     };
-    work().unwrap_or_else(|e| Some(crate::t!("maint.agents_size_unverifiable", error = e)))
+    work().unwrap_or_else(|e| Some(AgentsProblem::Unverifiable(e.to_string())))
 }
 fn is_agents(path: &Path) -> bool {
     matches!(
@@ -1513,10 +1541,17 @@ pub fn baseline(root: &Path) -> Result<()> {
 /// 利用者が明示した実行なので「新しい push かどうか」は問わないが、
 /// 未 push の HEAD・外部 PR などの安全確認は通常どおり行う。
 pub fn run_now(root: &Path, options: MaintenanceOptions) -> Result<Option<String>> {
+    run_now_reported(root, options).map(|r| r.message)
+}
+/// `run_now` と同じ処理で、警告・破棄の通知（`PollReport::notes`）も返す。
+pub fn run_now_reported(root: &Path, options: MaintenanceOptions) -> Result<PollReport> {
     let Some(_lock) = acquire_poll_lock()? else {
-        return Ok(Some(crate::t!("maint.busy").into()));
+        return Ok(PollReport {
+            message: Some(crate::t!("maint.busy").into()),
+            notes: Vec::new(),
+        });
     };
-    poll_repository_with(
+    poll_repository_reported(
         root,
         PollOptions {
             force: true,
@@ -1535,9 +1570,27 @@ pub fn poll_repository_with(
     cwd: Option<&str>,
     plan: &PollPlan,
 ) -> Result<Option<String>> {
+    poll_repository_reported(root, opts, cwd, plan).map(|r| r.message)
+}
+/// 保守の結果。`message` は失敗・見送りの説明（成功なら None）、`notes` は成功した保守が残した通知
+/// （上限を超えたまま commit した警告・出力を破棄した旨など）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PollReport {
+    pub message: Option<String>,
+    pub notes: Vec<String>,
+}
+/// `poll_repository_with` と同じ処理で、通知（`PollReport::notes`）も返す。
+pub fn poll_repository_reported(
+    root: &Path,
+    opts: PollOptions,
+    cwd: Option<&str>,
+    plan: &PollPlan,
+) -> Result<PollReport> {
     let started = now();
     let drafts: RefCell<Vec<crate::runlog::Run>> = RefCell::new(Vec::new());
-    let result = poll_repository_inner(root, opts, cwd, plan, &drafts);
+    let notes: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    let result = poll_repository_inner(root, opts, cwd, plan, &drafts, &notes);
+    let notes = notes.into_inner();
     let drafts = drafts.into_inner();
     if !drafts.is_empty()
         && let Ok(db) = open_state_db()
@@ -1551,7 +1604,7 @@ pub fn poll_repository_with(
             let _ = crate::runlog::record(&db, &run);
         }
     }
-    result
+    result.map(|message| PollReport { message, notes })
 }
 /// 保守履歴の記録候補（開始・終了時刻と契機は外側が足す）。
 #[allow(clippy::too_many_arguments)]
@@ -1641,6 +1694,7 @@ fn failure_draft(
         crate::runlog::Detail {
             kinds: state_kind_ids(&state),
             documents: Vec::new(),
+            ..Default::default()
         },
         Some(message.to_owned()),
     )
@@ -1651,6 +1705,7 @@ fn poll_repository_inner(
     cwd: Option<&str>,
     plan: &PollPlan,
     drafts: &RefCell<Vec<crate::runlog::Run>>,
+    notes: &RefCell<Vec<String>>,
 ) -> Result<Option<String>> {
     let initialize = opts.initialize;
     let Some(snapshot) = push_snapshot(root) else {
@@ -1828,6 +1883,7 @@ fn poll_repository_inner(
             crate::runlog::Detail {
                 kinds: state_kind_ids(&state),
                 documents: commit_changes(root, &resumed_commit),
+                ..Default::default()
             },
             None,
         ));
@@ -2054,16 +2110,34 @@ fn poll_repository_inner(
         pushed.clone()
     };
     save_cursor(&db, &snapshot, &fingerprint, None, &processed)?;
-    // 保守が完了した（処理済み位置を error なしで保存した）ので、今回対象になった種類の最終完了を記録する。
-    crate::timing::record_kind_runs(&db, &repo_key, record, &processed, now())?;
-    // 保守履歴: 完了した publication 状態から、commit・push 済みか、変更なしかを分ける。
     let finished = read_state(&path).unwrap_or_else(|_| json!({}));
+    let discarded = s(&finished, "discarded");
+    // 保守が完了した（処理済み位置を error なしで保存した）ので、今回対象になった種類の最終完了を記録する。
+    // 検査に違反して出力を破棄した回は完了に数えない（位置だけ進める）。
+    if discarded.is_empty() {
+        crate::timing::record_kind_runs(&db, &repo_key, record, &processed, now())?;
+    }
+    // 保守履歴: 完了した publication 状態から、commit・push 済みか、変更なしか、破棄したかを分ける。
     if s(&finished, "phase") == "complete" {
+        notes.borrow_mut().extend(
+            finished["notes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_owned)),
+        );
         let commit = s(&finished, "commit");
-        let (label, documents) = if commit.is_empty() {
+        let (label, documents) = if !discarded.is_empty() {
+            ("rejected", Vec::new())
+        } else if commit.is_empty() {
             ("unchanged", Vec::new())
         } else {
             ("committed", commit_changes(root, &commit))
+        };
+        let message = if discarded.is_empty() {
+            Some(s(&finished, "limit_warning")).filter(|m| !m.is_empty())
+        } else {
+            Some(discarded)
         };
         drafts.borrow_mut().push(draft(
             &snapshot,
@@ -2074,8 +2148,9 @@ fn poll_repository_inner(
             crate::runlog::Detail {
                 kinds: state_kind_ids(&finished),
                 documents,
+                fixups: finished["fixups"].as_u64().unwrap_or(0) as u32,
             },
-            None,
+            message,
         ));
     }
     prior_fingerprint.clear();
@@ -2283,7 +2358,7 @@ pub fn handle_hook(payload: &Value) -> Result<Option<String>> {
             None => return Ok(notice),
         },
     };
-    let result = poll_repository_with(
+    let result = poll_repository_reported(
         &root,
         PollOptions {
             initialize: event == "UserPromptSubmit",
@@ -2293,7 +2368,18 @@ pub fn handle_hook(payload: &Value) -> Result<Option<String>> {
         &plan,
     );
     drop(lock);
-    match (notice, result?) {
+    let report = result?;
+    // 成功した保守の通知（警告・破棄）は、失敗の説明がなければそれだけを、あれば続けて知らせる。
+    let message = match (report.message, report.notes) {
+        (m, notes) if notes.is_empty() => m,
+        (None, notes) => Some(notes.join(crate::t!("list.separator"))),
+        (Some(m), notes) => Some(crate::t!(
+            "maint.join_sentences",
+            first = m,
+            second = notes.join(crate::t!("list.separator"))
+        )),
+    };
+    match (notice, message) {
         (Some(n), Some(m)) => Ok(Some(crate::t!(
             "maint.join_sentences",
             first = n,
@@ -2716,7 +2802,14 @@ pub fn run_maintenance_worker_with(
     allowed: &[String],
     options: &MaintenanceOptions,
 ) -> Option<String> {
-    run_worker_outcome(root, reason, allowed, options).map(|f| f.message)
+    run_worker_outcome(
+        root,
+        reason,
+        allowed,
+        options,
+        Duration::from_secs(options.worker.timeout_secs),
+    )
+    .map(|f| f.message)
 }
 
 /// worker の失敗。`timed_out` は終了状態が確定しないタイムアウト（文言は表示言語で変わるため、
@@ -2731,6 +2824,7 @@ fn run_worker_outcome(
     reason: &str,
     allowed: &[String],
     options: &MaintenanceOptions,
+    timeout: Duration,
 ) -> Option<WorkerFailure> {
     let failed = |message: String| {
         Some(WorkerFailure {
@@ -2752,13 +2846,8 @@ fn run_worker_outcome(
     // CLAUDE_CODE_OAUTH_TOKEN だけは利用者が明示的に設定する認証手段なので残す。
     // restricted でも同じ（権限の厳しさとは独立した、起動環境の衛生）。
     scrub_host_env(&mut c);
-    let seconds = options.worker.timeout_secs;
-    match capture(
-        c,
-        Some(reason.as_bytes().to_vec()),
-        Duration::from_secs(seconds),
-        true,
-    ) {
+    let seconds = timeout.as_secs();
+    match capture(c, Some(reason.as_bytes().to_vec()), timeout, true) {
         Ok(r) if r.code == Some(0) => None,
         Ok(r) => failed({
             let tail = String::from_utf8_lossy(&r.stderr[r.stderr.len().saturating_sub(8192)..])
@@ -2985,6 +3074,85 @@ pub fn save_publication(path: &Path, state: &mut Value) -> Result<()> {
     let temporary = path.with_extension("tmp");
     fs::write(&temporary, serde_json::to_vec(state).map_err(err)?).map_err(err)?;
     fs::rename(&temporary, path).map_err(err)
+}
+/// 利用者へ知らせる文（警告・破棄の通知）を publication 状態に足す。保守の完了後に
+/// `poll_repository_with` が読み、hook の出力と run-now の結果へ渡す。
+fn push_note(state: &mut Value, note: String) {
+    if !state["notes"].is_array() {
+        state["notes"] = json!([]);
+    }
+    if let Some(list) = state["notes"].as_array_mut() {
+        list.push(json!(note));
+    }
+}
+/// 再実行で直せる違反（上限・必須見出し・AGENTS の 30,000 バイト超過）。AGENTS は編集を許した
+/// ファイルだけを対象にする（許可パスに無いものは worker が直せない）。
+fn fixable_problems(
+    root: &Path,
+    kinds: &[ResolvedKind],
+    editable: &[String],
+    size_dirs: &[PathBuf],
+) -> (Vec<crate::kinds::Violation>, Vec<crate::kinds::AgentsOver>) {
+    let violations = crate::kinds::check_documents(root, kinds, editable)
+        .into_iter()
+        .filter(crate::kinds::Violation::is_soft)
+        .collect();
+    let agents = match agents_problem(root, size_dirs, true) {
+        Some(AgentsProblem::File { path, size }) => {
+            let relative = safe_relative(root, Path::new(&path)).unwrap_or(path);
+            if editable.iter().any(|e| e == &relative) {
+                vec![crate::kinds::AgentsOver {
+                    path: relative,
+                    size: size as u64,
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    };
+    (violations, agents)
+}
+/// worker の出力を破棄する。編集を許したパスのうち、現在の内容が worker 終了時の記録（`after`）と一致する
+/// ものだけを変更前に戻す（追跡済みは HEAD から復元、worker が作った未追跡の新規ファイルは削除）。
+/// 記録と一致しないもの（利用者が触った可能性がある）は戻さず、そのパスを返す。何度呼んでも同じ結果になる。
+fn discard_outputs(root: &Path, state: &Value) -> Vec<String> {
+    let mut kept = Vec::new();
+    let (Some(before), Some(after)) = (state["before"].as_object(), state["after"].as_object())
+    else {
+        return kept;
+    };
+    for (relative, before_digest) in before {
+        let after_digest = after.get(relative).cloned().unwrap_or(Value::Null);
+        if *before_digest == after_digest {
+            continue;
+        }
+        let current = document_hash(root, relative).map(|v| json!(v));
+        if current.as_ref().ok() != Some(&after_digest) {
+            kept.push(relative.clone());
+            continue;
+        }
+        if before_digest.is_null() {
+            let tracked = run_git(root, &["ls-files", "--error-unmatch", "--", relative]).is_some();
+            let target = root.join(relative);
+            if tracked || fs::remove_file(&target).is_err() {
+                kept.push(relative.clone());
+            } else if let Some(parent) = target.parent()
+                && parent != root
+            {
+                // 分割先を空のまま残さない（中身があれば消えない）。
+                let _ = fs::remove_dir(parent);
+            }
+        } else if run_git(
+            root,
+            &["restore", "--worktree", "--source=HEAD", "--", relative],
+        )
+        .is_none()
+        {
+            kept.push(relative.clone());
+        }
+    }
+    kept
 }
 fn fail(path: &Path, state: &mut Value, message: impl Into<String>) -> Result<Option<String>> {
     let message = message.into();
@@ -3214,6 +3382,29 @@ pub fn publish_locked_with(
             save_publication(path, &mut state)?;
         }
     }
+    // 検査に違反して止まったままの記録（ready・worker_failed）は、HEAD が進んだ（新しい push や利用者の
+    // commit があった）ら、worker の出力のうち現在も記録どおりのものだけを戻して、新しい保守として処理する
+    // （そのまま失敗にすると以後ずっと保守されない）。
+    let mut stale_note: Option<String> = None;
+    if ["ready", "worker_failed"].contains(&s(&state, "phase").as_str())
+        && head
+            != state
+                .get("commit")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| state["head"].as_str().unwrap_or(""))
+    {
+        let kept = discard_outputs(root, &state);
+        stale_note = Some(if kept.is_empty() {
+            crate::t!("maint.stale_output_discarded").to_string()
+        } else {
+            crate::t!(
+                "maint.stale_output_discarded_kept",
+                paths = kept.join(crate::t!("list.separator"))
+            )
+        });
+        state["phase"] = json!("complete");
+        state["error"] = Value::Null;
+    }
     if state.as_object().is_some_and(|m| !m.is_empty())
         && !["complete", "interrupted_recovered"].contains(&s(&state, "phase").as_str())
     {
@@ -3346,6 +3537,9 @@ pub fn publish_locked_with(
             ),
         };
         state = json!({"phase":"worker_pending","head":head,"branch":branch,"remote":remote,"ref":reference,"destination":destination,"before":before,"after":before,"ignored_before":ignored,"error":null,"history":history,"poll_fingerprint":fingerprint,"validation_dirs":validations,"kinds":kind_ids});
+        if let Some(note) = stale_note {
+            push_note(&mut state, note);
+        }
         save_publication(path, &mut state)?;
     }
     if ["worker_pending", "worker_failed"].contains(&s(&state, "phase").as_str()) {
@@ -3427,52 +3621,81 @@ pub fn publish_locked_with(
         );
         state["phase"] = json!("worker_running");
         save_publication(path, &mut state)?;
-        let outcome = run_worker_outcome(root, &prompt, &allowed, options);
-        if let Some(failure) = outcome.as_ref().filter(|f| f.timed_out) {
-            return fail(
-                path,
-                &mut state,
-                crate::t!("maint.timeout_stopped", error = failure.message),
-            );
-        }
-        let error = outcome.map(|f| f.message);
-        // 事後検査（Restricted のみ）: 許可文書以外が変わっていれば、commit もせず失敗扱いにする。
-        // 対象外の変更は自動では戻さない（利用者の作業を損なわないため）。記録して再実行を止める。
-        let mut error = error;
-        let post_snapshot = pre_snapshot
-            .as_ref()
-            .map(|_| worktree_snapshot_with(root, false));
-        match (pre_snapshot, post_snapshot) {
-            (Some(pre_snapshot), Some(Ok(post))) => {
-                let bad = out_of_scope_changes(root, &pre_snapshot, &post, &allowed);
-                if !bad.is_empty() {
-                    let record: serde_json::Map<String, Value> = bad
-                        .iter()
-                        .map(|k| {
-                            (
-                                k.clone(),
-                                json!(post.get(k).cloned().unwrap_or_else(|| "clean".into())),
-                            )
-                        })
-                        .collect();
-                    state["violation"] = json!(record);
-                    error = Some(crate::t!(
-                        "maint.worker_violation",
-                        paths = bad.join(crate::t!("list.separator"))
-                    ));
+        // 上限・必須見出し・AGENTS の大きさに違反が残っていれば、違反だけを直す再実行を最大 `MAX_FIXUPS` 回
+        // 同じ hook の中で行う。期限は最初の起動から `timeout_secs` を共有する。
+        let resolved_kinds = options.resolved_kinds();
+        let started = std::time::Instant::now();
+        let mut fixups = 0u32;
+        let mut pre_snapshot = pre_snapshot;
+        let mut prompt = prompt;
+        let mut timeout = Duration::from_secs(options.worker.timeout_secs);
+        let error = loop {
+            let outcome = run_worker_outcome(root, &prompt, &allowed, options, timeout);
+            if let Some(failure) = outcome.as_ref().filter(|f| f.timed_out) {
+                return fail(
+                    path,
+                    &mut state,
+                    crate::t!("maint.timeout_stopped", error = failure.message),
+                );
+            }
+            // 事後検査（Restricted のみ）: 許可文書以外が変わっていれば、commit もせず失敗扱いにする。
+            // 対象外の変更は自動では戻さない（利用者の作業を損なわないため）。記録して再実行を止める。
+            let mut error = outcome.map(|f| f.message);
+            let post_snapshot = pre_snapshot
+                .as_ref()
+                .map(|_| worktree_snapshot_with(root, false));
+            match (pre_snapshot.take(), post_snapshot) {
+                (Some(pre), Some(Ok(post))) => {
+                    let bad = out_of_scope_changes(root, &pre, &post, &allowed);
+                    if !bad.is_empty() {
+                        let record: serde_json::Map<String, Value> = bad
+                            .iter()
+                            .map(|k| {
+                                (
+                                    k.clone(),
+                                    json!(post.get(k).cloned().unwrap_or_else(|| "clean".into())),
+                                )
+                            })
+                            .collect();
+                        state["violation"] = json!(record);
+                        error = Some(crate::t!(
+                            "maint.worker_violation",
+                            paths = bad.join(crate::t!("list.separator"))
+                        ));
+                    }
+                    // 次の起動の比較元は、今回の worker 後の状態。
+                    pre_snapshot = Some(post);
                 }
+                (Some(_), Some(Err(e))) => {
+                    error = Some(crate::t!("maint.worktree_after_unknown", error = e));
+                }
+                // Bypass は全体比較をしない（commit 対象のハッシュ検査だけ）。
+                _ => {}
             }
-            (Some(_), Some(Err(e))) => {
-                error = Some(crate::t!("maint.worktree_after_unknown", error = e));
+            let mut after = serde_json::Map::new();
+            for relative in &allowed {
+                after.insert(relative.clone(), json!(document_hash(root, relative)?));
             }
-            // Bypass は全体比較をしない（commit 対象のハッシュ検査だけ）。
-            _ => {}
-        }
-        let mut after = serde_json::Map::new();
-        for relative in allowed {
-            after.insert(relative.clone(), json!(document_hash(root, &relative)?));
-        }
-        state["after"] = json!(after);
+            state["after"] = json!(after);
+            if error.is_some() || fixups >= crate::kinds::MAX_FIXUPS {
+                break error;
+            }
+            let (violations, agents) =
+                fixable_problems(root, &resolved_kinds, &allowed, &size_dirs);
+            if violations.is_empty() && agents.is_empty() {
+                break None;
+            }
+            let Some(budget) =
+                crate::kinds::fixup_budget(options.worker.timeout_secs, started.elapsed())
+            else {
+                break None;
+            };
+            fixups += 1;
+            state["fixups"] = json!(fixups);
+            save_publication(path, &mut state)?;
+            prompt = crate::kinds::fixup_prompt(&resolved_kinds, &violations, &agents, &allowed);
+            timeout = budget;
+        };
         state["phase"] = json!(if error.is_some() {
             "worker_failed"
         } else {
@@ -3490,12 +3713,11 @@ pub fn publish_locked_with(
             .map(|d| safe_relative(root, d))
             .collect::<Result<Vec<_>>>()?
     );
-    if let Some(e) = agents_size_error(root, &size_dirs, true) {
-        return fail(path, &mut state, crate::t!("maint.kept_all", error = e));
-    }
-    // 種類ごとの上限（文字数・バイト数）と必須見出しの検査。権限モードに関係なく、AGENTS の上限超過と
-    // 同じ扱い（commit せず phase は ready のまま。中断復旧でも必ずここを通る）。
+    // 保守後検査。権限モードに関係なく、中断復旧や ready からの再開でも必ずここを通る。
     // 検査対象は worker に編集を許したパス（記録済みの `before` のキー）。
+    // - ハード違反（AGENTS の 30,000 バイト・階層の超過、CHANGELOG のリリース済みエントリの変更、検査不能）は
+    //   再実行しても残るので、worker の出力を破棄して完了にする（処理済み位置を進め、止まり続けない）。
+    // - ソフト違反（利用者設定の上限・必須見出し）は、警告を記録したうえで commit・push する。
     let editable: Vec<String> = state["before"]
         .as_object()
         .ok_or(crate::t!("maint.state_field_invalid", field = "before"))?
@@ -3503,25 +3725,65 @@ pub fn publish_locked_with(
         .cloned()
         .collect();
     let resolved = options.resolved_kinds();
-    if let Some(e) = crate::kinds::limit_error(root, &resolved, &editable) {
-        return fail(path, &mut state, crate::t!("maint.kept_all", error = e));
+    let mut hard = agents_size_error(root, &size_dirs, true);
+    let violations = crate::kinds::check_documents(root, &resolved, &editable);
+    if hard.is_none()
+        && let Some(v) = violations.iter().find(|v| !v.is_soft())
+    {
+        hard = Some(crate::kinds::violations_message(std::slice::from_ref(v)));
     }
-    // CHANGELOG のリリース済みエントリ不変の検査（上限検査と同じ扱い・同じ位置。権限モードに関係なく通る）。
+    // CHANGELOG のリリース済みエントリ不変の検査（権限モードに関係なく通る）。
     // 編集前の内容は保守開始時の HEAD（`state.head`）の CHANGELOG.md。記録のハッシュが null なら新規作成で、
     // 上限と必須見出しの検査だけになる。CHANGELOG の種類が無い・編集を許していないときは git を呼ばない。
-    if let Some(kind) = crate::changelog::changelog_kind(&resolved)
+    if hard.is_none()
+        && let Some(kind) = crate::changelog::changelog_kind(&resolved)
         && let Some(rel) = crate::changelog::find_changelog_path(&editable)
     {
         let existed = !state["before"][rel.as_str()].is_null();
-        if let Some(e) = crate::changelog::check_released_entries(
+        hard = crate::changelog::check_released_entries(
             root,
             rel,
             &s(&state, "head"),
             Some(existed),
             kind,
-        ) {
-            return fail(path, &mut state, crate::t!("maint.kept_all", error = e));
+        );
+    }
+    if let Some(e) = hard {
+        let kept = discard_outputs(root, &state);
+        if kept.is_empty() {
+            // 全部戻したので、記録も変更前の内容に揃える（後続の完了確認で「変わった」と見なさない）。
+            state["after"] = state["before"].clone();
         }
+        let mut message = crate::t!("maint.output_discarded", error = e);
+        if !kept.is_empty() {
+            message = crate::t!(
+                "maint.join_sentences",
+                first = message,
+                second = crate::t!(
+                    "maint.discard_kept",
+                    paths = kept.join(crate::t!("list.separator"))
+                )
+            );
+        }
+        state["discarded"] = json!(message);
+        push_note(&mut state, message);
+        state["phase"] = json!("complete");
+        state["error"] = Value::Null;
+        save_publication(path, &mut state)?;
+        return Ok(None);
+    }
+    if !violations.is_empty() {
+        let message = crate::t!(
+            "maint.limit_committed_over",
+            problems = violations
+                .iter()
+                .map(crate::kinds::Violation::message)
+                .collect::<Vec<_>>()
+                .join(crate::t!("list.separator"))
+        );
+        state["limit_warning"] = json!(message);
+        state["warning"] = json!(message);
+        push_note(&mut state, message);
     }
     let before = state["before"]
         .as_object()

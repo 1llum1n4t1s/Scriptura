@@ -299,6 +299,10 @@ pub struct KindSettings {
     /// 保守後に存在を検査する見出し（20 件以内）。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub required_headings: Vec<String>,
+    /// 上限を超える詳細を移してよい分割先ディレクトリ（既定は `docs/<id>`。上限を設定した種類だけで有効）。
+    /// 1.0.5 以前はこの項目を読めない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<Timing>,
     /// changelog 専用の表。
