@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-11-20
+
+### Changed
+
+- **hook の起動タイミングを変えた**。毎ターン動く Stop をやめ、`git push` の直後（`PostToolUse` / `PostToolUseFailure`。Bash と PowerShell。`git` コマンドに `push` を含むときだけ起動する）と、セッションの開始・再開時（`SessionStart`。Claude Code の外で行った push や取りこぼしの回収）に動く。保守中に別の push があっても見送らず、保守が終わるのを最大 25 分待ってから処理する。Codex の hook から渡される入力の形（`tool_input.command` が配列など）にも対応し、push を含まないコマンドは状態を作らずすぐ終わる。旧版の Stop の登録は、Setup 版は更新時に、単独 `install`・手作業で `connect` した場合は最初に Stop で呼ばれたときに、新しい登録へ自動で置き換える（置き換える前の settings.json を `settings.json.scriptura-migration-backup` へ退避し、他のツールの hook は残す。プラグインを有効にしているときは Scriptura 自身の hook を外すだけ）。`connect claude-code --json` は `event` の代わりに `events`（配列）を返し、`doctor` は旧 Stop 登録が残っていれば再登録を案内する。
+- AGENTS 系の文書の階層合計（親から子までの AGENTS.md / AGENTS.override.md の合計）が 30,000 バイトを超えているときは、worker に構成ファイルごとのサイズ・編集できるか・削る量を数値で伝えて縮めさせる（最大 3 回。縮まなければ打ち切る）。push の前から超えていた場合は、最初の指示でも縮めることを必須の作業として伝える。それでも収まらなければ commit せず、削るべきファイルとバイト数、編集できなかった理由を通知する。
+
+### Fixed
+
+- AGENTS の階層合計が上限を超えたとき、再実行せずに worker の出力をすべて破棄していた問題を直した。
+- 出力を破棄して元に戻すとき、`core.autocrlf=true` の環境で改行が CRLF に変わり、git 上「変更あり」になって次の保守でその文書が編集できなくなる問題を直した。元に戻した内容が保守前と一致することを確かめる。
+
 ## [1.0.7] - 2026-11-20
 
 ### Changed
