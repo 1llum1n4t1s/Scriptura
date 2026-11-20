@@ -47,12 +47,38 @@ fn fm_value<'a>(fm: &'a [String], key: &str) -> Option<&'a str> {
 #[test]
 fn hooks_json_uses_async_exec_form() {
     let v = read_json(&plugin_dir().join("hooks/hooks.json"));
-    let h = &v["hooks"]["Stop"][0]["hooks"][0];
-    assert_eq!(h["type"], "command");
-    assert_eq!(h["command"], "${CLAUDE_PLUGIN_ROOT}/bin/scriptura");
-    assert_eq!(h["args"], serde_json::json!(["hook"]));
-    assert_eq!(h["async"], true);
-    assert!(h["timeout"].as_u64().unwrap() >= 1500);
+    // 毎ターン発火する Stop は使わない（git push 直後の PostToolUse とセッション開始時の SessionStart だけ）。
+    assert!(v["hooks"].get("Stop").is_none());
+    let mut all: Vec<&Value> = Vec::new();
+    // PostToolUse・PostToolUseFailure（push のあとに後段が失敗したコマンド）: ツールごとの項目に、`if` を持つ hook を 1 つ。
+    // 条件は settings.json へ登録するものと同じ。
+    for event in ["PostToolUse", "PostToolUseFailure"] {
+        let post = v["hooks"][event].as_array().unwrap();
+        assert_eq!(post.len(), scriptura::connect::PUSH_RULES.len(), "{event}");
+        for (entry, (matcher, condition)) in post.iter().zip(scriptura::connect::PUSH_RULES) {
+            assert_eq!(entry["matcher"], matcher);
+            let hooks = entry["hooks"].as_array().unwrap();
+            assert_eq!(hooks.len(), 1);
+            assert_eq!(hooks[0]["if"], condition);
+            all.push(&hooks[0]);
+        }
+    }
+    let start = v["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(start.len(), 1);
+    assert_eq!(
+        start[0]["matcher"],
+        scriptura::connect::SESSION_START_MATCHER
+    );
+    assert_eq!(start[0]["hooks"].as_array().unwrap().len(), 1);
+    assert!(start[0]["hooks"][0].get("if").is_none());
+    all.push(&start[0]["hooks"][0]);
+    for h in all {
+        assert_eq!(h["type"], "command");
+        assert_eq!(h["command"], "${CLAUDE_PLUGIN_ROOT}/bin/scriptura");
+        assert_eq!(h["args"], serde_json::json!(["hook"]));
+        assert_eq!(h["async"], true);
+        assert!(h["timeout"].as_u64().unwrap() >= 1500);
+    }
     // フックが参照するランチャーが実在する。
     assert!(plugin_dir().join("bin/scriptura").is_file());
 }

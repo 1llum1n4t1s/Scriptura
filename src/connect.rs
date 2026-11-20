@@ -1,7 +1,9 @@
 // Claude Code の settings.json へ Scriptura の hook を登録・解除する。
 //
 // 既定では登録内容を表示するだけで、--apply を付けたときだけ書き込む。
-// 登録するのは Stop hook（push 後の文書保守）。コマンドは導入先の固定の実行ファイルを指す。
+// 登録するのは「git push の直後」（PostToolUse と、後段が失敗したときの PostToolUseFailure。Bash・PowerShell ツールで `push` を含むコマンドだけ）と
+// 「セッション開始時」（SessionStart。取りこぼしの回収）の hook。毎ターン発火する旧登録の Stop hook は
+// 新しく登録せず、`--apply` と Setup 版の登録が外して置き換える。コマンドは導入先の固定の実行ファイルを指す。
 // 既存の保守 hook（従来の agents-maintenance.ts や旧 Codex 版を呼ぶ項目）だけを置き換え、
 // ほかの設定は保つ。壊れた settings.json は書き換えずに止め、最初の変更前に元の内容を退避する。
 //
@@ -19,7 +21,37 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const EVENT: &str = "Stop";
+/// 旧登録（v1.0.7 まで）のイベント。毎ターン発火して頻度が高すぎるため新しい登録では使わない。
+/// 旧登録の検出・移行・解除のためだけに読む（`handle_hook` も旧登録の互換で受け付け続ける）。
+const LEGACY_EVENT: &str = "Stop";
+const POST_TOOL_USE: &str = "PostToolUse";
+/// ツールが非 0 で終わったときのイベント。`git push && gh pr create` のように push のあとで失敗するコマンドは
+/// PostToolUse ではなくこちらになるので、同じ条件で登録する。
+const POST_TOOL_USE_FAILURE: &str = "PostToolUseFailure";
+const SESSION_START: &str = "SessionStart";
+/// Scriptura の hook を探す・外す対象のイベント（旧登録を含む）。
+const EVENTS: [&str; 4] = [
+    LEGACY_EVENT,
+    POST_TOOL_USE,
+    POST_TOOL_USE_FAILURE,
+    SESSION_START,
+];
+/// 登録するイベント（出力用）。
+const REGISTERED_EVENTS: [&str; 3] = [POST_TOOL_USE, POST_TOOL_USE_FAILURE, SESSION_START];
+
+/// push 直後に発火させる hook の条件。`(ツール名の matcher, `if`（権限ルール。1 つの `if` に 1 ルール）)`。
+///
+/// `*` は空白を含む任意の文字列（空も含む。`echo push` に `* push*` が一致することを実機で確認済み）に一致し、
+/// 位置は問わない。`git` で始めると RTK の書き換え（`rtk git push`）や `git -C <path> push` を取りこぼすため、
+/// `push` の語だけで絞り、末尾の `*` で引用の終端（`bash -lc 'git push'`）や引数あり・なしの両方を 1 本で拾う。
+/// 先頭の `VAR=value` と `timeout` などのラッパーは Claude Code が外して判定し、`&&` でつないだ各コマンドも個別に判定する。
+/// `echo push x` のような誤検出は、hook が新しい push を見つけなければ何もしないので害がない。
+pub const PUSH_RULES: [(&str, &str); 2] = [
+    ("Bash", "Bash(* push*)"),
+    ("PowerShell", "PowerShell(* push*)"),
+];
+/// セッション開始時の hook の matcher（`startup` と `resume`。`clear`・`compact` では回収しない）。
+pub const SESSION_START_MATCHER: &str = "startup|resume";
 // 従来の登録（agents-maintenance.ts）と同じく、worker のタイムアウト（1200 秒）より長く取り、非同期で動かす。
 const TIMEOUT: u64 = 1800;
 
@@ -62,6 +94,7 @@ fn hook_executable(hook: &Value) -> Option<&str> {
 /// macOS・Linux は大小を区別する（別のファイルを取り違えない）。
 fn normalize_executable(text: &str) -> String {
     let text = text.replace('\\', "/");
+    let text = text.strip_prefix("//?/").unwrap_or(&text).to_string();
     if cfg!(windows) {
         text.to_lowercase()
     } else {
@@ -120,12 +153,14 @@ fn is_maintenance_hook(hook: &Value, own: Option<&Path>) -> bool {
 /// settings.json の要約（status・doctor・引数なし起動の案内と、Setup 版の登録判断に使う）。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SettingsScan {
-    /// Scriptura 自身の Stop hook がある（どの導入のものでも）。
+    /// Scriptura 自身の hook がある（どの導入のものでも。新旧のイベントを含む）。
     pub scriptura_hook: bool,
-    /// `own` を完全パス一致で指す Stop hook がある。
+    /// `own` を完全パス一致で指す hook がある（新旧のイベントを含む）。
     pub own_hook: bool,
     /// 旧 agents-maintenance の Stop hook がある。
     pub legacy_hook: bool,
+    /// Scriptura 自身の旧登録（Stop hook。毎ターン発火する）が残っている（どの導入のものでも）。
+    pub old_stop_hook: bool,
     /// scriptura プラグインが有効（`enabledPlugins` の `scriptura@*` が true）。
     pub plugin_enabled: bool,
 }
@@ -144,11 +179,14 @@ pub fn scan_settings(settings: &Value, own: Option<&Path>) -> SettingsScan {
         plugin_enabled: plugin_enabled(settings),
         ..SettingsScan::default()
     };
-    for entry in settings["hooks"][EVENT].as_array().into_iter().flatten() {
-        for hook in entry["hooks"].as_array().into_iter().flatten() {
-            scan.scriptura_hook |= is_scriptura_hook_with(hook, own);
-            scan.own_hook |= own.is_some_and(|own| hook_points_at(hook, own));
-            scan.legacy_hook |= is_legacy_hook(hook);
+    for event in EVENTS {
+        for entry in settings["hooks"][event].as_array().into_iter().flatten() {
+            for hook in entry["hooks"].as_array().into_iter().flatten() {
+                scan.old_stop_hook |= event == LEGACY_EVENT && is_scriptura_hook_with(hook, own);
+                scan.scriptura_hook |= is_scriptura_hook_with(hook, own);
+                scan.own_hook |= own.is_some_and(|own| hook_points_at(hook, own));
+                scan.legacy_hook |= is_legacy_hook(hook);
+            }
         }
     }
     scan
@@ -161,7 +199,7 @@ pub fn read_settings_scan(path: &Path, own: Option<&Path>) -> SettingsScan {
         .unwrap_or_default()
 }
 
-/// settings から Scriptura 自身の Stop hook だけを取り除き、取り除いた個数を返す（冪等）。
+/// settings から Scriptura 自身の hook（旧登録の Stop hook を含む）だけを取り除き、取り除いた個数を返す（冪等）。
 /// 1 つの項目に別の hook が同居していれば、その項目は Scriptura の hook だけを抜いて残す。
 /// agents-maintenance の項目は対象外（`connect claude-code --apply` が置き換える）。
 pub fn remove_hooks(settings: &mut Value) -> Result<usize, String> {
@@ -179,27 +217,58 @@ pub fn remove_hooks_pointing_at(settings: &mut Value, executable: &Path) -> Resu
     remove_hooks_matching(settings, &|hook| hook_points_at(hook, executable))
 }
 
-/// 条件に合う Stop hook を hook 単位で取り除く共通部分。
-fn remove_hooks_matching(
-    settings: &mut Value,
-    matches: &dyn Fn(&Value) -> bool,
-) -> Result<usize, String> {
+/// settings の `hooks` から、新旧すべてのイベントの項目を取り出す（検査だけで書き換えない）。
+/// settings が JSON オブジェクトでない・`hooks` がオブジェクトでない・イベントの値が配列でないときはエラー。
+fn read_lists(settings: &Value) -> Result<Vec<(&'static str, Vec<Value>)>, String> {
     if !settings.is_object() {
         return Err(crate::t!("connect.settings_not_object").into());
     }
-    let Some(hooks) = settings.get("hooks") else {
-        return Ok(0);
-    };
-    if !hooks.is_object() {
+    let hooks = settings.get("hooks");
+    if hooks.is_some_and(|h| !h.is_object()) {
         return Err(crate::t!("connect.hooks_not_object").into());
     }
-    let entries = match hooks.get(EVENT) {
-        None => return Ok(0),
-        Some(Value::Array(items)) => items.clone(),
-        Some(_) => {
-            return Err(crate::t!("connect.stop_not_array").into());
+    EVENTS
+        .iter()
+        .map(|event| match hooks.and_then(|h| h.get(*event)) {
+            None => Ok((*event, Vec::new())),
+            Some(Value::Array(items)) => Ok((*event, items.clone())),
+            Some(_) => Err(crate::t!("connect.event_not_array", event = *event).into()),
+        })
+        .collect()
+}
+
+/// イベントごとの項目を settings へ書き戻す。変わらなかったイベントには触れず、空になったイベントと
+/// 空になった `hooks` は残さない（登録前の形へ戻す）。
+fn write_lists(settings: &mut Value, lists: Vec<(&'static str, Vec<Value>)>) {
+    for (event, entries) in lists {
+        let current = settings["hooks"][event]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if current == entries {
+            continue;
         }
-    };
+        if entries.is_empty() {
+            if let Some(obj) = settings["hooks"].as_object_mut() {
+                obj.remove(event);
+            }
+        } else {
+            if settings.get("hooks").is_none() {
+                settings["hooks"] = json!({});
+            }
+            settings["hooks"][event] = Value::Array(entries);
+        }
+    }
+    if settings["hooks"].as_object().is_some_and(|o| o.is_empty())
+        && let Some(obj) = settings.as_object_mut()
+    {
+        obj.remove("hooks");
+    }
+}
+
+/// 項目から条件に合う hook を hook 単位で外し、外した個数を返す。1 つの項目に別の hook が同居していれば
+/// その hook は残し、条件に合う hook だけだった項目は丸ごと落とす。
+fn strip(entries: Vec<Value>, matches: &dyn Fn(&Value) -> bool) -> (Vec<Value>, usize) {
     let mut removed = 0;
     let mut kept = Vec::new();
     for mut entry in entries {
@@ -209,7 +278,6 @@ fn remove_hooks_matching(
             if rest.len() != before {
                 removed += before - rest.len();
                 if rest.is_empty() {
-                    // Scriptura の hook だけだった項目は丸ごと落とす。
                     continue;
                 }
                 entry["hooks"] = Value::Array(rest);
@@ -217,82 +285,78 @@ fn remove_hooks_matching(
         }
         kept.push(entry);
     }
-    if removed == 0 {
-        return Ok(0);
+    (kept, removed)
+}
+
+/// 条件に合う hook を、新旧すべてのイベントから hook 単位で取り除く共通部分。
+fn remove_hooks_matching(
+    settings: &mut Value,
+    matches: &dyn Fn(&Value) -> bool,
+) -> Result<usize, String> {
+    let mut removed = 0;
+    let mut lists = Vec::new();
+    for (event, entries) in read_lists(settings)? {
+        let (kept, count) = strip(entries, matches);
+        removed += count;
+        lists.push((event, kept));
     }
-    if kept.is_empty() {
-        // 空になった Stop / hooks を残さない（登録前の形へ戻す）。
-        if let Some(obj) = settings["hooks"].as_object_mut() {
-            obj.remove(EVENT);
-            if obj.is_empty() {
-                settings.as_object_mut().map(|o| o.remove("hooks"));
-            }
-        }
-    } else {
-        settings["hooks"][EVENT] = Value::Array(kept);
+    if removed > 0 {
+        write_lists(settings, lists);
     }
     Ok(removed)
 }
 
 /// settings の値へ hook を統合する（何度実行しても同じ結果になる）。
+/// 保守 hook（Scriptura・agents-maintenance）を新旧すべてのイベントから外し、新しい登録を末尾へ足す。
+/// 旧登録の Stop hook はここで外れる（移行）。
 pub fn merge_hooks(settings: &mut Value, executable: &Path) -> Result<(), String> {
-    if !settings.is_object() {
-        return Err("Claude Code settings must be a JSON object; it was not changed.".into());
-    }
-    if settings.get("hooks").is_none() {
-        settings["hooks"] = json!({});
-    }
-    if !settings["hooks"].is_object() {
-        return Err(
-            "Claude Code settings has a non-object \"hooks\" value; it was not changed.".into(),
-        );
-    }
-    let mut entries = match settings["hooks"].get(EVENT) {
-        None => Vec::new(),
-        Some(Value::Array(items)) => items.clone(),
-        Some(_) => {
-            return Err(
-                "Claude Code settings has a non-array hooks.Stop value; it was not changed.".into(),
-            );
+    let groups = desired_groups(executable)?;
+    let mut lists = Vec::new();
+    for (event, entries) in read_lists(settings)? {
+        let (mut kept, _) = strip(entries, &|h| is_maintenance_hook(h, Some(executable)));
+        if let Some((_, add)) = groups.iter().find(|(e, _)| *e == event) {
+            kept.extend(add.iter().cloned());
         }
-    };
-    // 保守 hook だけを hook 単位で外す。1 つの項目に別の hook が同居していれば、その hook は残す
-    // （`remove_hooks` と同じ扱い）。保守 hook だけだった項目は丸ごと落とす。再実行しても同じ結果になる。
-    entries = entries
-        .into_iter()
-        .filter_map(|mut entry| {
-            let Some(list) = entry["hooks"].as_array() else {
-                return Some(entry);
-            };
-            let rest: Vec<Value> = list
-                .iter()
-                .filter(|h| !is_maintenance_hook(h, Some(executable)))
-                .cloned()
-                .collect();
-            if rest.len() == list.len() {
-                return Some(entry);
-            }
-            if rest.is_empty() {
-                return None;
-            }
-            entry["hooks"] = Value::Array(rest);
-            Some(entry)
-        })
-        .collect();
-    entries.push(json!({"hooks":[desired_hook(executable)?]}));
-    settings["hooks"][EVENT] = Value::Array(entries);
+        lists.push((event, kept));
+    }
+    write_lists(settings, lists);
     Ok(())
 }
 
-/// 登録する hook 1 つの定義（`merge_hooks` と Setup 版の登録で共有する）。
-fn desired_hook(executable: &Path) -> Result<Value, String> {
-    Ok(json!({
+/// 登録する hook 1 つの定義。`condition` は `if`（権限ルール）で、無ければ付けない。
+fn desired_hook(command: &str, condition: Option<&str>) -> Value {
+    let mut hook = json!({
         "type":"command",
-        "command": hook_command(executable)?,
+        "command": command,
         "timeout": TIMEOUT,
         "statusMessage": crate::t!("connect.status_message"),
         "async": true
-    }))
+    });
+    if let Some(condition) = condition {
+        hook["if"] = json!(condition);
+    }
+    hook
+}
+
+/// 登録する項目（`merge_hooks` と Setup 版の登録で共有する）。イベントごとの項目の並び。
+/// PostToolUse・PostToolUseFailure はツールごとの項目に、`if` を持つ hook を 1 つ置く。
+fn desired_groups(executable: &Path) -> Result<Vec<(&'static str, Vec<Value>)>, String> {
+    let command = hook_command(executable)?;
+    let push: Vec<Value> = PUSH_RULES
+        .iter()
+        .map(|(matcher, condition)| {
+            json!({"matcher": matcher, "hooks": [desired_hook(&command, Some(condition))]})
+        })
+        .collect();
+    let start = vec![json!({
+        "matcher": SESSION_START_MATCHER,
+        "hooks": [desired_hook(&command, None)]
+    })];
+    Ok(vec![
+        (POST_TOOL_USE, push.clone()),
+        (POST_TOOL_USE_FAILURE, push),
+        (SESSION_START, start),
+    ])
 }
 
 /// Setup 版の登録で settings の値へ hook を統合する。変えたら true（何度実行しても同じ結果になる）。
@@ -300,68 +364,30 @@ fn desired_hook(executable: &Path) -> Result<Value, String> {
 /// `merge_hooks`（`connect claude-code --apply`）との違い:
 /// - **Scriptura 自身の hook だけ**を置き換える。従来の agents-maintenance の hook は置き換えない
 ///   （利用者の自作の仕組みを Setup が勝手に外さないため。案内だけして `connect claude-code --apply` に任せる）。
-/// - 既に自分（`executable`）を指す hook があれば、その位置のまま定義だけを最新にする（並び順を変えない）。
-///   自分を指す hook が複数あれば最初の 1 つだけを残す。
+/// - 既に Scriptura の hook があるイベントでは、最初に見つかった項目の位置へ新しい登録を置く（並び順を変えない）。
 /// - 別の導入（旧単独導入 `Programs\Scriptura\bin\scriptura.exe`、プラグイン同梱の実行ファイル、旧 AppImage など）を
-///   指す Scriptura の hook は取り除く（二重実行を防ぐ。旧ファイル自体は消さない）。
+///   指す Scriptura の hook も取り除く（二重実行を防ぐ。旧ファイル自体は消さない）。
+/// - 旧登録の Stop hook は外すだけで、Stop には新しく登録しない（移行）。
 pub fn merge_setup_hooks(settings: &mut Value, executable: &Path) -> Result<bool, String> {
-    if !settings.is_object() {
-        return Err("Claude Code settings must be a JSON object; it was not changed.".into());
-    }
-    if settings.get("hooks").is_some_and(|h| !h.is_object()) {
-        return Err(
-            "Claude Code settings has a non-object \"hooks\" value; it was not changed.".into(),
-        );
-    }
-    let entries = match settings.get("hooks").and_then(|h| h.get(EVENT)) {
-        None => Vec::new(),
-        Some(Value::Array(items)) => items.clone(),
-        Some(_) => {
-            return Err(
-                "Claude Code settings has a non-array hooks.Stop value; it was not changed.".into(),
-            );
-        }
-    };
-    let desired = desired_hook(executable)?;
+    let groups = desired_groups(executable)?;
     let before = settings.clone();
-    let mut placed = false;
-    let mut kept = Vec::new();
-    for mut entry in entries {
-        let Some(list) = entry["hooks"].as_array().cloned() else {
-            kept.push(entry);
+    let is_own = |h: &Value| is_scriptura_hook_with(h, Some(executable));
+    let mut lists = Vec::new();
+    for (event, entries) in read_lists(settings)? {
+        let Some((_, add)) = groups.iter().find(|(e, _)| *e == event) else {
+            lists.push((event, strip(entries, &is_own).0));
             continue;
         };
-        let mut rest = Vec::new();
-        let mut touched = false;
-        for hook in list {
-            if hook_points_at(&hook, executable) {
-                touched = true;
-                if !placed {
-                    placed = true;
-                    rest.push(desired.clone());
-                }
-            } else if is_scriptura_hook_with(&hook, Some(executable)) {
-                touched = true;
-            } else {
-                rest.push(hook);
-            }
-        }
-        if touched {
-            if rest.is_empty() {
-                // Scriptura の hook だけだった項目は丸ごと落とす。
-                continue;
-            }
-            entry["hooks"] = Value::Array(rest);
-        }
-        kept.push(entry);
+        // 最初に Scriptura の hook を含んでいた項目より前は変わらないので、その位置へ新しい項目を差し込む。
+        let first = entries
+            .iter()
+            .position(|e| e["hooks"].as_array().is_some_and(|l| l.iter().any(is_own)));
+        let (mut kept, _) = strip(entries, &is_own);
+        let at = first.unwrap_or(kept.len()).min(kept.len());
+        kept.splice(at..at, add.iter().cloned());
+        lists.push((event, kept));
     }
-    if !placed {
-        kept.push(json!({"hooks":[desired]}));
-    }
-    if settings.get("hooks").is_none() {
-        settings["hooks"] = json!({});
-    }
-    settings["hooks"][EVENT] = Value::Array(kept);
+    write_lists(settings, lists);
     Ok(*settings != before)
 }
 
@@ -371,7 +397,7 @@ pub enum SetupRegistration {
     /// 自分を指す hook を登録した（`changed` は settings.json を書き換えたか）。
     Registered { changed: bool, legacy_hook: bool },
     /// scriptura プラグインが有効なため、登録しなかった。`removed` は二重実行を防ぐために settings.json から
-    /// 外した Scriptura 自身の Stop hook の個数（旧単独導入・Setup 版自身のもの。プラグイン自身の hook は
+    /// 外した Scriptura 自身の hook の個数（新旧のイベントの、旧単独導入・Setup 版自身のもの。プラグイン自身の hook は
     /// settings.json にはなく、agents-maintenance は対象外）。
     Plugin { legacy_hook: bool, removed: usize },
     /// 更新後の確認で、自分を指す hook が無かった（利用者が外した。戻さない）。
@@ -380,7 +406,7 @@ pub enum SetupRegistration {
     Failed(String),
 }
 
-/// Setup 版の登録。プラグインが有効なら登録せず、二重実行を防ぐために Scriptura 自身の Stop hook を外して
+/// Setup 版の登録。プラグインが有効なら登録せず、二重実行を防ぐために Scriptura 自身の hook（新旧のイベント）を外して
 /// `Plugin`（外す対象と条件は `remove_hooks_with` と同じ。agents-maintenance・他ツールの hook は残す）。
 /// それ以外は `merge_setup_hooks` で統合する。壊れた settings.json は書き換えずに `Failed`。
 pub fn register_for_setup(path: &Path, executable: &Path) -> SetupRegistration {
@@ -391,7 +417,7 @@ pub fn register_for_setup(path: &Path, executable: &Path) -> SetupRegistration {
     let scan = scan_settings(&settings, Some(executable));
     if scan.plugin_enabled {
         // プラグインの hook は `${CLAUDE_PLUGIN_ROOT}/bin/scriptura` を呼ぶプラグイン側の定義で、settings.json には
-        // 無い。settings.json にある Scriptura の Stop hook（旧単独導入・Setup 版自身）は、プラグインと二重に
+        // 無い。settings.json にある Scriptura の hook（旧 Stop 登録・旧単独導入・Setup 版自身）は、プラグインと二重に
         // 実行されるので外す。書き換えは他の登録と同じ（最初に退避・一時ファイルから rename）で、
         // 1 つも外さなければ何も書かない。
         return match remove_hooks_with(&mut settings, Some(executable)) {
@@ -464,6 +490,112 @@ pub fn unregister_for_setup(path: &Path, executable: &Path) -> String {
         Ok(removed) => format!("claude: {removed} hook(s) removed"),
         Err(error) => format!("claude: failed: {error}"),
     }
+}
+
+/// 旧登録（Stop hook）の自動移行。`scriptura hook` が Stop イベントで呼ばれたとき（= 旧登録が残っている証拠）に
+/// `maintenance::run` が呼ぶ。対象はユーザー単位の settings.json（`settings_path`。`CLAUDE_CONFIG_DIR` を尊重）だけで、
+/// プロジェクトの `.claude/settings*.json` は触らない。移行したときだけ、利用者へ知らせる文を返す。
+///
+/// - Setup（Velopack）版は `app_update::registration` が移行するので何もしない（二重に書かない）。
+/// - ファイルに Scriptura 自身の Stop hook が無ければ何もしない（`--remove` した設定を戻さない。agents-maintenance だけの
+///   設定にも触れない）。ファイルが無い・壊れている・読めないときも何も作らず書き換えない。
+/// - プラグインが有効なら、新しい登録は足さず、二重実行を防ぐために settings.json の Scriptura の hook を外す
+///   （`register_for_setup` のプラグイン分岐と同じ）。
+/// - それ以外は、見つけた Stop hook の実行ファイルを指す新しい登録へ置き換える（`merge_setup_hooks`。`connect --apply`
+///   と同じ結果で、他ツールの hook・agents-maintenance は残る）。
+/// - 最初の変更前の退避・一時ファイルからの rename は `write_settings` と同じ。複数セッションの Stop が同時に来ても、
+///   一時ファイルへ書いたあと rename の直前にもう一度読んで、読んだ時点から変わっていなければだけ書く（変わっていたら次の Stop に任せる。
+///   窓を狭めるだけで完全な排他ではない）。
+/// - 移行直前の内容は、既存の退避とは別の新しい退避（`settings.json.scriptura-migration-backup[-N]`）へ必ず残す。
+/// - 新しい登録に使うのは実行中の本体で、Stop hook がそれを指すときだけ移行する（別の導入・旧版を指すものは触れない）。
+/// - ベストエフォート。失敗しても何も返さず、保守本体に影響させない。
+pub fn migrate_old_stop_registration() -> Option<String> {
+    if crate::app_update::setup_executable().is_some() {
+        return None;
+    }
+    migrate_old_stop_registration_at(&settings_path(), &std::env::current_exe().ok()?)
+}
+
+/// 移行の直前の内容を残す退避ファイル名（既存の `settings.json.scriptura-backup` は最初の変更前の内容を持つので
+/// 上書きしない。移行用には別名で、既にあれば連番を付けて必ず新しく作る）。
+fn migration_backup_path(path: &Path) -> Option<PathBuf> {
+    (1u32..1000).find_map(|n| {
+        let name = if n == 1 {
+            "settings.json.scriptura-migration-backup".to_string()
+        } else {
+            format!("settings.json.scriptura-migration-backup-{n}")
+        };
+        let candidate = path.with_file_name(name);
+        (!candidate.exists()).then_some(candidate)
+    })
+}
+
+/// 移行用の書き込み。一時ファイル（プロセス ID つき）へ書き、rename の直前にもう一度読んで読んだ時点
+/// （`original`）から変わっていないことを確かめ（変わっていたら何も書かず None。次の Stop に任せる）、移行直前の内容を
+/// 新しい退避へ複製してから rename する。同時に書かれる窓を狭めるだけで、完全な排他ではない。退避のファイル名を返す。
+fn write_migrated_settings(path: &Path, original: &Value, next: &Value) -> Option<String> {
+    let mut bytes = serde_json::to_vec_pretty(next).ok()?;
+    bytes.push(b'\n');
+    let temporary = path.with_file_name(format!(
+        ".settings.json.scriptura.{}.tmp",
+        std::process::id()
+    ));
+    let done = (|| -> Option<String> {
+        fs::write(&temporary, bytes).ok()?;
+        if &read_settings(path).ok()? != original {
+            return None;
+        }
+        let backup = migration_backup_path(path)?;
+        let mut source = fs::File::open(path).ok()?;
+        let mut target = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+            .ok()?;
+        std::io::copy(&mut source, &mut target).ok()?;
+        fs::rename(&temporary, path).ok()?;
+        Some(backup.file_name()?.to_string_lossy().into_owned())
+    })();
+    if done.is_none() {
+        let _ = fs::remove_file(&temporary);
+    }
+    done
+}
+
+/// `migrate_old_stop_registration` の本体（settings.json の場所と、実行中の本体を引数にして単体で試せるようにしている）。
+/// 新しい登録に使うのは実行中の本体（`executable`）で、Stop hook がそれを完全パス一致で指すときだけ移行する
+/// （別の導入・旧版を指す hook から、実行中の本体へ黙って付け替えない。`rtk <exe> hook` のような前置き付きや
+/// チルダ付きの記述を、引用で壊さない）。プラグイン有効時は外すだけで、実行ファイルは使わない。
+pub fn migrate_old_stop_registration_at(path: &Path, executable: &Path) -> Option<String> {
+    let settings = read_settings(path).ok()?;
+    let scan = scan_settings(&settings, None);
+    if !scan.old_stop_hook {
+        return None;
+    }
+    let mut next = settings.clone();
+    let plugin = scan.plugin_enabled;
+    if plugin {
+        remove_hooks_with(&mut next, None).ok()?;
+    } else {
+        let points_at_us = settings["hooks"][LEGACY_EVENT]
+            .as_array()?
+            .iter()
+            .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
+            .any(|hook| hook_points_at(hook, executable));
+        if !points_at_us {
+            return None;
+        }
+        merge_setup_hooks(&mut next, executable).ok()?;
+    }
+    if next == settings {
+        return None;
+    }
+    let backup = write_migrated_settings(path, &settings, &next)?;
+    Some(if plugin {
+        crate::t!("connect.stop_removed_for_plugin", backup = backup)
+    } else {
+        crate::t!("connect.stop_migrated", backup = backup)
+    })
 }
 
 /// settings.json を読む。無ければ空のオブジェクト。壊れていれば書き換えずにエラーにする。
@@ -540,7 +672,7 @@ pub fn run(args: &[String]) -> Result<Value, String> {
         let removed = remove_hooks_with(&mut settings, own.as_deref())?;
         let mut result = json!({
             "ok":true,"tool":"claude-code","applied":apply,"remove":true,"settings":path,
-            "event":EVENT,"removed":removed,"changed":settings != before
+            "events":EVENTS,"removed":removed,"changed":settings != before
         });
         if apply
             && settings != before
@@ -566,7 +698,7 @@ pub fn run(args: &[String]) -> Result<Value, String> {
     merge_hooks(&mut settings, &executable)?;
     let mut result = json!({
         "ok":true,"tool":"claude-code","applied":apply,"executable":executable,"settings":path,
-        "event":EVENT,"command":hook_command(&executable)?,"changed":settings != before
+        "events":REGISTERED_EVENTS,"command":hook_command(&executable)?,"changed":settings != before
     });
     if apply
         && settings != before
@@ -603,19 +735,42 @@ mod tests {
             settings["hooks"]["Notification"][0]["hooks"][0]["command"],
             "notify"
         );
+        // agents-maintenance だけが外れ、他ツールの Stop hook は残る。Scriptura は Stop に登録しない。
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 2);
+        assert_eq!(stop.len(), 1);
         assert_eq!(
             stop[0]["hooks"][0]["command"],
             "\"C:/x/remnifold.exe\" hook Stop"
         );
-        assert!(
-            stop[1]["hooks"][0]["command"]
-                .as_str()
-                .unwrap()
-                .ends_with("scriptura.exe\" hook")
-        );
-        assert_eq!(stop[1]["hooks"][0]["timeout"], TIMEOUT);
+        assert_new_registration(&settings);
+    }
+
+    /// 新しい登録（PostToolUse・PostToolUseFailure の Bash・PowerShell と SessionStart）が 1 組だけある。
+    fn assert_new_registration(settings: &Value) {
+        for event in ["PostToolUse", "PostToolUseFailure"] {
+            let post = settings["hooks"][event].as_array().unwrap();
+            assert_eq!(post.len(), PUSH_RULES.len(), "{event}");
+            for (entry, (matcher, condition)) in post.iter().zip(PUSH_RULES) {
+                assert_eq!(entry["matcher"], matcher);
+                let hooks = entry["hooks"].as_array().unwrap();
+                assert_eq!(hooks.len(), 1);
+                let hook = &hooks[0];
+                let command = hook["command"].as_str().unwrap();
+                assert!(
+                    command.ends_with("scriptura.exe\" hook")
+                        || command.ends_with("scriptura\" hook")
+                );
+                assert_eq!(hook["if"], condition);
+                assert_eq!(hook["async"], true);
+                assert_eq!(hook["timeout"], TIMEOUT);
+            }
+        }
+        let start = settings["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(start.len(), 1);
+        assert_eq!(start[0]["matcher"], SESSION_START_MATCHER);
+        assert_eq!(start[0]["hooks"].as_array().unwrap().len(), 1);
+        assert!(start[0]["hooks"][0].get("if").is_none());
+        assert_eq!(start[0]["hooks"][0]["async"], true);
     }
 
     #[test]
@@ -634,12 +789,57 @@ mod tests {
         merge_hooks(&mut settings, &exe).unwrap();
         assert_eq!(settings, once);
         let stop = settings["hooks"]["Stop"].as_array().unwrap();
-        // 同居していた別 hook を残した項目 + 新しい Scriptura の項目だけ。
-        assert_eq!(stop.len(), 2);
+        // 同居していた別 hook を残した項目だけが Stop に残る（Scriptura の新しい登録は Stop に入れない）。
+        assert_eq!(stop.len(), 1);
         assert_eq!(stop[0]["matcher"], "x");
         let kept = stop[0]["hooks"].as_array().unwrap();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0]["command"], "other-tool");
+        assert_new_registration(&settings);
+    }
+
+    #[test]
+    fn merge_migrates_an_old_stop_registration_and_keeps_other_events() {
+        let exe = std::env::temp_dir().join("bin/scriptura.exe");
+        let mut settings = json!({"hooks":{
+            "Stop":[{"hooks":[{"type":"command","command":hook_command(&exe).unwrap()}]}],
+            "PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"fmt"}]}],
+            "SessionStart":[{"hooks":[{"type":"command","command":"\"C:/x/remnifold.exe\" hook SessionStart"}]}]
+        }});
+        merge_hooks(&mut settings, &exe).unwrap();
+        let once = settings.clone();
+        merge_hooks(&mut settings, &exe).unwrap();
+        assert_eq!(settings, once);
+        // 旧 Stop は外れて空になり、キーごと消える。他ツールの項目は先頭に残る。
+        assert!(settings["hooks"].get("Stop").is_none());
+        assert_eq!(settings["hooks"]["PostToolUse"][0]["matcher"], "Edit");
+        assert_eq!(
+            settings["hooks"]["PostToolUse"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(
+            settings["hooks"]["SessionStart"].as_array().unwrap().len(),
+            2
+        );
+        // 他ツールの項目を除くと、新しい登録の形になる。
+        let mut only = settings.clone();
+        only["hooks"]["PostToolUse"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        only["hooks"]["SessionStart"]
+            .as_array_mut()
+            .unwrap()
+            .remove(0);
+        assert_new_registration(&only);
+    }
+
+    #[test]
+    fn push_rules_cover_wrapped_and_unwrapped_forms() {
+        // ツールごとに 1 ルール（先頭が `*`、末尾も `*` の `push`）。引用の終端・引数あり・なしを 1 本で拾う。
+        for (matcher, condition) in PUSH_RULES {
+            assert_eq!(condition, format!("{matcher}(* push*)"));
+        }
     }
 
     #[test]
@@ -727,14 +927,26 @@ mod tests {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
     }
 
-    fn commands(settings: &Value) -> Vec<String> {
-        settings["hooks"]["Stop"]
+    fn event_commands(settings: &Value, event: &str) -> Vec<String> {
+        settings["hooks"][event]
             .as_array()
             .into_iter()
             .flatten()
             .flat_map(|e| e["hooks"].as_array().cloned().unwrap_or_default())
             .map(|h| h["command"].as_str().unwrap_or("").to_string())
             .collect()
+    }
+
+    /// Stop の hook のコマンド（旧登録と他ツールのもの）。
+    fn commands(settings: &Value) -> Vec<String> {
+        event_commands(settings, "Stop")
+    }
+
+    /// 新しい登録（PostToolUse・SessionStart）の hook のコマンド。
+    fn scriptura_commands(settings: &Value) -> Vec<String> {
+        let mut all = event_commands(settings, "PostToolUse");
+        all.extend(event_commands(settings, "SessionStart"));
+        all
     }
 
     #[test]
@@ -757,12 +969,17 @@ mod tests {
         });
         assert!(merge_setup_hooks(&mut settings, &exe).unwrap());
         let found = commands(&settings);
-        // agents-maintenance は Setup では置き換えない。旧単独導入の hook は Setup 版へ置き換わる。
+        // agents-maintenance は Setup では置き換えない。旧単独導入の hook は外れ、新しい登録が入る。
         assert!(found[0].contains("agents-maintenance"));
         assert_eq!(found[1], "other-tool");
-        assert_eq!(found.len(), 3);
-        assert_eq!(found[2], hook_command(&exe).unwrap());
+        assert_eq!(found.len(), 2);
         assert_eq!(settings["hooks"]["Stop"][1]["matcher"], "x");
+        assert_new_registration(&settings);
+        assert!(
+            scriptura_commands(&settings)
+                .iter()
+                .all(|c| *c == hook_command(&exe).unwrap())
+        );
         assert_eq!(settings["model"], "keep");
         // 冪等: もう一度統合しても変わらない。
         let once = settings.clone();
@@ -784,19 +1001,33 @@ mod tests {
             hook_command(&exe).unwrap()
         };
         let own = own.replace(" HOOK", " hook");
-        let mut settings = json!({"hooks":{"Stop":[
-            {"hooks":[{"type":"command","command":own,"timeout":5}]},
-            {"hooks":[{"type":"command","command":"notify"}]},
-            {"hooks":[{"type":"command","command":hook_command(&exe).unwrap()}]}
-        ]}});
+        let mut settings = json!({"hooks":{
+            "Stop":[
+                {"hooks":[{"type":"command","command":own.clone(),"timeout":5}]},
+                {"hooks":[{"type":"command","command":"notify"}]},
+                {"hooks":[{"type":"command","command":hook_command(&exe).unwrap()}]}
+            ],
+            "PostToolUse":[
+                {"matcher":"Edit","hooks":[{"type":"command","command":"fmt"}]},
+                {"matcher":"Bash","hooks":[{"type":"command","command":own,"timeout":5}]},
+                {"matcher":"Edit","hooks":[{"type":"command","command":"lint"}]}
+            ]
+        }});
         assert!(merge_setup_hooks(&mut settings, &exe).unwrap());
-        let stop = settings["hooks"]["Stop"].as_array().unwrap();
-        assert_eq!(stop.len(), 2, "{settings}");
-        assert_eq!(stop[0]["hooks"][0]["timeout"], TIMEOUT);
-        assert_eq!(stop[1]["hooks"][0]["command"], "notify");
+        // 旧 Stop の自分の hook は外れ、他ツールの hook は残る。
+        assert_eq!(commands(&settings), ["notify"]);
+        // 新しい登録は、Scriptura の hook が最初にあった項目の位置へ入る（他ツールの並びを変えない）。
+        let post = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 2 + PUSH_RULES.len(), "{settings}");
+        assert_eq!(post[0]["hooks"][0]["command"], "fmt");
+        assert_eq!(post[1]["matcher"], "Bash");
+        assert_eq!(post[2]["matcher"], "PowerShell");
+        assert_eq!(post[3]["hooks"][0]["command"], "lint");
+        assert_eq!(post[1]["hooks"][0]["timeout"], TIMEOUT);
         assert!(!merge_setup_hooks(&mut settings, &exe).unwrap());
         assert!(merge_setup_hooks(&mut json!([]), &exe).is_err());
         assert!(merge_setup_hooks(&mut json!({"hooks":{"Stop":{}}}), &exe).is_err());
+        assert!(merge_setup_hooks(&mut json!({"hooks":{"PostToolUse":{}}}), &exe).is_err());
     }
 
     #[test]
@@ -813,7 +1044,7 @@ mod tests {
                 legacy_hook: false
             }
         );
-        assert_eq!(commands(&read(&path)), [hook_command(&exe).unwrap()]);
+        assert_new_registration(&read(&path));
         // 元のファイルが無かったので退避は作らない。
         assert!(
             !path
@@ -867,9 +1098,9 @@ mod tests {
                 legacy_hook: true
             }
         );
-        let found = commands(&read(&path));
-        assert_eq!(found.len(), 2);
-        assert!(found[0].contains("agents-maintenance"));
+        let after = read(&path);
+        assert_eq!(commands(&after), ["bun agents-maintenance.ts"]);
+        assert_new_registration(&after);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -891,6 +1122,16 @@ mod tests {
                 ]},
                 {"hooks":[{"type":"command","command":hook_command(exe).unwrap()}]},
                 {"hooks":[{"type":"command","command":"\"C:/scriptura-tools/other.exe\" hook"}]}
+            ],
+            "PostToolUse":[
+                {"matcher":"Bash","hooks":[{"type":"command","command":hook_command(exe).unwrap(),"if":"Bash(* push*)"}]},
+                {"matcher":"Edit","hooks":[{"type":"command","command":"fmt"}]}
+            ],
+            "PostToolUseFailure":[
+                {"matcher":"Bash","hooks":[{"type":"command","command":hook_command(exe).unwrap(),"if":"Bash(* push*)"}]}
+            ],
+            "SessionStart":[
+                {"matcher":"startup|resume","hooks":[{"type":"command","command":hook_command(exe).unwrap()}]}
             ]}
         })
     }
@@ -904,10 +1145,14 @@ mod tests {
             register_for_setup(&path, &exe),
             SetupRegistration::Plugin {
                 legacy_hook: true,
-                removed: 2
+                removed: 5
             }
         );
         let after = read(&path);
+        // 新しい登録（PostToolUse・SessionStart）の自分の hook も外れ、他ツールの項目は残る。
+        assert_eq!(event_commands(&after, "PostToolUse"), ["fmt"]);
+        assert!(after["hooks"].get("SessionStart").is_none());
+        assert!(after["hooks"].get("PostToolUseFailure").is_none());
         // 旧単独導入と Setup 版自身の hook だけが消える。agents-maintenance・同居の別 hook・名前だけ似た別ツール・
         // 他の設定は残る（項目の matcher も保たれる）。
         assert_eq!(
@@ -982,7 +1227,9 @@ mod tests {
             register_for_setup(&path, &exe),
             SetupRegistration::Registered { changed: true, .. }
         ));
-        assert_eq!(commands(&read(&path)), vec![hook_command(&exe).unwrap()]);
+        let written = read(&path);
+        assert_new_registration(&written);
+        assert!(written["hooks"].get("Stop").is_none());
         fs::write(&path, b"{ broken").unwrap();
         assert!(matches!(
             register_for_setup(&path, &exe),
@@ -1016,10 +1263,15 @@ mod tests {
             refresh_for_setup(&path, &exe),
             SetupRegistration::Registered { changed: true, .. }
         ));
-        assert_eq!(
-            read(&path)["hooks"]["Stop"][0]["hooks"][0]["timeout"],
-            TIMEOUT
-        );
+        // 旧登録の Stop hook は外れ、新しい登録（PostToolUse・SessionStart）へ移る。
+        let after = read(&path);
+        assert!(after["hooks"].get("Stop").is_none());
+        assert_new_registration(&after);
+        // 移行後はもう一度更新しても書き換えない。
+        assert!(matches!(
+            refresh_for_setup(&path, &exe),
+            SetupRegistration::Registered { changed: false, .. }
+        ));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -1032,16 +1284,22 @@ mod tests {
             {"hooks":[{"type":"command","command":"\"C:/Users/u/AppData/Local/Programs/Scriptura/bin/scriptura.exe\" hook"}]},
             {"hooks":[{"type":"command","command":prefix_only}]},
             {"hooks":[{"type":"command","command":"bun agents-maintenance.ts"}]}
-        ]}});
+        ],
+        "PostToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":hook_command(&exe).unwrap(),"if":"Bash(* push*)"}]}],
+        "PostToolUseFailure":[{"matcher":"Bash","hooks":[{"type":"command","command":hook_command(&exe).unwrap(),"if":"Bash(* push*)"}]}],
+        "SessionStart":[{"matcher":"startup|resume","hooks":[{"type":"command","command":hook_command(&exe).unwrap()}]}]
+        }});
         let mut settings = original.clone();
-        assert_eq!(remove_hooks_pointing_at(&mut settings, &exe).unwrap(), 1);
+        // 旧登録の Stop と新しい登録（PostToolUse・SessionStart）の自分の hook を外す。
+        assert_eq!(remove_hooks_pointing_at(&mut settings, &exe).unwrap(), 4);
         assert_eq!(commands(&settings).len(), 3);
+        assert!(scriptura_commands(&settings).is_empty());
         assert_eq!(remove_hooks_pointing_at(&mut settings, &exe).unwrap(), 0);
         // ファイル経由の解除も同じ。無いファイルは作らない。
         let path = scratch_settings(Some(&original));
         assert_eq!(
             unregister_for_setup(&path, &exe),
-            "claude: 1 hook(s) removed"
+            "claude: 4 hook(s) removed"
         );
         assert_eq!(commands(&read(&path)).len(), 3);
         assert_eq!(
@@ -1054,6 +1312,183 @@ mod tests {
             "claude: 0 hook(s) removed"
         );
         assert!(!missing.exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// 旧登録（Stop のみ）の settings。他ツールの hook・agents-maintenance を含む。
+    fn old_stop_settings(exe: &Path) -> Value {
+        json!({
+            "model":"keep",
+            "hooks":{
+                "Stop":[
+                    {"hooks":[{"type":"command","command":"bun agents-maintenance.ts"}]},
+                    {"matcher":"x","hooks":[
+                        {"type":"command","command":hook_command(exe).unwrap(),"timeout":1800,"async":true},
+                        {"type":"command","command":"other-tool"}
+                    ]}
+                ],
+                "Notification":[{"hooks":[{"type":"command","command":"notify"}]}]
+            }
+        })
+    }
+
+    #[test]
+    fn stop_migration_replaces_the_old_registration_like_connect_apply_and_is_idempotent() {
+        let exe = std::env::temp_dir().join("Scriptura App/bin/scriptura.exe");
+        let original = old_stop_settings(&exe);
+        let path = scratch_settings(Some(&original));
+        // 既に最初の退避がある典型の利用者: それは上書きせず、移行直前の内容を別の新しい退避へ残す。
+        let first = path.with_file_name("settings.json.scriptura-backup");
+        fs::write(&first, b"first backup").unwrap();
+        let message = migrate_old_stop_registration_at(&path, &exe).expect("移行の通知がある");
+        assert!(
+            message.contains("settings.json.scriptura-migration-backup"),
+            "{message}"
+        );
+        let after = read(&path);
+        assert_eq!(fs::read(&first).unwrap(), b"first backup");
+        assert_eq!(
+            read(&path.with_file_name("settings.json.scriptura-migration-backup")),
+            original
+        );
+        assert!(
+            fs::read_dir(path.parent().unwrap()).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp"))
+        );
+        assert_eq!(
+            commands(&after),
+            ["bun agents-maintenance.ts", "other-tool"]
+        );
+        assert_eq!(after["model"], "keep");
+        assert_eq!(
+            after["hooks"]["Notification"],
+            original["hooks"]["Notification"]
+        );
+        assert_new_registration(&after);
+        // `connect --apply`（merge_hooks）と同じ形（agents-maintenance を除く）になる。
+        let mut applied = original.clone();
+        merge_hooks(&mut applied, &exe).unwrap();
+        assert_eq!(
+            after["hooks"]["PostToolUse"],
+            applied["hooks"]["PostToolUse"]
+        );
+        assert_eq!(
+            after["hooks"]["PostToolUseFailure"],
+            applied["hooks"]["PostToolUseFailure"]
+        );
+        assert_eq!(
+            after["hooks"]["SessionStart"],
+            applied["hooks"]["SessionStart"]
+        );
+        // 2 回目は何もしない（通知なし・書き換えなし）。
+        assert_eq!(migrate_old_stop_registration_at(&path, &exe), None);
+        assert_eq!(read(&path), after);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn stop_migration_does_nothing_without_an_own_stop_hook_or_with_unreadable_settings() {
+        let exe = std::env::temp_dir().join("bin/scriptura.exe");
+        // 無いファイルは作らない。
+        let missing = scratch_settings(None);
+        assert_eq!(migrate_old_stop_registration_at(&missing, &exe), None);
+        assert!(!missing.exists());
+        // 自分の Stop hook が無い（agents-maintenance・他ツールだけ）。--remove 済みの設定も戻さない。
+        for value in [
+            json!({"hooks":{"Stop":[{"hooks":[{"type":"command","command":"bun agents-maintenance.ts"}]}]}}),
+            json!({"hooks":{"Stop":[{"hooks":[{"type":"command","command":"other-tool"}]}]}}),
+            json!({"model":"keep"}),
+        ] {
+            let path = scratch_settings(Some(&value));
+            assert_eq!(migrate_old_stop_registration_at(&path, &exe), None);
+            assert_eq!(read(&path), value);
+            assert!(
+                !path
+                    .with_file_name("settings.json.scriptura-backup")
+                    .exists()
+            );
+            let _ = fs::remove_dir_all(path.parent().unwrap());
+        }
+        // 新しい登録だけなら何もしない。
+        let mut fresh = json!({});
+        merge_hooks(&mut fresh, &exe).unwrap();
+        let path = scratch_settings(Some(&fresh));
+        assert_eq!(migrate_old_stop_registration_at(&path, &exe), None);
+        assert_eq!(read(&path), fresh);
+        // 壊れた JSON・オブジェクトでない値・hooks.Stop が配列でない設定は書き換えない。
+        fs::write(&path, b"{ broken").unwrap();
+        assert_eq!(migrate_old_stop_registration_at(&path, &exe), None);
+        assert_eq!(fs::read(&path).unwrap(), b"{ broken");
+        fs::write(&path, br#"{"hooks":{"Stop":{}}}"#).unwrap();
+        assert_eq!(migrate_old_stop_registration_at(&path, &exe), None);
+        assert_eq!(fs::read(&path).unwrap(), br#"{"hooks":{"Stop":{}}}"#);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn stop_migration_only_follows_a_stop_hook_that_points_at_the_running_executable() {
+        let exe = std::env::temp_dir().join("Scriptura App/bin/scriptura.exe");
+        let other = std::env::temp_dir().join("Elsewhere/bin/scriptura.exe");
+        let stop = |commands: &[String]| {
+            json!({"hooks":{"Stop":commands.iter()
+                .map(|c| json!({"hooks":[{"type":"command","command":c}]})).collect::<Vec<_>>()}})
+        };
+        // 別のパスを指す Stop hook・前置き付きの記述・チルダ付きは、実行中の本体と一致しないので何もしない。
+        for command in [
+            hook_command(&other).unwrap(),
+            format!("rtk {} hook", exe.to_string_lossy().replace('\\', "/")),
+            "~/bin/scriptura hook".to_string(),
+        ] {
+            let value = stop(&[command.clone()]);
+            let path = scratch_settings(Some(&value));
+            assert_eq!(
+                migrate_old_stop_registration_at(&path, &exe),
+                None,
+                "{command}"
+            );
+            assert_eq!(read(&path), value, "{command}");
+            assert!(
+                !path
+                    .with_file_name("settings.json.scriptura-migration-backup")
+                    .exists()
+            );
+            let _ = fs::remove_dir_all(path.parent().unwrap());
+        }
+        // Stop hook が 2 本（旧版・別導入が先）でも、実行中の本体を指すものがあれば、実行中のパスで登録し直す。
+        let value = stop(&[hook_command(&other).unwrap(), hook_command(&exe).unwrap()]);
+        let path = scratch_settings(Some(&value));
+        assert!(migrate_old_stop_registration_at(&path, &exe).is_some());
+        let after = read(&path);
+        assert!(after["hooks"].get("Stop").is_none());
+        assert_new_registration(&after);
+        assert!(
+            scriptura_commands(&after)
+                .iter()
+                .all(|c| *c == hook_command(&exe).unwrap())
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn stop_migration_follows_the_plugin_behavior_when_the_plugin_is_enabled() {
+        let exe = std::env::temp_dir().join("bin/scriptura.exe");
+        let mut original = old_stop_settings(&exe);
+        original["enabledPlugins"] = json!({"scriptura@kagayoi":true});
+        let path = scratch_settings(Some(&original));
+        assert!(migrate_old_stop_registration_at(&path, &exe).is_some());
+        let after = read(&path);
+        // 新しい登録は足さず、Scriptura の hook だけを外す。
+        assert_eq!(
+            commands(&after),
+            ["bun agents-maintenance.ts", "other-tool"]
+        );
+        assert!(after["hooks"].get("PostToolUse").is_none());
+        assert!(after["hooks"].get("SessionStart").is_none());
+        assert_eq!(after["enabledPlugins"], original["enabledPlugins"]);
+        assert_eq!(migrate_old_stop_registration_at(&path, &exe), None);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

@@ -6,7 +6,7 @@
 //! `native/src/app_update.rs`（同じ Velopack の版・同じ方式）。
 //!
 //! # 多プロセス型としての設計
-//! Scriptura の `hook` は Claude Code の Stop ごとに起動し、worker（`claude -p`）の終了まで同期で待つ
+//! Scriptura の `hook` は Claude Code の hook（git push 直後・セッション開始時）で起動し、worker（`claude -p`）の終了まで同期で待つ
 //! （async・timeout 1800 秒）。`ui` も最長 60 分動き、複数のセッションが並行する。Velopack の適用
 //! （Windows の `Update.exe apply`）は導入先から動く自分以外の全プロセスを強制終了するため、日中に適用すると
 //! 保守中の hook（git 操作の途中のこともある）を殺してしまう。そこで次のように分ける。
@@ -16,7 +16,7 @@
 //! - 適用は、ログオン時の `update-apply`（[`update_apply`]）と、利用者が管理画面の「更新をインストール」を押したとき
 //!   （[`panel_install`]）だけ。どちらも [`apply_pending`] で、導入先に他のプロセスが無いことを確かめ、署名者を検証してから
 //!   適用する（`update-apply` は再起動なし。管理画面は応答の後に終了し、常駐なら更新器が新しい版を起動する）。
-//! - Claude Code への登録（settings.json の Stop hook）とログオン時の適用の登録は、全 OS で
+//! - Claude Code への登録（settings.json の hook）とログオン時の適用の登録は、全 OS で
 //!   [`registration`] が状態ファイル（`setup-registration.json`）とあわせて行う。Windows では Velopack の
 //!   フック（install / updated / uninstall）からも呼び、いずれも必ず終了コード 0 で終える。macOS・Linux には
 //!   フックもアンインストーラーも無いため、引数なしの起動とログオン時の `update-apply` で登録し、解除は利用者が
@@ -101,7 +101,7 @@ pub struct AutoUpdateSettings {
     pub auto_update: bool,
     /// 前回の確認に成功した時刻（UNIX 秒）。
     pub last_checked_at: Option<u64>,
-    /// 前回の確認に失敗した時刻（UNIX 秒）。失敗しても 24 時間は再試行しない（Stop ごとに起動する hook が
+    /// 前回の確認に失敗した時刻（UNIX 秒）。失敗しても 24 時間は再試行しない（頻繁に起動する hook が
     /// ネットワークの不調のたびに通信しないため）。
     pub last_failed_at: Option<u64>,
 }

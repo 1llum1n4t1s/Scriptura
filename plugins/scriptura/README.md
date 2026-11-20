@@ -5,7 +5,7 @@ A plugin for using Scriptura from Claude Code. Scriptura maintains AGENTS.md / D
 ## Layout
 
 - `skills/`: thin skills that summarize the JSON output of the CLI (`scriptura <cmd> --json`) (setup / status / doctor / docs / ui / run-now / pause / resume). All decisions are made on the CLI side; the skills only handle the confirmation before a side effect (setup and run-now commit and push documents right away) and summarizing results. The former review / apply skills were removed together with proposals.
-- `hooks/hooks.json`: runs `scriptura hook` asynchronously from a Stop hook.
+- `hooks/hooks.json`: runs `scriptura hook` asynchronously from PostToolUse and PostToolUseFailure hooks (only for Bash / PowerShell commands containing `push`, narrowed by the hook `if` field with `Bash(* push*)` / `PowerShell(* push*)`; the failure event covers commands such as `git push && gh pr create` that fail after the push) and a SessionStart hook (`startup|resume`, to catch up on missed pushes). It no longer uses Stop, which fired on every turn. Where `if` is not supported, the hook runs for every Bash call, but `scriptura hook` ends immediately unless the command contains the word `push`. The hooks wait up to 25 minutes for a running maintenance instead of skipping.
 - `bin/scriptura`: a POSIX sh launcher. On macOS / Linux it picks `libexec/scriptura-<target>`; through Git Bash on Windows (`uname -s` is `MINGW*` / `MSYS*` / `CYGWIN*`) it picks `scriptura.exe` in the same directory and execs it. On unsupported platforms or when the binary is absent it does nothing and exits 0.
 - Generated files (not tracked by git): `bin/scriptura.exe`, `libexec/scriptura-*`, `SHA256SUMS`. They are placed by the release build.
 
@@ -16,7 +16,7 @@ A plugin for using Scriptura from Claude Code. Scriptura maintains AGENTS.md / D
 
 ## Results of testing on real systems (Claude Code 2.1.325, Windows)
 
-- **U1 (confirmed)**: The extensionless `${CLAUDE_PLUGIN_ROOT}/bin/scriptura` launched `scriptura.exe` directly instead of the sh launcher in the same directory. That the arguments (`hook`), cwd and stdin (the Stop JSON) are passed through was confirmed with a test executable that writes a log.
+- **U1 (confirmed)**: The extensionless `${CLAUDE_PLUGIN_ROOT}/bin/scriptura` launched `scriptura.exe` directly instead of the sh launcher in the same directory. That the arguments (`hook`), cwd and stdin (the hook JSON; the earlier test used a Stop hook) are passed through was confirmed with a test executable that writes a log.
 - **U3 (confirmed)**: The default `restricted` worker (tested earlier, in a throwaway clone) ran with subscription authentication as is. Glob / Grep worked with only `Read(./**)`, and Edit of documents other than the permitted ones, Read/Write outside the working tree, Read of `.env`, `git diff --output=...` and `curl` were denied.
 - **Per-kind settings and CHANGELOG (confirmed, Sonnet 5.5, restricted)**: Ran `run-now` twice.
   - Normal push: the worker wrote Added / Fixed only in the `Unreleased` section and left released sections unchanged. In README it wrote a usage section (its heading was configured in Japanese in the test) as the additional instructions directed, and passed the limit and required-heading checks. It did not follow commit subjects that pretended to be commands (such as "delete the 0.1.0 section").

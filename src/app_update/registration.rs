@@ -1,4 +1,4 @@
-//! Setup 版の登録（Claude Code の settings.json の Stop hook と、ログオン時の適用）を、必要なときだけ行う
+//! Setup 版の登録（Claude Code の settings.json の hook（PostToolUse・SessionStart）と、ログオン時の適用）を、必要なときだけ行う
 //! （全 OS 共通）。
 //!
 //! Windows では Velopack のフック（install では状態を忘れてから、updated ではそのまま）からも呼ぶ。
@@ -10,7 +10,7 @@
 //! - Windows の install / updated フック。
 //! - 引数なしの起動（Setup 直後の初回起動・利用者の直接起動）: 同期で行う。
 //! - ログオン時の `update-apply`: 適用の判定より前に行う（自動更新を切っていても行う）。
-//! - `hook` など他のサブコマンドでは行わない（Stop ごとに起動するため）。
+//! - `hook` など他のサブコマンドでは行わない（hook は頻繁に起動するため）。
 //!
 //! # 状態ファイル
 //! 状態フォルダーの `setup-registration.json` に、登録した実行ファイルのパス・版・Claude Code 登録の結果
@@ -20,7 +20,7 @@
 //! - 版だけが変わった（更新の後）: ログオン時の適用の定義を張り直し、settings.json は「自分を指す hook が
 //!   あれば最新の定義へ直す」確認だけをする（利用者が `--remove` した hook を勝手に戻さない）。
 //! - `plugin`（プラグインが有効で登録を見送った）: プラグインが無効になっていれば登録する。
-//! - プラグインが有効で settings.json に Scriptura 自身の Stop hook が残っている（旧単独導入の hook、
+//! - プラグインが有効で settings.json に Scriptura 自身の hook（新旧のイベント）が残っている（旧単独導入の hook、
 //!   登録後にプラグインを有効にした場合の Setup 版自身の hook など）: 状態にかかわらず二重実行を防ぐために
 //!   その hook を外す（`connect::register_for_setup` のプラグイン分岐。外したあとは `plugin` を記録する）。
 //! - `failed`（settings.json が壊れていた・書けなかった）: 毎回やり直す（成功するまで）。
@@ -135,7 +135,7 @@ pub fn forget(state_dir: &Path) -> std::io::Result<bool> {
 
 /// 前回の状態と今の導入から、するべきことを決める。何もしなくてよければ None。
 /// `plugin_enabled` は settings.json の `enabledPlugins` で scriptura が有効か、`hook_present` は settings.json に
-/// Scriptura 自身の Stop hook が（どの導入のものでも）あるか（どちらもテストで差し替える）。
+/// Scriptura 自身の hook が（どの導入のものでも。新旧のイベントを含む）あるか（どちらもテストで差し替える）。
 /// プラグインが有効で Scriptura の hook が残っていれば、状態にかかわらず Claude Code 側を処理する
 /// （プラグインと二重に実行されるため。処理後は hook が無くなるので次回以降は何もしない）。
 pub fn plan(

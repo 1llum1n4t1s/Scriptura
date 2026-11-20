@@ -1354,6 +1354,8 @@ fn fixup_prompt_names_each_violation_with_numbers_and_the_editable_paths() {
     let agents = vec![kinds::AgentsOver {
         path: "AGENTS.md".into(),
         size: 31_000,
+        members: Vec::new(),
+        required_cut: 1_001,
     }];
     let allowed = vec!["README.md".to_string(), "docs/readme/a.md".to_string()];
     let prompt = kinds::fixup_prompt(&kinds, &violations, &agents, &allowed);
@@ -1362,7 +1364,7 @@ fn fixup_prompt_names_each_violation_with_numbers_and_the_editable_paths() {
         "Remove at least 500 characters; aim for at most 900 characters",
         "the required heading \"## 概要\" is missing",
         "AGENTS.md: currently 31000 bytes",
-        "aim for at most 26999 bytes",
+        "Remove at least 1001 bytes; aim for at most 26999 bytes",
         "Fix only these violations and do not redo the rest of the maintenance",
         "files under `docs/readme/`",
         "[\"README.md\",\"docs/readme/a.md\"]",
@@ -1384,6 +1386,72 @@ fn fixup_prompt_names_each_violation_with_numbers_and_the_editable_paths() {
     );
     assert!(prompt.contains("Only the Unreleased section"), "{prompt}");
     assert!(!prompt.contains("files under"), "{prompt}");
+}
+
+#[test]
+fn chain_fixup_prompt_lists_members_sizes_editability_and_the_required_cut() {
+    let file = |path: &str, size: u64, is_override: bool, editable: bool| kinds::AgentsFile {
+        path: path.into(),
+        size,
+        is_override,
+        editable,
+    };
+    let over = kinds::AgentsOver {
+        path: "apps/hikyaku".into(),
+        size: 30_639,
+        members: vec![
+            file("AGENTS.md", 22_392, false, true),
+            file("apps/hikyaku/AGENTS.md", 8_247, false, true),
+        ],
+        required_cut: 640,
+    };
+    assert!(over.is_absorbable());
+    let allowed = vec![
+        "AGENTS.md".to_string(),
+        "apps/hikyaku/AGENTS.md".to_string(),
+    ];
+    let prompt = kinds::fixup_prompt(&[], &[], std::slice::from_ref(&over), &allowed);
+    for needle in [
+        "applied to `apps/hikyaku`",
+        "total 30639 bytes",
+        "Remove at least 640 bytes in total",
+        "about 3640 bytes so the total is at most 26999 bytes",
+        "- AGENTS.md: 22392 bytes (editable)",
+        "- apps/hikyaku/AGENTS.md: 8247 bytes (editable)",
+        "DESIGN.md",
+    ] {
+        assert!(prompt.contains(needle), "{needle}\n{prompt}");
+    }
+    // 編集できない構成ファイルは明示し、編集できる分で吸収できなければ再実行の対象にしない。
+    let locked = kinds::AgentsOver {
+        members: vec![
+            file("AGENTS.md", 22_392, false, false),
+            file("apps/hikyaku/AGENTS.md", 8_247, false, true),
+        ],
+        required_cut: 8_247,
+        ..over.clone()
+    };
+    assert!(!locked.is_absorbable());
+    let prompt = kinds::fixup_prompt(
+        &[],
+        &[],
+        &[kinds::AgentsOver {
+            required_cut: 640,
+            ..locked
+        }],
+        &allowed,
+    );
+    assert!(
+        prompt.contains("- AGENTS.md: 22392 bytes (NOT editable this time)"),
+        "{prompt}"
+    );
+    // 保守の開始時点の追記は、既存の超過が無ければ空（従来のプロンプトを変えない）。
+    assert_eq!(kinds::agents_required_note(&[]), "");
+    let note = kinds::agents_required_note(&[over]);
+    assert!(
+        note.contains("ALREADY exceed") && note.contains("640 bytes"),
+        "{note}"
+    );
 }
 
 #[test]

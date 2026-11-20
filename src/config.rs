@@ -32,7 +32,7 @@ pub const CURRENT_SCHEMA: u32 = 3;
 pub const MIN_SCHEMA: u32 = 1;
 /// 旧形式の同意文書の版。移行（旧形式の読み込み）だけが使い、有効な同意かの判定に使う。
 const LEGACY_CONSENT_VERSION: u32 = 1;
-/// worker timeout の許容範囲（秒）。上限は Stop hook の timeout（プラグインの hooks.json は 1800 秒）より
+/// worker timeout の許容範囲（秒）。上限は hook の timeout（プラグインの hooks.json は 1800 秒）より
 /// 小さくする。worker が hook より後まで動くと、hook の強制終了で worker 後の公開処理が中断されるため。
 pub const TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 60..=1500;
 

@@ -490,6 +490,14 @@ fn settings_items() -> Vec<Value> {
     if legacy_hook {
         items.push(item("legacyHook", "warn", crate::t!("doctor.legacy_hook")));
     }
+    // 旧登録の Stop hook（毎ターン発火する）が残っている。プラグインとの重複は hookDuplicate が案内する。
+    if scan.old_stop_hook && !plugin_enabled {
+        items.push(item(
+            "oldStopHook",
+            "warn",
+            crate::t!("doctor.old_stop_hook"),
+        ));
+    }
     // Setup（Velopack）版の項目（プラグインとの重複・登録・旧単独導入の残存・自動更新）。管理外なら 1 項目だけ。
     items.extend(crate::app_update::doctor_items(
         plugin_enabled,

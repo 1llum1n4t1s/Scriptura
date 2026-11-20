@@ -1463,6 +1463,8 @@ pub fn limit_error(root: &Path, kinds: &[ResolvedKind], files: &[String]) -> Opt
 
 /// 再実行の最大回数（最初の起動を除く）。
 pub const MAX_FIXUPS: u32 = 2;
+/// AGENTS の超過が残っている間の再実行の最大回数（上限・見出しの 2 回より多い。毎回縮まなければ打ち切る）。
+pub const MAX_AGENTS_FIXUPS: u32 = 3;
 /// 再実行を始めるのに残っているべき最短の秒数。
 pub const MIN_FIXUP_SECS: u64 = 120;
 /// 上限を超えた文書を収める目標（上限に対する割合）。
@@ -1478,11 +1480,90 @@ pub fn fixup_budget(
     (remaining.as_secs() >= MIN_FIXUP_SECS).then_some(remaining)
 }
 
-/// 再実行で直す、AGENTS の 30,000 バイト超過（ファイルと現在のバイト数）。
+/// AGENTS の階層（ルートから子まで）を構成する 1 ファイル。`editable` は今回 worker が編集できるか。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentsFile {
+    pub path: String,
+    pub size: u64,
+    pub is_override: bool,
+    pub editable: bool,
+}
+
+/// 再実行で直す、AGENTS の 30,000 バイト超過。`members` が空ならファイル単体（`path` はそのファイル）、
+/// 空でなければ階層の合計（`path` はディレクトリ、`size` は合計、`members` は構成ファイル）。
+/// `required_cut` は 30,000 バイト未満（29,999 以下）に戻すために最低限削る量。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentsOver {
     pub path: String,
     pub size: u64,
+    pub members: Vec<AgentsFile>,
+    pub required_cut: u64,
+}
+
+impl AgentsOver {
+    /// 階層の超過のうち、編集できる構成ファイルの合計が必要削減量を吸収できるか。
+    /// 単体ファイルは編集できるものだけがここに入るので常に true。
+    pub fn is_absorbable(&self) -> bool {
+        self.members.is_empty()
+            || self
+                .members
+                .iter()
+                .filter(|m| m.editable)
+                .map(|m| m.size)
+                .sum::<u64>()
+                > self.required_cut
+    }
+}
+
+/// AGENTS の超過を worker へ示す行（構成ファイルごとのバイト数・編集可否・最低削減量・目標を数値で）。
+pub fn agents_over_lines(agents: &[AgentsOver]) -> Vec<String> {
+    let target = AGENTS_MAX_BYTES * FIXUP_TARGET_PERCENT / 100;
+    let mut lines = Vec::new();
+    for a in agents {
+        if a.members.is_empty() {
+            lines.push(format!(
+                "- {}: currently {} bytes, but AGENTS files must stay under 30000 bytes. Remove at least {} bytes; aim for at most {} bytes.",
+                a.path, a.size, a.required_cut, target
+            ));
+            continue;
+        }
+        let listed = a
+            .members
+            .iter()
+            .map(|m| {
+                let state = if m.editable {
+                    "editable"
+                } else if m.is_override {
+                    "personal override, NOT editable"
+                } else {
+                    "NOT editable this time"
+                };
+                format!("  - {}: {} bytes ({state})", m.path, m.size)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        lines.push(format!(
+            "- The AGENTS files applied to `{}` are read together (root to child) and total {} bytes, but the total must stay under 30000 bytes. Remove at least {} bytes in total from the editable files below; aim to remove about {} bytes so the total is at most {} bytes. Members:\n{listed}\n  Merge duplicated or overlapping rules (keep each rule once, in the most general file), drop outdated or low-value detail, and you may move detailed content into other editable documents (for example DESIGN.md), leaving a short pointer to it. The program re-measures the actual bytes after your edit.",
+            a.path,
+            a.size,
+            a.required_cut,
+            a.size.saturating_sub(target),
+            target
+        ));
+    }
+    lines
+}
+
+/// 保守の開始時点で既に AGENTS が上限を超えているときの、最初のプロンプトへの追記（無ければ空文字）。
+/// 超過の解消そのものが必須の作業だと伝え、現在のバイト数・内訳・削減量を数値で渡す。
+pub fn agents_required_note(agents: &[AgentsOver]) -> String {
+    if agents.is_empty() {
+        return String::new();
+    }
+    format!(
+        " The AGENTS files in this repository ALREADY exceed the 30000-byte limit before this maintenance, and the program discards the whole maintenance output if the limit is still exceeded afterward. Bringing them under the limit is therefore a required part of this task, in addition to the normal maintenance:\n{}\n",
+        agents_over_lines(agents).join("\n")
+    )
 }
 
 /// 違反を直すための再実行用プロンプト（worker が読む文なので英語に固定）。
@@ -1543,14 +1624,7 @@ pub fn fixup_prompt(
             }
         }
     }
-    for a in agents {
-        lines.push(format!(
-            "- {}: currently {} bytes, but AGENTS files must stay under 30000 bytes. Remove duplication and low-value detail; aim for at most {} bytes.",
-            a.path,
-            a.size,
-            target(AGENTS_MAX_BYTES)
-        ));
-    }
+    lines.extend(agents_over_lines(agents));
     format!(
         "The maintenance result for this push still violates checks that the program enforces after every run. Fix only these violations and do not redo the rest of the maintenance:\n{}\nReduce size by removing duplication, outdated statements and low-value detail and by tightening wording; do not simply cut text off.{}\nThe only editable paths are those in this JSON array: {}. Do not edit any other path.",
         lines.join("\n"),

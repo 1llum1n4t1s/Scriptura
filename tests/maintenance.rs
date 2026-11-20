@@ -1040,6 +1040,158 @@ fn hook_initialization_and_stop_process_local_push() {
     );
     assert_eq!(f.git(&["rev-list", "--count", "HEAD"]), count);
 }
+/// PostToolUse（git push 直後）と SessionStart（取りこぼしの回収）は、旧登録の Stop と同じく新しい push を処理し、
+/// 同じ push を二重に処理しない（旧登録と新登録が重なっても、処理済み位置が重複を防ぐ）。
+#[test]
+fn post_tool_use_and_session_start_process_a_push_once() {
+    for event in ["PostToolUse", "SessionStart"] {
+        let f = Fixture::new();
+        assert_eq!(f.hook("UserPromptSubmit"), None);
+        fs::write(f.root.join("source.txt"), "new change").unwrap();
+        f.git(&["add", "source.txt"]);
+        f.git(&["commit", "-m", "new pushed source"]);
+        f.git(&["push"]);
+        f.writes(json!({f.root.join("README.md").to_str().unwrap():"documented change"}));
+        let payload = json!({
+            "hook_event_name":event,"cwd":f.root,
+            "tool_name":"Bash","tool_input":{"command":"git push"},"source":"startup"
+        });
+        assert_eq!(handle_hook(&payload).unwrap(), None, "{event}");
+        assert_eq!(f.state()["phase"], "complete", "{event}");
+        let count = f.git(&["rev-list", "--count", "HEAD"]);
+        assert_eq!(count.trim(), "3", "{event}");
+        // 同じ push は、どのイベントで呼ばれても再処理しない。
+        assert_eq!(handle_hook(&payload).unwrap(), None);
+        assert_eq!(f.hook("Stop"), None);
+        assert_eq!(f.git(&["rev-list", "--count", "HEAD"]), count, "{event}");
+    }
+}
+/// Claude Code・Codex の PostToolUse（失敗時の PostToolUseFailure を含む）の payload から、`push` の語を含みうる
+/// コマンドだけを通す（`if` を持たない Codex でも状態 DB・ロックに触れる前に終わる）。判定できない形は処理側に倒す。
+#[test]
+fn post_tool_use_payload_filter_accepts_push_words_and_skips_other_commands() {
+    use scriptura::maintenance::payload_may_push;
+    let bash = |c: Value| json!({"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":c}});
+    for pushed in [
+        "git push",
+        "git push origin main",
+        "rtk git push",
+        "git -C D:/repo push origin HEAD",
+        "git -c core.x=y push",
+        "FOO=1 git push",
+        "npm test && git push",
+        "cd repo; git push --force-with-lease",
+        "bash -lc 'git push'",
+        "\"C:\\Program Files\\Git\\cmd\\git.exe\" push",
+        "/usr/bin/git push",
+        // `if`（`* push*`）を通る、git の語を含まない形も落とさない。
+        "g push",
+        "make push",
+        "npm run push",
+        "$GIT push origin",
+        "git push && gh pr create",
+    ] {
+        assert!(payload_may_push(&bash(json!(pushed))), "{pushed}");
+    }
+    // Codex は command が配列のことがある。
+    assert!(payload_may_push(&bash(json!(["bash", "-lc", "git push"]))));
+    for other in [
+        "git status",
+        "git pull && cargo test",
+        "pushd /tmp",
+        "ls",
+        "",
+    ] {
+        assert!(!payload_may_push(&bash(json!(other))), "{other}");
+    }
+    assert!(!payload_may_push(&bash(json!(["ls", "-la"]))));
+    // ファイル編集・MCP のツールは対象外（Codex の apply_patch は command にパッチ本文が入る）。
+    for tool in ["apply_patch", "Edit", "mcp__x__y"] {
+        let p = json!({"tool_name":tool,"tool_input":{"command":"git push"}});
+        assert!(!payload_may_push(&p), "{tool}");
+    }
+    // 判定できない形（command が無い・未知の型）は処理側に倒す。
+    assert!(payload_may_push(&json!({"tool_name":"Bash"})));
+    assert!(payload_may_push(
+        &json!({"tool_name":"Bash","tool_input":{"cmd":"x"}})
+    ));
+    assert!(payload_may_push(&json!({})));
+}
+/// PostToolUse・SessionStart（非同期）は、別の保守がロックを持っていても待って処理する。同期の旧登録（Stop）は待たずに見送る。
+/// push 成功後に後段が失敗した（PostToolUseFailure）場合も、PostToolUse と同じに処理する。
+#[test]
+fn async_hooks_wait_for_the_poll_lock_and_stop_does_not() {
+    let f = Fixture::new();
+    assert_eq!(f.hook("UserPromptSubmit"), None);
+    fs::write(f.root.join("source.txt"), "new change").unwrap();
+    f.git(&["add", "source.txt"]);
+    f.git(&["commit", "-m", "new pushed source"]);
+    f.git(&["push"]);
+    f.writes(json!({f.root.join("README.md").to_str().unwrap():"documented change"}));
+    let lock_path = state_db_path().with_extension("poll-lock.sqlite3");
+    let held = Connection::open(&lock_path).unwrap();
+    held.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // Stop は待たずに見送る（保守されず、コミットは増えない）。
+    assert_eq!(
+        handle_hook(&json!({"hook_event_name":"Stop","cwd":f.root})).unwrap(),
+        None
+    );
+    assert_eq!(f.git(&["rev-list", "--count", "HEAD"]).trim(), "2");
+    // 別の保守が終わる（ロックが解ける）まで待ってから処理する。
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        held.execute_batch("COMMIT").unwrap();
+    });
+    let payload = json!({
+        "hook_event_name":"PostToolUseFailure","cwd":f.root,
+        "tool_name":"Bash","tool_input":{"command":"git push && gh pr create"}
+    });
+    let started = std::time::Instant::now();
+    assert_eq!(handle_hook(&payload).unwrap(), None);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1000));
+    release.join().unwrap();
+    assert_eq!(f.state()["phase"], "complete");
+    assert_eq!(f.git(&["rev-list", "--count", "HEAD"]).trim(), "3");
+}
+/// push を含まない PostToolUse と、知らないイベント名・cwd の無い payload は、状態に触れずに何もしない。
+/// イベント名の綴りの違い（Codex など）は吸収し、既知の形はどちらでも動く。
+#[test]
+fn post_tool_use_without_push_and_unknown_payloads_touch_no_state() {
+    let f = Fixture::new();
+    for p in [
+        json!({"hook_event_name":"PostToolUse","cwd":f.root,"tool_name":"Bash","tool_input":{"command":"git status"}}),
+        json!({"hook_event_name":"PostToolUse","cwd":f.root,"tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch git push"}}),
+        json!({"hook_event_name":"post_tool_use","cwd":f.root,"tool_name":"Bash","tool_input":{"command":["bash","-lc","ls"]}}),
+        json!({"hookEventName":"PostToolUse","cwd":f.root,"tool_input":{"command":"echo hi"}}),
+        json!({"hook_event_name":"PreToolUse","cwd":f.root,"tool_name":"Bash","tool_input":{"command":"git push"}}),
+        json!({"hook_event_name":"SessionEnd","cwd":f.root}),
+        json!({"hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"git push"}}),
+    ] {
+        assert_eq!(handle_hook(&p).unwrap(), None, "{p}");
+    }
+    assert!(!state_db_path().exists());
+}
+/// Codex 形式（`hook_event_name`・`cwd`・`tool_input.command`・`tool_response` などを持つ payload）の PostToolUse と、
+/// `source` を持つ SessionStart でも push を処理する。
+#[test]
+fn codex_shaped_payloads_process_a_push() {
+    let f = Fixture::new();
+    assert_eq!(f.hook("UserPromptSubmit"), None);
+    fs::write(f.root.join("source.txt"), "new change").unwrap();
+    f.git(&["add", "source.txt"]);
+    f.git(&["commit", "-m", "new pushed source"]);
+    f.git(&["push"]);
+    f.writes(json!({f.root.join("README.md").to_str().unwrap():"documented change"}));
+    let payload = json!({
+        "session_id":"s","transcript_path":"t","model":"gpt","permission_mode":"default",
+        "hook_event_name":"PostToolUse","cwd":f.root,"tool_name":"Bash","tool_use_id":"u",
+        "tool_input":{"command":"rtk git -C . push origin HEAD"},
+        "tool_response":{"exit_code":0,"stdout":"ok"}
+    });
+    assert_eq!(handle_hook(&payload).unwrap(), None);
+    assert_eq!(f.state()["phase"], "complete");
+    assert_eq!(f.git(&["rev-list", "--count", "HEAD"]).trim(), "3");
+}
 #[test]
 fn recursive_and_invalid_hook_payloads_do_nothing() {
     let f = Fixture::new();
@@ -4124,8 +4276,9 @@ fn an_agents_file_over_30000_bytes_is_discarded_and_maintenance_completes() {
         message.contains("サイズ超過") && message.contains("破棄"),
         "{message}"
     );
-    // 再実行（最初の起動 + 2 回）でも直らないので、worker の出力を破棄して完了にする。
-    assert_eq!(f.worker_runs(), 3);
+    // 再実行は 1 回だけ行う。2 回目の起動でも超過量が縮まない（毎回同じ内容を書く）ので、
+    // 続けても進まないと見て打ち切り、worker の出力を破棄して完了にする。
+    assert_eq!(f.worker_runs(), 2);
     assert!(
         f.prompt_of_run(2)
             .contains("AGENTS files must stay under 30000 bytes"),
@@ -4153,6 +4306,315 @@ fn an_agents_file_over_30000_bytes_is_discarded_and_maintenance_completes() {
         f.git(&["show", "--name-only", "--format=", "HEAD"]),
         "README.md\n"
     );
+}
+
+fn chain_fixture() -> Fixture {
+    // モノレポの実例: ルート 22,392 + 子 8,247 = 30,639 バイトで、HEAD の時点で既に階層の上限を超えている。
+    let f = Fixture::with_config(Some(Config::legacy_all_push()));
+    f.commit_push_file("AGENTS.md", &"a".repeat(22_392));
+    f.commit_push_file("apps/hikyaku/AGENTS.md", &"b".repeat(8_247));
+    f
+}
+
+fn child_agents(f: &Fixture) -> String {
+    f.root
+        .join("apps/hikyaku/AGENTS.md")
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[test]
+fn an_existing_chain_excess_is_shrunk_by_the_rerun_and_committed_under_the_limit() {
+    let f = chain_fixture();
+    f.hook("UserPromptSubmit");
+    f.commit_push_file("apps/hikyaku/notes.txt", "change");
+    // 1 回目はまだ足りない（30,247 バイト）、再実行で上限内（28,000 バイト）に収める。
+    f.writes(json!([
+        {agents_path(&f): "a".repeat(22_000)},
+        {agents_path(&f): "a".repeat(20_000), child_agents(&f): "b".repeat(8_000)}
+    ]));
+    let head = f.head();
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.worker_runs(), 2);
+    // 最初のプロンプトは「既に超過している」ことと内訳・削減量を伝える。
+    let first = f.prompt_of_run(1);
+    for needle in [
+        "ALREADY exceed",
+        "AGENTS.md: 22392 bytes (editable)",
+        "apps/hikyaku/AGENTS.md: 8247 bytes (editable)",
+        "Remove at least 640 bytes in total",
+    ] {
+        assert!(first.contains(needle), "{needle}\n{first}");
+    }
+    // 再実行のプロンプトは、測り直した現在のバイト数と残りの超過量を渡す。
+    let second = f.prompt_of_run(2);
+    for needle in [
+        "total 30247 bytes",
+        "AGENTS.md: 22000 bytes (editable)",
+        "Remove at least 248 bytes in total",
+    ] {
+        assert!(second.contains(needle), "{needle}\n{second}");
+    }
+    assert_ne!(f.head(), head, "commit・push まで完了する");
+    assert_eq!(f.state()["phase"], "complete");
+    // 作業ツリーの実バイトと commit ツリーの両方が上限内。
+    let dirs = [f.root.join("apps/hikyaku")];
+    assert_eq!(agents_size_error(&f.root, &dirs, true), None);
+    assert_eq!(agents_tree_size_error(&f.root, "HEAD", &dirs), None);
+    assert_eq!(f.git(&["status", "--porcelain"]), "");
+    assert_eq!(
+        f.git(&["rev-parse", "HEAD"]),
+        f.git(&["rev-parse", "origin/main"])
+    );
+}
+
+#[test]
+fn a_chain_excess_is_fixed_with_only_the_editable_members_when_they_can_absorb_it() {
+    let f = chain_fixture();
+    f.hook("UserPromptSubmit");
+    f.commit_push_file("apps/hikyaku/notes.txt", "change");
+    // 子は利用者が編集中（許可パス外）。ルートだけで吸収できる。
+    fs::write(f.root.join("apps/hikyaku/AGENTS.md"), "b".repeat(8_300)).unwrap();
+    f.writes(json!({agents_path(&f): "a".repeat(20_000)}));
+    let head = f.head();
+    assert_eq!(f.hook("Stop"), None);
+    assert_ne!(f.head(), head);
+    let first = f.prompt_of_run(1);
+    assert!(
+        first.contains("apps/hikyaku/AGENTS.md: 8300 bytes (NOT editable this time)"),
+        "{first}"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("apps/hikyaku/AGENTS.md")).unwrap(),
+        "b".repeat(8_300),
+        "利用者の編集は触らない"
+    );
+    assert_eq!(
+        f.git(&["show", "--name-only", "--format=", "HEAD"]),
+        "AGENTS.md\n"
+    );
+}
+
+#[test]
+fn an_unfixable_chain_excess_is_not_committed_and_the_reason_names_the_files_and_bytes() {
+    let f = Fixture::with_config(Some(Config::legacy_all_push()));
+    f.commit_push_file("AGENTS.md", &"a".repeat(29_990));
+    f.commit_push_file("apps/hikyaku/AGENTS.md", &"b".repeat(300));
+    f.hook("UserPromptSubmit");
+    f.commit_push_file("apps/hikyaku/notes.txt", "change");
+    // ルートは利用者が編集中で許可パス外。編集できる子（300 バイト）では 300 バイトの超過を吸収できない。
+    fs::write(f.root.join("AGENTS.md"), "a".repeat(29_999)).unwrap();
+    let head = f.head();
+    let message = f.hook("Stop").expect("理由つきの通知があるはず");
+    assert_eq!(f.head(), head, "commit しない");
+    assert_eq!(f.worker_runs(), 1, "吸収できない超過は再実行しない");
+    for needle in [
+        "破棄",
+        "300 bytes 以上",
+        "AGENTS.md (29999)",
+        "編集できなかったファイル",
+    ] {
+        assert!(message.contains(needle), "{needle}\n{message}");
+    }
+    assert!(!message.contains("##"), "{message}");
+    assert_eq!(f.state()["phase"], "complete");
+}
+
+#[test]
+fn a_discard_leaves_an_lf_file_clean_even_when_autocrlf_converts_the_restore() {
+    let f = Fixture::with_config(Some(Config::legacy_all_push()));
+    f.commit_push_file("AGENTS.md", "a\nb\n");
+    f.hook("UserPromptSubmit");
+    f.push_change("autocrlf");
+    // 以降の `git restore` は CRLF に変換して書き戻す（作業ツリーの元の内容は LF）。
+    f.git(&["config", "core.autocrlf", "true"]);
+    f.writes(json!({agents_path(&f): "line\n".repeat(7_000)}));
+    let message = f.hook("Stop").expect("破棄の通知があるはず");
+    assert!(message.contains("破棄"), "{message}");
+    assert!(!message.contains("戻していないパス"), "{message}");
+    assert_eq!(fs::read(f.root.join("AGENTS.md")).unwrap(), b"a\nb\n");
+    assert_eq!(f.git(&["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_ready_record_with_an_editable_agents_excess_resumes_with_a_rerun() {
+    let f = Fixture::with_config(Some(Config::legacy_all_push()));
+    f.commit_push_file("AGENTS.md", &"a".repeat(30_500));
+    let mut state = f.checkpoint("ready");
+    f.save(&mut state);
+    f.writes(json!({agents_path(&f): "short"}));
+    let head = f.head();
+    assert_eq!(f.maintain(), None);
+    assert_eq!(f.worker_runs(), 1);
+    let prompt = f.prompt_of_run(1);
+    assert!(prompt.contains("Remove at least 501 bytes"), "{prompt}");
+    assert_ne!(f.head(), head);
+    assert_eq!(f.state()["phase"], "complete");
+    assert_eq!(agents_tree_size_error(&f.root, "HEAD", &[]), None);
+}
+
+/// ルート 23,500 + 子 8,247 を HEAD に持ち、子は利用者が 7,000 バイトへ縮める変更を未コミットで持つ
+/// （子は編集できない）。作業ツリーの合計は 30,500 だが、commit されるツリーでは子は 8,247 のまま。
+fn uncommitted_shrunk_child_fixture() -> Fixture {
+    let f = Fixture::with_config(Some(Config::legacy_all_push()));
+    f.commit_push_file("AGENTS.md", &"a".repeat(23_500));
+    f.commit_push_file("apps/hikyaku/AGENTS.md", &"b".repeat(8_247));
+    f.hook("UserPromptSubmit");
+    f.commit_push_file("apps/hikyaku/notes.txt", "change");
+    fs::write(f.root.join("apps/hikyaku/AGENTS.md"), "b".repeat(7_000)).unwrap();
+    f
+}
+
+#[test]
+fn a_non_editable_member_is_counted_at_its_committed_size_and_never_exceeds_in_the_commit() {
+    // 作業ツリーでは 29,900 だが commit されるツリーでは 31,147 になる出力は、commit せず破棄する。
+    let f = uncommitted_shrunk_child_fixture();
+    f.writes(json!({agents_path(&f): "a".repeat(22_900)}));
+    let head = f.head();
+    let message = f.hook("Stop").expect("破棄の通知があるはず");
+    assert!(message.contains("破棄"), "{message}");
+    assert_eq!(f.head(), head, "commit しない");
+    assert_eq!(
+        f.git(&["rev-parse", "HEAD"]),
+        f.git(&["rev-parse", "origin/main"])
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("AGENTS.md")).unwrap().len(),
+        23_500
+    );
+    assert_eq!(f.state()["phase"], "complete");
+    // 編集できない子は HEAD の大きさで数え、必要削減量は 1,748 バイト（31,747 - 29,999）になる。
+    let first = f.prompt_of_run(1);
+    assert!(first.contains("Remove at least 1748 bytes"), "{first}");
+    assert!(
+        first.contains("apps/hikyaku/AGENTS.md: 8247 bytes (NOT editable this time)"),
+        "{first}"
+    );
+}
+
+#[test]
+fn a_rerun_that_brings_the_committed_tree_under_the_limit_is_committed() {
+    let f = uncommitted_shrunk_child_fixture();
+    f.writes(json!([
+        {agents_path(&f): "a".repeat(22_900)},
+        {agents_path(&f): "a".repeat(21_000)}
+    ]));
+    let head = f.head();
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.worker_runs(), 2);
+    assert_ne!(f.head(), head);
+    assert_eq!(
+        agents_tree_size_error(&f.root, "HEAD", &[f.root.join("apps/hikyaku")]),
+        None
+    );
+    assert_eq!(
+        f.git(&["show", "--name-only", "--format=", "HEAD"]),
+        "AGENTS.md\n"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("apps/hikyaku/AGENTS.md")).unwrap(),
+        "b".repeat(7_000),
+        "利用者の未コミットの変更は触らない"
+    );
+}
+
+#[test]
+fn a_first_run_that_grows_an_existing_excess_still_gets_the_dedicated_reruns() {
+    let f = Fixture::with_config(Some(Config::legacy_all_push()));
+    f.commit_push_file("AGENTS.md", &"a".repeat(30_500));
+    f.hook("UserPromptSubmit");
+    f.push_change("grow");
+    // 最初の起動は超過を 100 バイト増やす（保守そのもの）。再実行で縮めれば commit まで完了する。
+    f.writes(json!([
+        {agents_path(&f): "a".repeat(30_600)},
+        {agents_path(&f): "short"}
+    ]));
+    let head = f.head();
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.worker_runs(), 2);
+    assert_ne!(f.head(), head);
+    assert_eq!(agents_tree_size_error(&f.root, "HEAD", &[]), None);
+}
+
+#[test]
+fn agents_reruns_stop_after_three_even_while_the_excess_keeps_shrinking() {
+    let f = Fixture::with_config(Some(Config::legacy_all_push()));
+    f.commit_push_file("AGENTS.md", &"a".repeat(31_000));
+    f.hook("UserPromptSubmit");
+    f.push_change("slow");
+    let sizes: Vec<Value> = [30_800, 30_600, 30_400, 30_200, 30_100]
+        .iter()
+        .map(|n| json!({agents_path(&f): "a".repeat(*n)}))
+        .collect();
+    f.writes(Value::Array(sizes));
+    let head = f.head();
+    let message = f.hook("Stop").expect("破棄の通知があるはず");
+    assert!(message.contains("破棄"), "{message}");
+    // 最初の起動 + 再実行 3 回。
+    assert_eq!(f.worker_runs(), 4);
+    assert_eq!(f.head(), head);
+    assert_eq!(
+        fs::read_to_string(f.root.join("AGENTS.md")).unwrap().len(),
+        31_000
+    );
+}
+
+#[test]
+fn a_ready_record_returns_to_the_rerun_only_once() {
+    let f = Fixture::with_config(Some(Config::legacy_all_push()));
+    f.commit_push_file("AGENTS.md", &"a".repeat(30_500));
+    let mut state = f.checkpoint("ready");
+    state["agents_resumed"] = json!(true);
+    f.save(&mut state);
+    let head = f.head();
+    assert_eq!(f.maintain(), None);
+    assert_eq!(f.worker_runs(), 0, "2 回目の再開では worker を起動しない");
+    assert_eq!(f.head(), head);
+    assert_eq!(f.state()["phase"], "complete");
+}
+
+#[test]
+fn a_personal_override_in_the_chain_is_not_editable_and_the_rest_absorbs_the_excess() {
+    let f = Fixture::with_config(Some(Config::legacy_all_push()));
+    f.commit_push_file("AGENTS.md", &"a".repeat(20_000));
+    f.commit_push_file("apps/x/AGENTS.override.md", &"o".repeat(10_500));
+    f.hook("UserPromptSubmit");
+    f.commit_push_file("apps/x/notes.txt", "change");
+    f.writes(json!({agents_path(&f): "a".repeat(19_000)}));
+    let head = f.head();
+    assert_eq!(f.hook("Stop"), None);
+    assert_ne!(f.head(), head);
+    let first = f.prompt_of_run(1);
+    assert!(
+        first.contains("apps/x/AGENTS.override.md: 10500 bytes (personal override, NOT editable)"),
+        "{first}"
+    );
+    // override は単体の超過として「削れ」とも言わない（階層側と矛盾しない）。
+    assert!(!first.contains("AGENTS.override.md: currently"), "{first}");
+    assert_eq!(
+        agents_tree_size_error(&f.root, "HEAD", &[f.root.join("apps/x")]),
+        None
+    );
+}
+
+#[test]
+fn a_chain_excess_is_measured_at_the_deepest_directory() {
+    let f = Fixture::with_config(Some(Config::legacy_all_push()));
+    f.commit_push_file("AGENTS.md", &"a".repeat(20_000));
+    f.commit_push_file("a/AGENTS.md", &"b".repeat(10_500));
+    f.commit_push_file("a/b/AGENTS.md", &"c".repeat(5_000));
+    f.hook("UserPromptSubmit");
+    f.commit_push_file("a/b/notes.txt", "change");
+    f.writes(json!({agents_path(&f): "a".repeat(14_000)}));
+    let head = f.head();
+    assert_eq!(f.hook("Stop"), None);
+    assert_ne!(f.head(), head);
+    // 浅い `a`（30,500）ではなく、最も深い `a/b`（35,500）の必要削減量で伝える。
+    let first = f.prompt_of_run(1);
+    assert!(first.contains("applied to `a/b`"), "{first}");
+    assert!(first.contains("Remove at least 5501 bytes"), "{first}");
+    assert!(!first.contains("applied to `a`"), "{first}");
 }
 
 #[test]

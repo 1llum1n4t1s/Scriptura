@@ -1,12 +1,79 @@
 {
   "hooks": {
-    "Stop": [
+    "PostToolUse": [
       {
+        "matcher": "Bash",
         "hooks": [
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/bin/scriptura",
-            "args": ["hook"],
+            "args": [
+              "hook"
+            ],
+            "if": "Bash(* push*)",
+            "async": true,
+            "timeout": 1800
+          }
+        ]
+      },
+      {
+        "matcher": "PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/scriptura",
+            "args": [
+              "hook"
+            ],
+            "if": "PowerShell(* push*)",
+            "async": true,
+            "timeout": 1800
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/scriptura",
+            "args": [
+              "hook"
+            ],
+            "if": "Bash(* push*)",
+            "async": true,
+            "timeout": 1800
+          }
+        ]
+      },
+      {
+        "matcher": "PowerShell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/scriptura",
+            "args": [
+              "hook"
+            ],
+            "if": "PowerShell(* push*)",
+            "async": true,
+            "timeout": 1800
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/scriptura",
+            "args": [
+              "hook"
+            ],
             "async": true,
             "timeout": 1800
           }

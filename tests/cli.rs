@@ -949,6 +949,24 @@ fn doctor_warns_about_duplicate_registration_policy_and_legacy_hooks() {
     fx.write_settings(&json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "\"C:/x/Scriptura/bin/scriptura.exe\" hook"}]}]}}));
     let v = fx.run(&["doctor", "--json"]).json();
     assert_eq!(item(&v, "hookDuplicate")["status"], "ok");
+    // 旧登録の Stop hook が残っていれば、再 connect を案内する（新しい登録では出ない）。
+    let old = item(&v, "oldStopHook");
+    assert_eq!(old["status"], "warn");
+    assert!(
+        old["detail"]
+            .as_str()
+            .unwrap()
+            .contains("connect claude-code --apply")
+    );
+    fx.write_settings(&json!({"hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "\"C:/x/Scriptura/bin/scriptura.exe\" hook", "if": "Bash(* push*)"}]}]}}));
+    let v = fx.run(&["doctor", "--json"]).json();
+    assert!(
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["id"] != "oldStopHook")
+    );
     fx.write_settings(&json!({"enabledPlugins": {"scriptura@scriptura": true}}));
     let v = fx.run(&["doctor", "--json"]).json();
     assert_eq!(item(&v, "hookDuplicate")["status"], "ok");
@@ -1050,6 +1068,133 @@ fn doctor_verify_checks_the_plugin_bundle_hashes() {
 // connect --remove
 // ---------------------------------------------------------------------------
 
+/// `connect --apply` は旧登録の Stop hook を外して新しい登録（PostToolUse・PostToolUseFailure・SessionStart）へ置き換え、
+/// JSON の `events` に登録するイベントを返す。`--remove` の `events` は新旧すべて。
+#[test]
+fn connect_apply_migrates_a_stop_registration_and_reports_events() {
+    let fx = Fx::new();
+    let own = format!("\"{}\" hook", EXE.replace('\\', "/"));
+    fx.write_settings(&json!({"hooks": {"Stop": [
+        {"hooks": [{"type": "command", "command": own}]},
+        {"hooks": [{"type": "command", "command": "other-tool stop"}]}
+    ]}}));
+    let preview = fx.run(&["connect", "claude-code", "--executable", EXE, "--json"]);
+    assert_eq!(preview.code, 0, "{}", preview.stderr);
+    let v = preview.json();
+    assert_eq!(
+        v["events"],
+        json!(["PostToolUse", "PostToolUseFailure", "SessionStart"])
+    );
+    assert_eq!(
+        (v["applied"].clone(), v["changed"].clone()),
+        (json!(false), json!(true))
+    );
+    let out = fx.run(&["connect", "claude-code", "--executable", EXE, "--apply"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let after: Value = serde_json::from_slice(&fs::read(fx.settings_path()).unwrap()).unwrap();
+    assert_eq!(after["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        after["hooks"]["Stop"][0]["hooks"][0]["command"],
+        "other-tool stop"
+    );
+    for event in ["PostToolUse", "PostToolUseFailure"] {
+        let entries = after["hooks"][event].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{event}");
+        assert_eq!(entries[0]["matcher"], "Bash");
+        assert_eq!(entries[0]["hooks"][0]["if"], "Bash(* push*)");
+        assert_eq!(entries[1]["hooks"][0]["if"], "PowerShell(* push*)");
+    }
+    assert_eq!(
+        after["hooks"]["SessionStart"][0]["matcher"],
+        "startup|resume"
+    );
+    // 冪等。
+    let again = fx
+        .run(&["connect", "claude-code", "--executable", EXE, "--json"])
+        .json();
+    assert_eq!(again["changed"], false);
+    // --remove は新旧すべてのイベントから外し、events に新旧を返す。
+    let removed = fx
+        .run(&["connect", "claude-code", "--remove", "--apply"])
+        .json();
+    assert_eq!(removed["removed"], 5);
+    assert_eq!(
+        removed["events"],
+        json!(["Stop", "PostToolUse", "PostToolUseFailure", "SessionStart"])
+    );
+    let last: Value = serde_json::from_slice(&fs::read(fx.settings_path()).unwrap()).unwrap();
+    assert_eq!(last["hooks"].as_object().unwrap().len(), 1);
+}
+
+/// Stop で呼ばれた hook は、ユーザー単位の settings.json の旧登録を新しい登録へ移行して 1 回だけ知らせる。
+/// 設定も旧状態も無い新規利用者でも状態フォルダー・DB は作らず、2 回目は何もしない。
+#[test]
+fn stop_hook_migrates_the_old_registration_once_without_creating_state() {
+    let fx = Fx::new();
+    let own = format!("\"{}\" hook", EXE.replace('\\', "/"));
+    let original = json!({"model": "keep", "hooks": {"Stop": [
+        {"hooks": [{"type": "command", "command": "bun C:/h/agents-maintenance.ts"}]},
+        {"hooks": [{"type": "command", "command": own, "async": true, "timeout": 1800}]}
+    ]}});
+    fx.write_settings(&original);
+    let out = fx.hook(&[]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let v = out.json();
+    assert!(
+        v["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("settings.json.scriptura-migration-backup")
+    );
+    let after: Value = serde_json::from_slice(&fs::read(fx.settings_path()).unwrap()).unwrap();
+    assert_eq!(after["model"], "keep");
+    assert_eq!(after["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    assert!(
+        after["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("agents-maintenance")
+    );
+    assert_eq!(
+        after["hooks"]["PostToolUse"][0]["hooks"][0]["if"],
+        "Bash(* push*)"
+    );
+    assert_eq!(
+        after["hooks"]["PostToolUseFailure"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        after["hooks"]["SessionStart"][0]["matcher"],
+        "startup|resume"
+    );
+    let backup = fx
+        .base
+        .join("claude")
+        .join("settings.json.scriptura-migration-backup");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(backup).unwrap()).unwrap(),
+        original
+    );
+    // 設定も旧状態も無い新規利用者: 状態フォルダー・DB を作らない。
+    assert!(!fx.state_db().exists());
+    assert_eq!(fs::read_dir(fx.base.join("state")).unwrap().count(), 0);
+    // 2 回目は何も書かず、何も出さない。
+    let written = fs::read(fx.settings_path()).unwrap();
+    let again = fx.hook(&[]);
+    assert_eq!(again.stdout.trim(), "");
+    assert_eq!(fs::read(fx.settings_path()).unwrap(), written);
+    // Stop 以外のイベントでは移行しない。
+    fx.write_settings(&original);
+    let payload = json!({"hook_event_name": "SessionStart", "cwd": fx.repo}).to_string();
+    let other = fx.exec(&["hook"], &[], Some(&payload), None);
+    assert_eq!(other.stdout.trim(), "");
+    let untouched: Value = serde_json::from_slice(&fs::read(fx.settings_path()).unwrap()).unwrap();
+    assert_eq!(untouched, original);
+}
+
 #[test]
 fn connect_remove_drops_only_scriptura_entries_and_is_safe_and_idempotent() {
     let fx = Fx::new();
@@ -1061,6 +1206,13 @@ fn connect_remove_drops_only_scriptura_entries_and_is_safe_and_idempotent() {
                 {"hooks": [{"type": "command", "command": "\"C:/x/Scriptura/bin/scriptura.exe\" hook", "async": true}]},
                 {"hooks": [{"type": "command", "command": "bun C:/h/agents-maintenance.ts"}]},
                 {"hooks": [{"type": "command", "command": "other-tool stop"}]}
+            ],
+            "PostToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "\"C:/x/Scriptura/bin/scriptura.exe\" hook", "if": "Bash(* push *)"}]},
+                {"matcher": "Edit", "hooks": [{"type": "command", "command": "fmt"}]}
+            ],
+            "SessionStart": [
+                {"matcher": "startup|resume", "hooks": [{"type": "command", "command": "\"C:/x/Scriptura/bin/scriptura.exe\" hook"}]}
             ],
             "Notification": [{"hooks": [{"type": "command", "command": "notify"}]}]
         }
@@ -1078,7 +1230,7 @@ fn connect_remove_drops_only_scriptura_entries_and_is_safe_and_idempotent() {
             v["changed"].clone(),
             v["removed"].clone()
         ),
-        (json!(false), json!(true), json!(1))
+        (json!(false), json!(true), json!(3))
     );
     assert_eq!(fs::read(fx.settings_path()).unwrap(), before);
     // --apply で Scriptura の項目だけ消え、退避が作られる。
@@ -1103,6 +1255,13 @@ fn connect_remove_drops_only_scriptura_entries_and_is_safe_and_idempotent() {
             .contains("agents-maintenance")
     );
     assert_eq!(stop[1]["hooks"][0]["command"], "other-tool stop");
+    // 新しい登録（PostToolUse・SessionStart）の Scriptura の hook も外れ、他ツールの項目と空のイベントの整理は保たれる。
+    assert_eq!(after["hooks"]["PostToolUse"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        after["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+        "fmt"
+    );
+    assert!(after["hooks"].get("SessionStart").is_none());
     assert_eq!(after["model"], "keep-me");
     assert_eq!(after["enabledPlugins"], original["enabledPlugins"]);
     assert_eq!(

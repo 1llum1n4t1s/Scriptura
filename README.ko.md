@@ -2,7 +2,7 @@
 
 # Scriptura
 
-Scriptura는 본인 저장소에 push한 뒤 백그라운드에서 `AGENTS.md` / `DESIGN.md` / `README.md`(그리고 옵트인으로 `CHANGELOG.md`와 사용자 정의 커스텀 문서)를 유지 관리합니다. Claude Code의 Stop hook에서 실행되며, 유지 관리 worker는 Claude Code CLI(기본값은 `claude -p --model claude-sonnet-5-5 --effort high`)입니다. Codex에는 의존하지 않습니다.
+Scriptura는 본인 저장소에 push한 뒤 백그라운드에서 `AGENTS.md` / `DESIGN.md` / `README.md`(그리고 옵트인으로 `CHANGELOG.md`와 사용자 정의 커스텀 문서)를 유지 관리합니다. Claude Code의 hook(Bash 또는 PowerShell 도구로 `git push`를 실행한 직후와, 놓친 push를 처리하는 세션 시작 시)에서 실행되며, 유지 관리 worker는 Claude Code CLI(기본값은 `claude -p --model claude-sonnet-5-5 --effort high`)입니다. Codex에는 의존하지 않습니다.
 
 - **기본값이 안전합니다.** `scriptura enable`(또는 관리 화면)로 저장소를 등록하기 전에는 아무것도 실행되지 않으며, 활성화에는 remote와 upstream이 필요합니다. 검토 단계는 없습니다. push할 때마다 worker가 대상 문서를 업데이트하고 Scriptura가 자동으로 commit과 push를 하며, 유지 관리 후 검사에서 대상 문서 외의 변경이 발견되면 commit하지 않습니다. 동의 기록과 이전의 `propose` 모드(업데이트 제안)는 제거되었습니다(「이전 설정의 마이그레이션」 참조).
 - 설정은 사용자 홈 디렉터리 아래의 파일 하나(`config.toml`)와 그 옆의 `templates/` 폴더에서만 읽습니다. 저장소 안의 파일을 통한 활성화나 설정은 읽지 않습니다(다른 사람의 저장소를 clone하기만 해도 자동 동작이 시작되는 일이 없도록 하기 위해서입니다).
@@ -14,13 +14,13 @@ Scriptura는 본인 저장소에 push한 뒤 백그라운드에서 `AGENTS.md` /
 
 ### 플러그인(권장)
 
-Claude Code 플러그인으로 설치하면 Stop hook과 운영용 스킬(`/scriptura:setup` 등)이 함께 설치됩니다. `scriptura` 바이너리는 플러그인에 포함되어 있습니다(Windows에서는 `bin/scriptura.exe`이며, macOS / Linux에서는 `bin/scriptura` 런처가 `libexec/` 아래의 바이너리를 선택합니다. Windows에서도 hook이 Git Bash의 sh를 거치는 경우 같은 런처가 `bin/scriptura.exe`로 넘깁니다). 배포물을 빌드하는 방법은 `xtask/`(`cargo run --manifest-path xtask/Cargo.toml --locked -- package`)를 참조하십시오.
+Claude Code 플러그인으로 설치하면 hook과 운영용 스킬(`/scriptura:setup` 등)이 함께 설치됩니다. `scriptura` 바이너리는 플러그인에 포함되어 있습니다(Windows에서는 `bin/scriptura.exe`이며, macOS / Linux에서는 `bin/scriptura` 런처가 `libexec/` 아래의 바이너리를 선택합니다. Windows에서도 hook이 Git Bash의 sh를 거치는 경우 같은 런처가 `bin/scriptura.exe`로 넘깁니다). 배포물을 빌드하는 방법은 `xtask/`(`cargo run --manifest-path xtask/Cargo.toml --locked -- package`)를 참조하십시오.
 
 ### Setup 판(자동 업데이트)
 
 `ScripturaApp-win-Setup.exe`(Windows), `ScripturaApp-osx-Setup.pkg`(macOS) 또는 AppImage `ScripturaApp-linux-x64.AppImage` / `ScripturaApp-linux-arm64.AppImage`(Linux x64 / arm64)를 실행하면 관리자 권한 없이 사용자 단위로 설치됩니다(Windows의 설치 위치는 `%LOCALAPPDATA%\ScripturaApp\current\scriptura.exe`입니다). 업데이트는 `https://scriptura-updates.kagayoi.com`에서 제공되며(`releases.<channel>.json`이라는 이름의 Velopack 피드이고 채널은 `win` / `osx` / `linux-x64` / `linux-arm64`), Windows 배포물은 Certum 인증서로 서명되어 있고 macOS 배포물은 Developer ID로 서명되어 공증을 마쳤습니다. 요구 사항: Apple Silicon의 macOS 11 이상(Intel은 지원하지 않음), glibc 2.39 이상의 Linux.
 
-- **등록은 자동입니다**: 설치 시점(Windows에서는 install hook, macOS와 Linux에서는 설치 후 인수 없이 처음 실행할 때)에 Claude Code `settings.json`의 Stop hook이 Setup 판의 실행 파일을 가리키도록 설정됩니다. Scriptura 자신의 hook만 교체합니다(이전 단독 설치 `%LOCALAPPDATA%\Programs\Scriptura\bin\scriptura.exe`를 가리키는 hook은 Setup 판의 것으로 교체되며, 이전 파일은 삭제하지 않습니다). 기존 `agents-maintenance` hook은 교체하지 않으며, `status` / `doctor` / 인수 없는 실행에서 `scriptura connect claude-code --apply`를 안내합니다.
+- **등록은 자동입니다**: 설치 시점(Windows에서는 install hook, macOS와 Linux에서는 설치 후 인수 없이 처음 실행할 때)에 Claude Code `settings.json`의 hook이 Setup 판의 실행 파일을 가리키도록 설정됩니다. Scriptura 자신의 hook만 교체합니다(이전 단독 설치 `%LOCALAPPDATA%\Programs\Scriptura\bin\scriptura.exe`를 가리키는 hook은 Setup 판의 것으로 교체되며, 이전 파일은 삭제하지 않습니다). 기존 `agents-maintenance` hook은 교체하지 않으며, `status` / `doctor` / 인수 없는 실행에서 `scriptura connect claude-code --apply`를 안내합니다.
 - **플러그인과의 중복 방지**: `settings.json`의 `enabledPlugins`에서 `scriptura@*`가 활성화되어 있으면 Setup 판은 `settings.json`에 등록하지 않습니다(등록하면 유지 관리가 두 번 실행되기 때문입니다). 플러그인을 계속 사용하거나, 플러그인을 비활성화하고 Setup 판으로 전환하는 것 중 하나를 선택하십시오. 비활성화한 뒤에는 인수 없는 실행 또는 다음 로그온 시 자동으로 등록됩니다.
 - **자동 업데이트(기본값 ON)**: hook의 유지 관리가 끝난 뒤 하루에 최대 한 번(성공과 실패 모두 24시간으로 제한) 새 버전을 확인하고 내려받기만 합니다. **적용은 로그온 시에만 이루어집니다**. 로그온 시 실행되는 `scriptura update-apply`(Windows에서는 HKCU Run 값 `<packId> Update`, macOS에서는 LaunchAgent `com.kagayoi.<packId>.update`, Linux에서는 XDG autostart 항목 `com.kagayoi.<packId>.update.desktop`)가 Scriptura의 hook이나 관리 화면이 실행 중이지 않은지 확인하고 서명자를 검증한 뒤, 재시작 없이 업데이트를 적용합니다. 실행 중인 것이 하나라도 있으면 아무것도 하지 않고 다음 로그온으로 넘깁니다(따라서 유지 관리 중인 hook이 강제 종료되는 일은 없습니다). 필요하면 관리 화면의 "업데이트 설치"(아래)로 직접 적용할 수도 있습니다.
 - 상태는 상태 폴더(아래에서 설명)에 저장됩니다. `app-update.json`(`auto_update`와 마지막 확인 / 실패 시각), `app-update.log`(진단용), `setup-registration.json`(등록 결과)입니다.
@@ -30,7 +30,7 @@ scriptura update                 # 자동 업데이트 설정, 마지막 확인,
 scriptura update --check         # 제한을 무시하고 지금 확인/내려받기 (다음 로그온 시 또는 update-apply를 수동 실행할 때 적용)
 scriptura update --auto off      # 자동 업데이트를 끔 (on으로 다시 켬)
 scriptura update-apply           # 내려받은 업데이트를 적용 (보통은 로그온 시 자동 실행)
-scriptura uninstall-setup        # Setup 판의 등록(Stop hook과 로그온 적용) 제거를 미리 보기
+scriptura uninstall-setup        # Setup 판의 등록(hook과 로그온 적용) 제거를 미리 보기
 scriptura uninstall-setup --apply
 ```
 
@@ -46,7 +46,9 @@ cargo build --release
 & "$env:LOCALAPPDATA\Programs\Scriptura\bin\scriptura.exe" connect claude-code --apply  # settings.json에 등록
 ```
 
-`connect claude-code --apply`는 고정된 설치 경로를 Claude Code `settings.json`(`CLAUDE_CONFIG_DIR` 또는 `~/.claude`)의 Stop hook에 등록합니다. 이전 `agents-maintenance`와 옛 Scriptura hook을 호출하는 hook만 hook 단위로 교체하며(같은 항목을 공유하는 다른 hook은 유지됩니다), 그 밖의 설정은 건드리지 않습니다. 명령이 `<executable> hook` 형태이고 실행 파일 이름이 `scriptura(.exe)`인 경우에만 Scriptura의 hook으로 간주하므로, 경로에 scriptura가 포함되어 있을 뿐인 다른 도구는 영향을 받지 않습니다. 첫 변경 전에 `settings.json.scriptura-backup`을 만들며, 손상된 JSON은 다시 쓰지 않습니다.
+`connect claude-code --apply`는 고정된 설치 경로를 Claude Code `settings.json`(`CLAUDE_CONFIG_DIR` 또는 `~/.claude`)의 hook에 등록합니다. 이전 `agents-maintenance`와 옛 Scriptura hook을 호출하는 hook만 hook 단위로 교체하며(같은 항목을 공유하는 다른 hook은 유지됩니다), 그 밖의 설정은 건드리지 않습니다. 명령이 `<executable> hook` 형태이고 실행 파일 이름이 `scriptura(.exe)`인 경우에만 Scriptura의 hook으로 간주하므로, 경로에 scriptura가 포함되어 있을 뿐인 다른 도구는 영향을 받지 않습니다. 첫 변경 전에 `settings.json.scriptura-backup`을 만들며, 손상된 JSON은 다시 쓰지 않습니다.
+
+이전 등록은 매 턴마다 실행되는 Stop hook을 사용했습니다. `--apply`와 Setup 판의 등록은 Scriptura의 옛 Stop hook을 제거하고 세 가지 hook으로 대체합니다. Bash·PowerShell 도구에서 `push`를 포함한 명령 뒤의 PostToolUse와 PostToolUseFailure(`git push && gh pr create`처럼 push 뒤에 실패했을 때 실행됨), 그리고 `startup` / `resume` 시의 SessionStart입니다. `--remove`는 새 hook과 옛 hook을 모두 제거합니다. 명령 뒤의 hook은 도구마다 권한 규칙 하나 `Bash(* push*)`(`PowerShell(* push*)`도 동일)로 좁히므로 `git push`, `rtk git push`, `git -C <path> push`, `FOO=1 git push`, `bash -lc 'git push'`, `make push`가 모두 해당합니다. `echo push x` 같은 불필요한 일치는 새 push를 찾지 못해 아무 일도 하지 않고 끝납니다. 이 hook은 비동기이며, 다른 유지 관리가 실행 중이어도 건너뛰지 않고 끝날 때까지 최대 25분 기다린 뒤 처리하므로, 유지 관리 중에 한 push도 나중에 처리됩니다. Claude Code 밖에서 한 push나 세션의 작업 폴더가 아닌 저장소로의 push(`git -C <다른 경로> push`)는 해당 저장소에서 다음에 세션을 시작할 때 처리됩니다. 옛 Stop hook도 (기다리지 않고) 계속 받아들이며, 그것으로 호출되면 사용자 수준 settings.json의 옛 등록을 새 hook으로 자동으로 한 번만 이전하고 메시지로 알립니다(원래 내용은 `settings.json.scriptura-migration-backup[-N]`에 백업하며, 프로젝트의 `.claude/settings*.json`은 건드리지 않고, `--remove`한 등록은 되돌리지 않습니다). scriptura 플러그인이 활성화되어 있으면 새 hook을 추가하지 않고 옛 hook만 제거합니다. Setup 판은 자체 등록 경로로 이전합니다.
 
 플러그인으로 옮길 때는 유지 관리가 두 번 실행되지 않도록 단독 등록을 제거하십시오(Scriptura의 항목만 제거하며 `agents-maintenance`나 다른 설정은 건드리지 않습니다).
 
@@ -92,7 +94,7 @@ exclude = ["private/**"]                        # 기본 민감 패턴에 추가
 [worker]
 model = "claude-sonnet-5-5"
 effort = "high"
-timeout_secs = 1200                             # 60..=1500 (Stop hook의 1800초보다 짧게)
+timeout_secs = 1200                             # 60..=1500 (hook의 1800초보다 짧게)
 permission = "restricted"                       # restricted / bypass
 claude_path = ""                                # 비어 있으면 PATH를 검색 (지정하면 절대 경로)
 
@@ -249,11 +251,11 @@ CLI, hook, 설치 프로그램의 안내 출력은 9개 언어(ja, en, zh-CN, zh
 | `run-now [--repo <path>] [--documents <id,...>]` | push를 기다리지 않고 지금 바로 유지 관리를 한 번 실행합니다(등록되었고 일시 중지되지 않은 저장소에 한하며, 시점은 무시하고 활성화된 모든 종류를 처리합니다). 문서는 일반 실행과 똑같이 commit·push됩니다. `--documents`는 처리할 종류를 좁힙니다(정의되지 않은 종류나 해당 저장소에서 비활성화된 종류는 worker를 시작하지 않고 거부됩니다). **주의**: 좁힌 `run-now`도 처리 완료 위치를 진행하므로, 좁힌 범위 밖의 종류는 그 push에 대해 유지 관리되지 않습니다. 성공하면 `outcome`은 `completed`입니다. |
 | `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | 문서 종류(내장과 커스텀)를 나열하고 하나의 상세(활성 또는 비활성, 대상 경로와 존재 여부, 상한, 시점, 템플릿 상태, 마지막 완료 시각. `show`는 설정된 guidance와 추가 지시도 출력합니다. 읽기 전용이며 문서 내용은 출력하지 않습니다)를 표시합니다. |
 | `ui [--port <n>] [--no-open] [--tray]` / `ui --autostart on\|off` | 관리 화면을 실행합니다(위에서 설명. `--tray`로 상주) / Setup 판의 로그온 시 상주를 전환합니다. `--json`은 사용할 수 없습니다. |
-| `connect claude-code [--apply] [--executable <absolute path>]` / `--remove [--apply]` | settings.json의 Stop hook을 등록합니다(이전 유지 관리 hook을 hook 단위로 교체) / Scriptura의 hook만 제거합니다. `--apply`를 지정하기 전까지는 미리 보기입니다. |
+| `connect claude-code [--apply] [--executable <absolute path>]` / `--remove [--apply]` | settings.json의 hook을 등록합니다(이전 유지 관리 hook을 hook 단위로 교체) / Scriptura의 hook만 제거합니다. `--apply`를 지정하기 전까지는 미리 보기입니다. |
 | `update [--check] [--auto on\|off]` | Setup 판의 자동 업데이트 상태를 표시 / 지금 확인하고 내려받기(적용하지 않음) / 자동 업데이트를 전환합니다. |
 | `update-apply` | 서명자를 검증한 뒤, 다른 Scriptura 프로세스가 실행 중이지 않을 때만 내려받은 업데이트를 적용합니다(로그온 시 자동으로 시작됩니다. 결과는 `status`가 `unmanaged` / `disabled` / `nothingPending` / `busy` / `untrusted`(종료 코드 2) / `applied` 중 하나인 JSON 한 줄입니다). |
-| `uninstall-setup [--apply]` | Setup 판의 등록(자기 자신을 가리키는 Stop hook과 로그온 적용)을 제거합니다. `--apply`를 지정하기 전까지는 미리 보기입니다. |
-| `install` / `hook` | 설치 위치에 배치합니다(기존의 고급 경로. 상태 폴더의 `install.json`에 기록됨) / Stop hook으로 실행합니다(보통 직접 호출하지 않습니다). |
+| `uninstall-setup [--apply]` | Setup 판의 등록(자기 자신을 가리키는 hook과 로그온 적용)을 제거합니다. `--apply`를 지정하기 전까지는 미리 보기입니다. |
+| `install` / `hook` | 설치 위치에 배치합니다(기존의 고급 경로. 상태 폴더의 `install.json`에 기록됨) / hook으로 실행합니다(보통 직접 호출하지 않습니다). |
 
 ## 안전
 

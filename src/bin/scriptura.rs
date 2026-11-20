@@ -28,7 +28,7 @@ fn main() -> ExitCode {
         return ExitCode::from(reply.code as u8);
     }
     match command {
-        // Claude Code の Stop hook から呼ばれる。stdin の JSON を読み、結果を stdout の JSON で返す。
+        // Claude Code の hook（git push 直後の PostToolUse とセッション開始時の SessionStart。旧登録の Stop も受け付ける）から呼ばれる。stdin の JSON を読み、結果を stdout の JSON で返す。
         Some("hook") => {
             maintenance::run();
             // Setup 版だけ、本処理の後に条件を満たせば更新を確認・取得する（適用はしない。stdout へは何も書かない）。

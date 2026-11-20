@@ -547,12 +547,118 @@ pub fn agents_size_error(
 ) -> Option<String> {
     agents_problem(root, directories, validate_sizes).map(|p| p.message())
 }
+/// 階層（ルートから子まで）の合計に数える 1 ファイル。`path` はリポジトリからの相対、`size` は実バイト
+/// （中身が空白だけなら 0 を数えるので、ここには 0 のものは入れない）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainMember {
+    pub path: String,
+    pub size: usize,
+    pub is_override: bool,
+    /// 今回 worker が編集できるか（個人用 override は常に false）。編集できないものは、commit される
+    /// 側（HEAD）の大きさも考えて、作業ツリーとの大きい方を `size` に入れる。
+    pub editable: bool,
+}
+/// AGENTS の大きさの検査で見つかった違反の全件版（`agents_problem` は先頭の 1 件だけ）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentsFinding {
+    File {
+        path: String,
+        size: usize,
+    },
+    Chain {
+        path: String,
+        size: usize,
+        members: Vec<ChainMember>,
+    },
+}
 pub fn agents_problem(
     root: &Path,
     directories: &[PathBuf],
     validate_sizes: bool,
 ) -> Option<AgentsProblem> {
-    let work = || -> Result<Option<AgentsProblem>> {
+    match scan_agents(root, directories, validate_sizes, false, None) {
+        Ok(found) => found.into_iter().next().map(|f| match f {
+            AgentsFinding::File { path, size } => AgentsProblem::File { path, size },
+            AgentsFinding::Chain { path, size, .. } => AgentsProblem::Chain { path, size },
+        }),
+        Err(e) => Some(AgentsProblem::Unverifiable(e)),
+    }
+}
+/// 大きさの違反を全件（重複なし）で返す。階層は、ルートから葉までの最も深い超過だけを報告する
+/// （より浅い祖先の超過は含まれるので省く）。`editable` は worker が編集できるパス（個人用 override は
+/// 含めても編集不可として扱う）。編集できないファイルは、作業ツリーと HEAD の blob の大きい方で数える
+/// （commit される側の大きさを過小に見ないため）。確認できなかったときは Err
+/// （呼び出し側は検査不能として別に扱う）。
+pub fn agents_findings(
+    root: &Path,
+    directories: &[PathBuf],
+    editable: &[String],
+) -> Result<Vec<AgentsFinding>> {
+    scan_agents(root, directories, true, true, Some(editable))
+}
+/// commit されるツリー（`touched` は作業ツリーの内容が commit に入る文書、それ以外は HEAD の内容）の
+/// AGENTS の大きさの違反。作業ツリーの大きさ検査（`agents_size_error`）と合わせて commit 前に使う。
+pub fn agents_commit_view_error(
+    root: &Path,
+    directories: &[PathBuf],
+    touched: &[String],
+) -> Option<String> {
+    match scan_agents(root, directories, true, false, Some(touched)) {
+        Ok(found) => found.into_iter().next().map(|f| match f {
+            AgentsFinding::File { path, size } => AgentsProblem::File { path, size },
+            AgentsFinding::Chain { path, size, .. } => AgentsProblem::Chain { path, size },
+        }),
+        Err(e) => Some(AgentsProblem::Unverifiable(e)),
+    }
+    .map(|p| p.message())
+}
+/// worker が編集できる AGENTS か（個人用 override は不可。許可パスとの照合は `is_allowed_path`）。
+fn agents_editable(root: &Path, editable: &[String], relative: &str) -> bool {
+    !Path::new(relative)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("AGENTS.override.md"))
+        && is_allowed_path(root, editable, relative)
+}
+/// 検査対象の AGENTS ファイルの内容（無ければ None）と、編集できるか。`editable` が None なら
+/// 作業ツリーの内容だけ。Some のとき、編集できないファイルは作業ツリーと HEAD の blob の大きい方を返す。
+fn agents_file_bytes(
+    root: &Path,
+    p: &Path,
+    editable: Option<&[String]>,
+) -> Result<Option<(Vec<u8>, bool)>> {
+    let worktree = match fs::symlink_metadata(p) {
+        Ok(m) => {
+            if !m.is_file() && !linked(&m) {
+                return Err(crate::t!("maint.not_regular_file", path = p.display()));
+            }
+            Some(fs::read(p).map_err(err)?)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(err(e)),
+    };
+    let Some(allowed) = editable else {
+        return Ok(worktree.map(|d| (d, true)));
+    };
+    let relative = safe_relative(root, p)?;
+    if agents_editable(root, allowed, &relative) {
+        return Ok(worktree.map(|d| (d, true)));
+    }
+    let head = run_git(root, &["cat-file", "blob", &format!("HEAD:{relative}")]);
+    Ok(match (worktree, head) {
+        (Some(a), Some(b)) => Some(if b.len() > a.len() { b } else { a }),
+        (a, b) => a.or(b),
+    }
+    .map(|d| (d, false)))
+}
+fn scan_agents(
+    root: &Path,
+    directories: &[PathBuf],
+    validate_sizes: bool,
+    all: bool,
+    editable: Option<&[String]>,
+) -> Result<Vec<AgentsFinding>> {
+    {
         let tracked = text(
             run_git(root, &["ls-files", "-z"]).ok_or(crate::t!("maint.agents_tracked_list"))?,
         )?;
@@ -563,8 +669,13 @@ pub fn agents_problem(
                 paths.insert((root.join(name).parent().unwrap().to_path_buf(), false));
             }
         }
+        let mut found: Vec<AgentsFinding> = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut seen_chains = BTreeSet::new();
         for (path, observed) in paths {
             let mut chain = 0;
+            let mut deepest: Option<(PathBuf, AgentsFinding)> = None;
+            let mut members: Vec<ChainMember> = Vec::new();
             for (index, d) in dirs(root, &path)?.into_iter().enumerate() {
                 if index > 0 {
                     match fs::symlink_metadata(&d) {
@@ -589,51 +700,82 @@ pub fn agents_problem(
                 let mut sizes = BTreeMap::new();
                 for name in ["AGENTS.override.md", "AGENTS.md"] {
                     let p = d.join(name);
-                    match fs::symlink_metadata(&p) {
-                        Ok(m) => {
-                            if !m.is_file() && !linked(&m) {
-                                return Err(crate::t!(
-                                    "maint.not_regular_file",
-                                    path = p.display()
-                                ));
-                            }
-                            let data = fs::read(&p).map_err(err)?;
-                            let size = data.len();
-                            if size >= LIMIT {
-                                return Ok(Some(AgentsProblem::File {
-                                    path: p.display().to_string(),
-                                    size,
-                                }));
-                            }
-                            sizes.insert(
-                                name,
-                                if instruction_has_content(&data) {
-                                    size
-                                } else {
-                                    0
-                                },
-                            );
+                    let Some((data, can_edit)) = agents_file_bytes(root, &p, editable)? else {
+                        continue;
+                    };
+                    let size = data.len();
+                    if size >= LIMIT {
+                        let finding = AgentsFinding::File {
+                            path: p.display().to_string(),
+                            size,
+                        };
+                        if !all {
+                            return Ok(vec![finding]);
                         }
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(err(e)),
+                        if seen.insert(p.clone()) {
+                            found.push(finding);
+                        }
                     }
+                    let counted = if instruction_has_content(&data) {
+                        size
+                    } else {
+                        0
+                    };
+                    sizes.insert(name, (counted, can_edit));
                 }
-                chain += sizes
-                    .get("AGENTS.override.md")
-                    .or_else(|| sizes.get("AGENTS.md"))
-                    .copied()
-                    .unwrap_or(0);
+                let chosen = if sizes.contains_key("AGENTS.override.md") {
+                    "AGENTS.override.md"
+                } else {
+                    "AGENTS.md"
+                };
+                let (counted, can_edit) = sizes.get(chosen).copied().unwrap_or((0, true));
+                chain += counted;
+                if counted > 0 {
+                    members.push(ChainMember {
+                        path: safe_relative(root, &d.join(chosen))?,
+                        size: counted,
+                        is_override: chosen == "AGENTS.override.md",
+                        editable: can_edit && chosen != "AGENTS.override.md",
+                    });
+                }
                 if chain >= LIMIT {
-                    return Ok(Some(AgentsProblem::Chain {
+                    let finding = AgentsFinding::Chain {
                         path: d.display().to_string(),
                         size: chain,
-                    }));
+                        members: members.clone(),
+                    };
+                    if !all {
+                        return Ok(vec![finding]);
+                    }
+                    deepest = Some((d.clone(), finding));
                 }
             }
+            // ルートから葉まで合計し、最も深い（合計が最大の）超過だけを報告する。
+            if let Some((dir, finding)) = deepest
+                && seen_chains.insert(dir)
+            {
+                found.push(finding);
+            }
         }
-        Ok(None)
-    };
-    work().unwrap_or_else(|e| Some(AgentsProblem::Unverifiable(e.to_string())))
+        if all {
+            // 別の超過の祖先にあたる階層は、深い側の超過に含まれるので省く。
+            let chain_dirs: Vec<PathBuf> = found
+                .iter()
+                .filter_map(|f| match f {
+                    AgentsFinding::Chain { path, .. } => Some(PathBuf::from(path)),
+                    _ => None,
+                })
+                .collect();
+            found.retain(|f| match f {
+                AgentsFinding::Chain { path, .. } => {
+                    let me = Path::new(path);
+                    !chain_dirs.iter().any(|o| o != me && o.starts_with(me))
+                }
+                _ => true,
+            });
+        }
+        Ok(found)
+    }
 }
 fn is_agents(path: &Path) -> bool {
     matches!(
@@ -2249,15 +2391,85 @@ fn due_kinds_for(
         .cloned()
         .collect())
 }
+/// イベント名を正規形（`PostToolUse` など）へ揃える。大文字小文字・`_`・`-` の違い（`post_tool_use` など）を吸収し、
+/// 知らない名前は空文字（何もしない）にする。
+fn canonical_event(raw: &str) -> &'static str {
+    let key: String = raw
+        .chars()
+        .filter(|c| !matches!(c, '_' | '-'))
+        .flat_map(char::to_lowercase)
+        .collect();
+    match key.as_str() {
+        // 失敗したコマンド（`git push && gh pr create` の後段の失敗など）も、push のあとなら処理する。
+        "posttooluse" | "posttoolusefailure" => "PostToolUse",
+        "sessionstart" => "SessionStart",
+        "userpromptsubmit" => "UserPromptSubmit",
+        "stop" => "Stop",
+        _ => "",
+    }
+}
+
+/// PostToolUse（PostToolUseFailure）の payload が push を含みうるか（Claude Code・Codex 共通。`tool_input.command` は
+/// 文字列または文字列の配列）。状態 DB・ロックに触れる前の軽い判定で、判定できない形（コマンドが取れない・未知のツール）は
+/// 処理側に倒す（push の有無は Git から検出するので、誤って通しても害がない）。
+/// コマンドに `push` の語（`pushd` などは含めない）があれば通す。`git` の語は要求しない。Claude Code の `if`
+/// （`* push*`）を通った `g push`・`make push`・`npm run push`・`$GIT push` や、`rtk git push`・`git -C <path> push`・
+/// 複合コマンド・`bash -c 'git push'` を落とさないため。ファイル編集・MCP のツールは対象外。
+pub fn payload_may_push(payload: &Value) -> bool {
+    let tool = payload["tool_name"].as_str().unwrap_or("");
+    let lower = tool.to_ascii_lowercase();
+    if [
+        "apply_patch",
+        "edit",
+        "multiedit",
+        "write",
+        "read",
+        "notebookedit",
+    ]
+    .contains(&lower.as_str())
+        || lower.starts_with("mcp__")
+    {
+        return false;
+    }
+    let command = match &payload["tool_input"]["command"] {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return true,
+    };
+    command
+        .split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .any(|token| token == "push")
+}
+
 pub fn handle_hook(payload: &Value) -> Result<Option<String>> {
-    let event = payload
-        .get("hook_event_name")
-        .or_else(|| payload.get("hookEventName"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if !["UserPromptSubmit", "Stop"].contains(&event) || payload["stop_hook_active"] == true {
+    let event = canonical_event(
+        payload
+            .get("hook_event_name")
+            .or_else(|| payload.get("hookEventName"))
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    );
+    // 現行の登録は PostToolUse（git push 直後）と SessionStart（取りこぼしの回収）。Stop と UserPromptSubmit は
+    // 旧登録の互換で受け付け続ける（移行が済むまで旧登録と重複して呼ばれても、poll ロックで直列になり安全）。
+    // Codex の hooks も同じイベント名・`cwd`・`tool_input.command` で呼ぶ。Codex には `if` のような絞り込みが無いので、
+    // PostToolUse は push を含まないコマンドをここで即座に終える。
+    if event.is_empty()
+        || payload["stop_hook_active"] == true
+        || (event == "PostToolUse" && !payload_may_push(payload))
+    {
         return Ok(None);
     }
+    // 非同期で動く新しい登録（PostToolUse・SessionStart）は、保守中でもロックを待って処理する。同期の
+    // UserPromptSubmit と旧登録の Stop は待たない（従来どおり、実行中なら見送って次の呼び出しに任せる）。
+    let lock_wait = if ["PostToolUse", "SessionStart"].contains(&event) {
+        HOOK_LOCK_WAIT
+    } else {
+        Duration::ZERO
+    };
     let Some(cwd) = payload["cwd"].as_str().filter(|v| !v.is_empty()) else {
         return Ok(None);
     };
@@ -2296,7 +2508,7 @@ pub fn handle_hook(payload: &Value) -> Result<Option<String>> {
             if !legacy_state_present() {
                 return Ok(None);
             }
-            let Some(held) = acquire_poll_lock()? else {
+            let Some(held) = acquire_poll_lock_waiting(lock_wait)? else {
                 return Ok(None);
             };
             lock = Some(held);
@@ -2353,7 +2565,7 @@ pub fn handle_hook(payload: &Value) -> Result<Option<String>> {
     }
     let lock = match lock {
         Some(held) => held,
-        None => match acquire_poll_lock()? {
+        None => match acquire_poll_lock_waiting(lock_wait)? {
             Some(held) => held,
             None => return Ok(notice),
         },
@@ -2448,10 +2660,19 @@ pub fn plan_for_decision(decision: &Decision) -> PollPlan {
 /// poll ロック（フック同士の排他）。実行中なら None。状態フォルダーを作るので、
 /// 判定を通った後にだけ呼ぶこと。
 pub(crate) fn acquire_poll_lock() -> Result<Option<Connection>> {
+    acquire_poll_lock_waiting(Duration::ZERO)
+}
+/// push 直後・セッション開始時の hook（非同期）がロックを待つ上限。worker の期限（既定 1200 秒。設定の上限は 1500 秒）と
+/// その前後の処理が終わるまで待てる長さ。ロックは全リポジトリ共通で worker の終了まで保持されるので、待たずに
+/// 見送ると、次の SessionStart まで push が拾われない（旧 Stop は次のターンで再試行されていた）。
+const HOOK_LOCK_WAIT: Duration = Duration::from_secs(1500);
+/// `acquire_poll_lock` と同じだが、実行中なら `wait` まで待つ（待つあいだは SQLite の busy ハンドラが再試行する）。
+/// 待っても取れなければ None。
+pub(crate) fn acquire_poll_lock_waiting(wait: Duration) -> Result<Option<Connection>> {
     let lock_path = state_db_path().with_extension("poll-lock.sqlite3");
     fs::create_dir_all(lock_path.parent().unwrap()).map_err(err)?;
     let lock = Connection::open(lock_path).map_err(err)?;
-    lock.busy_timeout(Duration::ZERO).map_err(err)?;
+    lock.busy_timeout(wait).map_err(err)?;
     if lock.execute_batch("BEGIN IMMEDIATE").is_err() {
         return Ok(None);
     }
@@ -2530,10 +2751,29 @@ pub fn run() {
         } else {
             serde_json::from_str(&raw).map_err(err)?
         };
-        if payload.is_object() {
-            handle_hook(&payload)
+        if !payload.is_object() {
+            return Ok(None);
+        }
+        // Stop で呼ばれた = 旧登録が残っている。ユーザー単位の settings.json を新しい登録へ移行する
+        // （ベストエフォート。状態フォルダー・DB には触れない）。
+        let event = payload
+            .get("hook_event_name")
+            .or_else(|| payload.get("hookEventName"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let migrated = if canonical_event(event) == "Stop" {
+            crate::connect::migrate_old_stop_registration()
         } else {
-            Ok(None)
+            None
+        };
+        match (migrated, handle_hook(&payload)) {
+            (Some(n), Ok(Some(m))) => Ok(Some(crate::t!(
+                "maint.join_sentences",
+                first = n,
+                second = m
+            ))),
+            (Some(n), Ok(None) | Err(_)) => Ok(Some(n)),
+            (None, result) => result,
         }
     };
     match work() {
@@ -2835,11 +3075,11 @@ fn run_worker_outcome(
     let executable = claude_executable(&options.worker);
     let mut c = command(&executable.to_string_lossy());
     // 非対話（-p）でプロンプトは stdin から渡す。
-    // WORKER_ENV=1 により、worker 自身の Stop フックから本フックが再帰起動しても即終了する。
+    // WORKER_ENV=1 により、worker 自身の hook から本フックが再帰起動しても即終了する。
     c.args(worker_args(&options.worker, allowed, &options.exclude))
         .current_dir(root)
         .env(WORKER_ENV, "1");
-    // Claude デスクトップのセッションから Stop フック経由で起動されると、ホスト用の環境変数
+    // Claude デスクトップのセッションから hook 経由で起動されると、ホスト用の環境変数
     // （中継先の ANTHROPIC_BASE_URL、CLAUDECODE、CLAUDE_CODE_SIMPLE などの CLAUDE_CODE_*）を継承する。
     // そのままでは worker が親セッション向けの中継・認証設定で起動して認証に失敗したり、
     // フックを省く簡易モードになったりするため、取り除いて単体 CLI のログイン情報で動かす。
@@ -3097,21 +3337,123 @@ fn fixable_problems(
         .into_iter()
         .filter(crate::kinds::Violation::is_soft)
         .collect();
-    let agents = match agents_problem(root, size_dirs, true) {
-        Some(AgentsProblem::File { path, size }) => {
-            let relative = safe_relative(root, Path::new(&path)).unwrap_or(path);
-            if editable.iter().any(|e| e == &relative) {
-                vec![crate::kinds::AgentsOver {
-                    path: relative,
-                    size: size as u64,
-                }]
-            } else {
-                Vec::new()
+    let agents = agents_overs(root, size_dirs, editable)
+        .into_iter()
+        .filter(crate::kinds::AgentsOver::is_absorbable)
+        .collect();
+    (violations, agents)
+}
+/// AGENTS の大きさの違反を、worker へ示す形（編集可否・必要削減量つき）で全件返す。測れないときは空。
+/// 編集できる構成ファイルでは吸収できない階層の超過も含む（呼び出し側が `is_absorbable` で分ける）。
+fn agents_overs(
+    root: &Path,
+    size_dirs: &[PathBuf],
+    editable: &[String],
+) -> Vec<crate::kinds::AgentsOver> {
+    use crate::kinds::{AgentsFile, AgentsOver};
+    let Ok(findings) = agents_findings(root, size_dirs, editable) else {
+        return Vec::new();
+    };
+    let relative = |path: &str| safe_relative(root, Path::new(path)).unwrap_or(path.to_string());
+    let cut = |size: usize| (size as u64).saturating_sub(LIMIT as u64 - 1);
+    let mut overs: Vec<AgentsOver> = Vec::new();
+    // 編集できる単体超過。階層の超過に同じファイルが含まれるときは、二重にならないよう階層側を省く。
+    for f in &findings {
+        if let AgentsFinding::File { path, size } = f {
+            let path = relative(path);
+            if agents_editable(root, editable, &path) {
+                overs.push(AgentsOver {
+                    path,
+                    size: *size as u64,
+                    members: Vec::new(),
+                    required_cut: cut(*size),
+                });
             }
         }
-        _ => Vec::new(),
-    };
-    (violations, agents)
+    }
+    let single: Vec<String> = overs.iter().map(|o| o.path.clone()).collect();
+    for f in findings {
+        let AgentsFinding::Chain {
+            path,
+            size,
+            members,
+        } = f
+        else {
+            continue;
+        };
+        if members.iter().any(|m| single.contains(&m.path)) {
+            continue;
+        }
+        let dir = match relative(&path) {
+            d if d.is_empty() => ".".to_string(),
+            d => d,
+        };
+        overs.push(AgentsOver {
+            path: dir,
+            size: size as u64,
+            required_cut: cut(size),
+            members: members
+                .into_iter()
+                .map(|m| AgentsFile {
+                    editable: m.editable,
+                    path: m.path,
+                    size: m.size as u64,
+                    is_override: m.is_override,
+                })
+                .collect(),
+        });
+    }
+    overs
+}
+/// 保守後も AGENTS の大きさを満たせなかったときに、利用者へ渡す内訳（どのファイルを何バイト削る必要が
+/// あるか、編集できなかったファイルとその理由）。見出しの文字列などは含めない。違反が無ければ None。
+fn agents_shortfall_note(
+    root: &Path,
+    size_dirs: &[PathBuf],
+    editable: &[String],
+) -> Option<String> {
+    let overs = agents_overs(root, size_dirs, editable);
+    if overs.is_empty() {
+        return None;
+    }
+    let separator = crate::t!("list.separator");
+    let mut parts: Vec<String> = Vec::new();
+    let mut locked: Vec<String> = Vec::new();
+    for o in &overs {
+        let files = if o.members.is_empty() {
+            o.path.clone()
+        } else {
+            o.members
+                .iter()
+                .map(|m| format!("{} ({})", m.path, m.size))
+                .collect::<Vec<_>>()
+                .join(&separator)
+        };
+        parts.push(crate::t!(
+            "maint.agents_cut_needed",
+            path = o.path,
+            size = o.size,
+            bytes = o.required_cut,
+            files = files
+        ));
+        locked.extend(
+            o.members
+                .iter()
+                .filter(|m| !m.editable)
+                .map(|m| m.path.clone()),
+        );
+    }
+    locked.sort();
+    locked.dedup();
+    let mut note = parts.join(&separator);
+    if !locked.is_empty() {
+        note = crate::t!(
+            "maint.join_sentences",
+            first = note,
+            second = crate::t!("maint.agents_not_editable", paths = locked.join(&separator))
+        );
+    }
+    Some(note)
 }
 /// worker の出力を破棄する。編集を許したパスのうち、現在の内容が worker 終了時の記録（`after`）と一致する
 /// ものだけを変更前に戻す（追跡済みは HEAD から復元、worker が作った未追跡の新規ファイルは削除）。
@@ -3148,11 +3490,33 @@ fn discard_outputs(root: &Path, state: &Value) -> Vec<String> {
             &["restore", "--worktree", "--source=HEAD", "--", relative],
         )
         .is_none()
+            || !matches_before(root, relative, before_digest)
+                && !restore_blob_bytes(root, relative, before_digest)
         {
             kept.push(relative.clone());
         }
     }
     kept
+}
+/// 復元後の内容が記録（変更前）のハッシュと一致しているか。
+fn matches_before(root: &Path, relative: &str, before_digest: &Value) -> bool {
+    document_hash(root, relative)
+        .map(|v| json!(v))
+        .is_ok_and(|v| v == *before_digest)
+}
+/// `git restore` は改行の変換（core.autocrlf=true なら CRLF）をかけるので、変更前と違う内容になることがある。
+/// その場合は HEAD の blob を変換なしでそのまま書き、記録と一致することを確かめる。
+/// 一致しなければ（書けない・内容が違う）false を返す。
+fn restore_blob_bytes(root: &Path, relative: &str, before_digest: &Value) -> bool {
+    let Some(data) = run_git(root, &["cat-file", "blob", &format!("HEAD:{relative}")]) else {
+        return false;
+    };
+    // 書く前に、blob が記録（変更前）と同じ内容で、対象が安全に扱えることを確かめる
+    // （HEAD が進んでいる経路で、別の内容へ書き換えない）。
+    if json!(hash(&data)) != *before_digest || document_hash(root, relative).is_err() {
+        return false;
+    }
+    fs::write(root.join(relative), data).is_ok() && matches_before(root, relative, before_digest)
 }
 fn fail(path: &Path, state: &mut Value, message: impl Into<String>) -> Result<Option<String>> {
     let message = message.into();
@@ -3542,6 +3906,23 @@ pub fn publish_locked_with(
         }
         save_publication(path, &mut state)?;
     }
+    // ready（worker 完了後・保守後検査の前）で止まっていた記録に、編集できるファイルで直せる AGENTS の
+    // 超過が残っているときは、1 回だけ違反を直す再実行へ戻る（再実行の判断は worker 実行中と同じ）。
+    let resume_fix: Vec<crate::kinds::AgentsOver> =
+        if s(&state, "phase") == "ready" && state["agents_resumed"].is_null() {
+            let editable: Vec<String> = state["before"]
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            fixable_problems(root, &options.resolved_kinds(), &editable, &size_dirs).1
+        } else {
+            Vec::new()
+        };
+    if !resume_fix.is_empty() {
+        state["agents_resumed"] = json!(true);
+        state["phase"] = json!("worker_failed");
+        save_publication(path, &mut state)?;
+    }
     if ["worker_pending", "worker_failed"].contains(&s(&state, "phase").as_str()) {
         if let Some(e) = agents_size_error(root, &size_dirs, false) {
             return fail(
@@ -3615,9 +3996,14 @@ pub fn publish_locked_with(
         } else {
             None
         };
+        let existing_agents: Vec<_> = agents_overs(root, &size_dirs, &allowed)
+            .into_iter()
+            .filter(crate::kinds::AgentsOver::is_absorbable)
+            .collect();
         let prompt = format!(
-            "{reason} To protect uncommitted changes that existed at the start, the only editable paths are those in this JSON array: {}. Even for candidate documents, do not edit paths that are not in this array (they have existing changes or similar), and skip maintaining them this time. Even within the array, edit only the files that actually need it.",
-            json!(allowed)
+            "{reason} To protect uncommitted changes that existed at the start, the only editable paths are those in this JSON array: {}. Even for candidate documents, do not edit paths that are not in this array (they have existing changes or similar), and skip maintaining them this time. Even within the array, edit only the files that actually need it.{}",
+            json!(allowed),
+            crate::kinds::agents_required_note(&existing_agents)
         );
         state["phase"] = json!("worker_running");
         save_publication(path, &mut state)?;
@@ -3627,7 +4013,15 @@ pub fn publish_locked_with(
         let started = std::time::Instant::now();
         let mut fixups = 0u32;
         let mut pre_snapshot = pre_snapshot;
-        let mut prompt = prompt;
+        // 「縮んでいるか」の比較元。最初の起動が違反を直す再実行（ready からの再開）のときだけ、開始時の
+        // 超過量。通常の最初の起動は保守そのものなので、増えても構わず、その後の測定から比べる。
+        let mut prev_excess: Option<u64> =
+            Some(resume_fix.iter().map(|a| a.required_cut).sum()).filter(|n| *n > 0);
+        let mut prompt = if resume_fix.is_empty() {
+            prompt
+        } else {
+            crate::kinds::fixup_prompt(&resolved_kinds, &[], &resume_fix, &allowed)
+        };
         let mut timeout = Duration::from_secs(options.worker.timeout_secs);
         let error = loop {
             let outcome = run_worker_outcome(root, &prompt, &allowed, options, timeout);
@@ -3677,12 +4071,24 @@ pub fn publish_locked_with(
                 after.insert(relative.clone(), json!(document_hash(root, relative)?));
             }
             state["after"] = json!(after);
-            if error.is_some() || fixups >= crate::kinds::MAX_FIXUPS {
+            if error.is_some() {
                 break error;
             }
-            let (violations, agents) =
+            let (violations, mut agents) =
                 fixable_problems(root, &resolved_kinds, &allowed, &size_dirs);
-            if violations.is_empty() && agents.is_empty() {
+            // AGENTS の超過は毎回測り直し、前回より縮んでいなければ続けても進まないので打ち切る。
+            let excess: u64 = agents.iter().map(|a| a.required_cut).sum();
+            if prev_excess.is_some_and(|p| excess >= p) {
+                agents.clear();
+            } else if excess > 0 {
+                prev_excess = Some(excess);
+            }
+            let max_fixups = if agents.is_empty() {
+                crate::kinds::MAX_FIXUPS
+            } else {
+                crate::kinds::MAX_AGENTS_FIXUPS
+            };
+            if (violations.is_empty() && agents.is_empty()) || fixups >= max_fixups {
                 break None;
             }
             let Some(budget) =
@@ -3725,7 +4131,26 @@ pub fn publish_locked_with(
         .cloned()
         .collect();
     let resolved = options.resolved_kinds();
-    let mut hard = agents_size_error(root, &size_dirs, true);
+    // commit に入る文書（記録が変更前と違うもの・無視から外れるもの）は作業ツリーの内容、それ以外は HEAD の
+    // 内容で数えた階層の大きさも検査する（編集できない文書を作業ツリーで過小に数えて、commit されるツリーが
+    // 上限を超えるのを防ぐ）。
+    let touched: Vec<String> = {
+        let after = &state["after"];
+        let ignored: Vec<&str> = state["ignored_before"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        editable
+            .iter()
+            .filter(|k| {
+                after.get(k.as_str()) != state["before"].get(k.as_str())
+                    || ignored.contains(&k.as_str())
+            })
+            .cloned()
+            .collect()
+    };
+    let mut hard = agents_size_error(root, &size_dirs, true)
+        .or_else(|| agents_commit_view_error(root, &size_dirs, &touched));
     let violations = crate::kinds::check_documents(root, &resolved, &editable);
     if hard.is_none()
         && let Some(v) = violations.iter().find(|v| !v.is_soft())
@@ -3755,6 +4180,10 @@ pub fn publish_locked_with(
             state["after"] = state["before"].clone();
         }
         let mut message = crate::t!("maint.output_discarded", error = e);
+        // AGENTS の大きさが原因なら、利用者が直すために、どのファイルを何バイト削る必要があるかを添える。
+        if let Some(shortfall) = agents_shortfall_note(root, &size_dirs, &editable) {
+            message = crate::t!("maint.join_sentences", first = message, second = shortfall);
+        }
         if !kept.is_empty() {
             message = crate::t!(
                 "maint.join_sentences",
