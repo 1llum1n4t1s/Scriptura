@@ -1,7 +1,7 @@
 //! CHANGELOG 固有の処理（src/changelog.rs）の契約テスト。
 //! - 純粋関数: 節の分割、リリース済みエントリ不変の検査（規則 1〜6）、版とタグの照合、資料の上限。
 //! - I/O: 実際の Git リポジトリでの起点・範囲内のタグ・履歴の収集・遡り・release の期限判定・保守後検査。
-//! push 検知・worker との結合は tests/maintenance.rs と tests/proposal.rs。
+//! push 検知・worker との結合は tests/maintenance.rs。
 use scriptura::changelog::{
     self, CHANGELOG_PATH, MATERIAL_MAX_BYTES, OWN_COMMIT_SUBJECT, base_commit, builtin_template,
     check_released_entries, collect_material, fit_material, has_version_section, parse,
@@ -785,7 +785,7 @@ fn changelog_spelling_is_resolved_from_the_tree_case_insensitively() {
 #[test]
 fn post_worker_check_resolves_a_differently_cased_changelog_and_fails_closed_when_ambiguous() {
     let kind = changelog_kind();
-    // Git 上は Changelog.md、作業ツリー側の名前は既定の CHANGELOG.md（propose の許可パス）。
+    // Git 上は Changelog.md、作業ツリー側の名前は既定の CHANGELOG.md（許可パス）。
     // 大文字小文字を区別しないファイルシステムでだけ同じファイルを指す。
     let r = Repo::new("check-spelling");
     let head = r.commit("Changelog.md", KAC, "CHANGELOG");

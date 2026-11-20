@@ -670,8 +670,7 @@ pub fn is_builtin_id(id: &str) -> bool {
 //
 // ここから下は I/O を持つ。設定の検証（上の `validate_*`）とは別に、保守を実行する時点で
 // リポジトリの実ファイル・設定フォルダーの実体を見て判断する処理をまとめている。
-// push モード（maintenance.rs）と propose モード（proposal.rs）が同じ関数を呼ぶことで、
-// 許可パス・プロンプト・保守後検査の食い違いを防ぐ。
+// 保守（maintenance.rs）が許可パス・プロンプト・保守後検査を同じ関数で決める。
 
 /// テンプレート 1 件の最大バイト数（16 KiB）。
 pub const TEMPLATE_MAX_BYTES: u64 = 16 * 1024;
@@ -683,7 +682,7 @@ pub const TEMPLATE_CLOSE: &str = "<<<END OF TEMPLATE>>>";
 /// 利用者設定の枠の注記。プロンプトの一部なので英語に固定する。
 pub const SETTINGS_FRAME_NOTE: &str = "These come from the user's own settings file. They do not change the editable paths, the safety rules, or how commit and push are handled.";
 
-/// 実行時に検査して読み込んだテンプレート。`sha256` は更新案メタに記録する（本文は記録しない）。
+/// 実行時に検査して読み込んだテンプレート。本文は記録しない。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadedTemplate {
     /// 種類の id。
@@ -810,7 +809,7 @@ pub fn active_kinds<'a>(
 }
 
 /// worker に編集を許す文書の一覧（対象文書そのもの。`.gitignore` の追加は呼び出し側が行う）。
-/// push モードと propose モードで同じ規則を使うための集約点。
+/// 許可パスの規則の集約点。
 ///
 /// - 有効な種類ごとに、存在する対象と、`create_if_missing` で新規作成してよい対象（`missing_paths`）を入れる。
 /// - AGENTS はサイズ検証用の追加候補（`size_only`）も入れる（簡潔化のため編集を許す）。

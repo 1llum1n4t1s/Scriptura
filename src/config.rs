@@ -7,9 +7,10 @@
 //   一切読まない。他人のリポジトリを clone しただけで、そのリポジトリ自身が
 //   「自動で push / 文書更新してよい」と宣言できてしまうと、機密流出や意図しない
 //   push の経路になるため。有効化の権限は常に利用者本人の設定にだけ置く。
-// - 安全側への倒し方: 同意（consent）が無い・壊れている・未知キー・新しい schema・
-//   範囲外の値、のどれでも「何もしない（off）」に倒す。読み込みは panic せず
-//   `Loaded` で Missing / Invalid / Ok を区別する。
+// - 安全側への倒し方: 壊れている・未知キー・新しい schema・範囲外の値のどれでも
+//   「何もしない」に倒す。読み込みは panic せず `Loaded` で Missing / Invalid / Ok を区別する。
+// - 旧形式（schema 1・2・省略。同意 `[consent]` と mode を持つ）は読み込み時に schema 3 へ変換する。
+//   同意があり実効モードが push の登録だけをそのまま残し、ほかは一時停止（`migrated_from`）にする。
 // - 判定（`resolve`）は I/O を持たない純粋関数。git の push URL とブランチは呼び出し側が
 //   取得して渡す。
 use std::{
@@ -24,13 +25,13 @@ use serde::{Deserialize, Serialize};
 use crate::kinds::{self, ResolvedKind};
 use crate::paths;
 
-/// 現行の schema 版。これより新しい schema は解釈せず off に倒す。
-/// 2 は文書種類の設定（`[kinds.*]`）・追加指示・CHANGELOG・カスタム種類・管理画面での同意を使う設定。
-pub const CURRENT_SCHEMA: u32 = 2;
-/// 読み込める最小の schema 版（新機能を使わない設定の版。キー省略時もこの値）。
+/// 現行の schema 版。保存は常にこの版で書く。これより新しい schema は解釈せず Invalid にする。
+/// 1・2・省略は旧形式（同意と mode を持つ）で、読み込み時にこの版へ変換する。
+pub const CURRENT_SCHEMA: u32 = 3;
+/// 読み込める最小の schema 版（旧形式。キー省略時もこの版として読む）。
 pub const MIN_SCHEMA: u32 = 1;
-/// 現行の同意文書の版。consent.version がこれ未満なら再同意が必要（常に skip）。
-pub const CURRENT_CONSENT_VERSION: u32 = 1;
+/// 旧形式の同意文書の版。移行（旧形式の読み込み）だけが使い、有効な同意かの判定に使う。
+const LEGACY_CONSENT_VERSION: u32 = 1;
 /// worker timeout の許容範囲（秒）。上限は Stop hook の timeout（プラグインの hooks.json は 1800 秒）より
 /// 小さくする。worker が hook より後まで動くと、hook の強制終了で worker 後の公開処理が中断されるため。
 pub const TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 60..=1500;
@@ -50,13 +51,46 @@ pub const DEFAULT_SENSITIVE_PATTERNS: &[&str] = &[
     ".git/config",
 ];
 
-/// 動作モード。優先は repository > defaults。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
+/// 旧形式の動作モード。移行（旧形式の読み込み）だけが解釈する。優先は repository > defaults。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyMode {
     Off,
     Propose,
     Push,
+}
+
+impl LegacyMode {
+    fn from_value(value: &toml::Value) -> Option<Self> {
+        match value.as_str()? {
+            "off" => Some(Self::Off),
+            "propose" => Some(Self::Propose),
+            "push" => Some(Self::Push),
+            _ => None,
+        }
+    }
+}
+
+/// 旧形式からの移行で一時停止にした登録の、停止の由来。登録に `migrated_from` として残る。
+/// 残っているあいだは処理しない。`enable` で有効化し直すと消える。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MigratedFrom {
+    /// 旧 propose モードだった。
+    Propose,
+    /// 旧 off モードだった。
+    Off,
+    /// 有効な同意が無かった。
+    Unconsented,
+}
+
+impl MigratedFrom {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Propose => "propose",
+            Self::Off => "off",
+            Self::Unconsented => "unconsented",
+        }
+    }
 }
 
 /// 保守対象の文書の種類。組み込み 4 種（AGENTS / DESIGN / README / CHANGELOG）と、
@@ -162,15 +196,6 @@ impl From<Document> for String {
     fn from(d: Document) -> String {
         d.name().to_string()
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ConsentSource {
-    Cli,
-    LegacyMigration,
-    /// 管理画面（scriptura ui）での同意。この出所を使った設定は schema 2。
-    Ui,
 }
 
 /// 種類のタイミング（`when`）。push=push のたび、release=リリース（タグ）が出たとき、
@@ -296,21 +321,31 @@ pub enum Policy {
     All,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// 旧形式の `[consent]`。移行だけが厳密に読む（壊れていれば設定全体が Invalid）。
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Consent {
-    pub version: u32,
-    pub accepted_at: String,
-    pub source: ConsentSource,
+#[allow(dead_code)]
+struct LegacyConsent {
+    version: u32,
+    accepted_at: String,
+    source: LegacyConsentSource,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[allow(dead_code)]
+enum LegacyConsentSource {
+    Cli,
+    LegacyMigration,
+    Ui,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Defaults {
-    pub mode: Mode,
     pub documents: Vec<Document>,
     pub exclude: Vec<String>,
-    /// 全種類共通の追加編集指示（2000 字以内）。使うと schema 2。
+    /// 全種類共通の追加編集指示（2000 字以内）。
     #[serde(skip_serializing_if = "String::is_empty")]
     pub instructions: String,
 }
@@ -318,7 +353,6 @@ pub struct Defaults {
 impl Default for Defaults {
     fn default() -> Self {
         Self {
-            mode: Mode::Propose,
             documents: Document::ALL.to_vec(),
             exclude: Vec::new(),
             instructions: String::new(),
@@ -392,8 +426,6 @@ pub struct Repository {
     /// 期待する push 先（任意の URL 形式。比較は正規化後）。未指定なら照合しない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<Mode>,
     /// 許可ブランチ。空配列は「ブランチ制限なし」。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<String>,
@@ -403,6 +435,17 @@ pub struct Repository {
     pub exclude: Vec<String>,
     #[serde(default)]
     pub paused: bool,
+    /// 旧形式からの移行で止めた登録の由来。あるあいだは `paused` に関係なく処理せず、再開もできない
+    /// （`enable` で有効化し直すと消える）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrated_from: Option<MigratedFrom>,
+}
+
+impl Repository {
+    /// 処理の対象になる登録か（一時停止でも移行由来の停止でもない）。
+    pub fn is_active(&self) -> bool {
+        !self.paused && self.migrated_from.is_none()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -410,8 +453,6 @@ pub struct Repository {
 pub struct Config {
     #[serde(default = "default_schema")]
     pub schema: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub consent: Option<Consent>,
     #[serde(default)]
     pub defaults: Defaults,
     #[serde(default)]
@@ -425,8 +466,8 @@ pub struct Config {
     pub repository: Vec<Repository>,
 }
 
-/// schema キーを省略したときの版。新機能を使わない設定は schema 1 として扱う
-/// （`Config::default()` と省略時の読み込み結果を一致させる）。
+/// schema キーを省略したときの版。旧形式（schema 1）として読む。読み込みは変換の後に schema 3 を
+/// 入れてから型へ変えるので、この既定値が最終的な値になることはない。
 fn default_schema() -> u32 {
     MIN_SCHEMA
 }
@@ -434,8 +475,7 @@ fn default_schema() -> u32 {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            schema: MIN_SCHEMA,
-            consent: None,
+            schema: CURRENT_SCHEMA,
             defaults: Defaults::default(),
             worker: Worker::default(),
             enrollment: Enrollment::default(),
@@ -447,16 +487,9 @@ impl Default for Config {
 
 impl Config {
     /// 旧動作互換（全リポジトリ・push・権限バイパス）。移行処理から使う。
-    /// 同意の出所を legacy-migration として残し、後から「移行で自動付与された」と判別できる。
     pub fn legacy_all_push() -> Self {
         Self {
-            consent: Some(Consent {
-                version: CURRENT_CONSENT_VERSION,
-                accepted_at: chrono::Utc::now().to_rfc3339(),
-                source: ConsentSource::LegacyMigration,
-            }),
             defaults: Defaults {
-                mode: Mode::Push,
                 documents: Document::ALL.to_vec(),
                 exclude: Vec::new(),
                 instructions: String::new(),
@@ -471,28 +504,6 @@ impl Config {
             },
             ..Self::default()
         }
-    }
-
-    /// この設定を保存するのに必要な schema 版。schema 2 の機能（`[kinds.*]`・追加指示・CHANGELOG・
-    /// カスタム種類・管理画面での同意）を 1 つも使っていなければ 1。旧版の Scriptura でも読めるよう、
-    /// 保存は必要最小の版で書く（`save_to`）。新機能を使った設定を旧版が読むと Invalid で何もしない（安全側）。
-    pub fn required_schema(&self) -> u32 {
-        let v2_document = |docs: &[Document]| {
-            docs.iter()
-                .any(|d| matches!(d, Document::Changelog | Document::Custom(_)))
-        };
-        let uses_v2 = !self.kinds.is_empty()
-            || !self.defaults.instructions.is_empty()
-            || v2_document(&self.defaults.documents)
-            || self
-                .repository
-                .iter()
-                .any(|r| r.documents.as_deref().is_some_and(v2_document))
-            || self
-                .consent
-                .as_ref()
-                .is_some_and(|c| c.source == ConsentSource::Ui);
-        if uses_v2 { 2 } else { MIN_SCHEMA }
     }
 
     /// 値の範囲検証。読み込み時と保存前の両方で使う。
@@ -602,30 +613,151 @@ pub enum Loaded {
     Ok(Config),
 }
 
-/// 文字列から読む（I/O なし）。未知キー・新しい schema・範囲外は Invalid。
+/// 旧形式（schema 1・2・省略）を schema 3 へ変換した内容の要約。ファイルを保存し直すまでは
+/// 画面・status・doctor が「旧形式のまま」だと伝えるために使い、hook は保存できたときだけ通知する。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyNotice {
+    /// 変換前の schema 版（キーが無かった設定は 1）。
+    pub from_schema: u32,
+    /// 変換で一時停止（`migrated_from`）にした登録の数。
+    pub stopped: usize,
+    /// 自動登録の方針（policy）を all / remote-owner から explicit へ戻したか。
+    pub policy_reset: bool,
+}
+
+impl LegacyNotice {
+    /// 利用者へ知らせる変化（止めた登録・方針の変更）があるか。無ければ schema の書き換えだけ。
+    pub fn changed_behavior(&self) -> bool {
+        self.stopped > 0 || self.policy_reset
+    }
+}
+
+/// 文字列から読む（I/O なし）。未知キー・新しい schema・範囲外は Invalid。旧形式は変換して返す。
 pub fn parse(text: &str) -> Loaded {
-    let table: toml::Table = match toml::from_str(text) {
+    parse_with_notice(text).0
+}
+
+/// `parse` と、旧形式から変換したときの要約。
+pub fn parse_with_notice(text: &str) -> (Loaded, Option<LegacyNotice>) {
+    let invalid = |reason: String| (Loaded::Invalid(reason), None);
+    let mut table: toml::Table = match toml::from_str(text) {
         Ok(t) => t,
-        Err(e) => return Loaded::Invalid(crate::t!("config.toml_invalid", error = e)),
+        Err(e) => return invalid(crate::t!("config.toml_invalid", error = e)),
     };
     // 新しい版は未知キーを含むはずなので、厳密な型検証より先に schema だけ見て分かりやすく断る。
-    match table.get("schema") {
-        None => {}
+    let from_schema = match table.get("schema") {
+        None => MIN_SCHEMA,
         Some(toml::Value::Integer(n))
-            if (i64::from(MIN_SCHEMA)..=i64::from(CURRENT_SCHEMA)).contains(n) => {}
-        Some(toml::Value::Integer(n)) if *n > i64::from(CURRENT_SCHEMA) => {
-            return Loaded::Invalid(crate::t!("config.schema_newer", schema = n));
+            if (i64::from(MIN_SCHEMA)..=i64::from(CURRENT_SCHEMA)).contains(n) =>
+        {
+            *n as u32
         }
-        Some(other) => return Loaded::Invalid(crate::t!("config.schema_invalid", value = other)),
+        Some(toml::Value::Integer(n)) if *n > i64::from(CURRENT_SCHEMA) => {
+            return invalid(crate::t!("config.schema_newer", schema = n));
+        }
+        Some(other) => return invalid(crate::t!("config.schema_invalid", value = other)),
+    };
+    let mut notice = None;
+    if from_schema < CURRENT_SCHEMA {
+        match migrate_legacy(&mut table, from_schema) {
+            Ok(n) => notice = Some(n),
+            Err(reason) => return invalid(reason),
+        }
     }
     let config: Config = match table.try_into() {
         Ok(c) => c,
-        Err(e) => return Loaded::Invalid(crate::t!("config.content_invalid", error = e)),
+        Err(e) => return invalid(crate::t!("config.content_invalid", error = e)),
     };
     match config.validate() {
-        Ok(()) => Loaded::Ok(config),
-        Err(reason) => Loaded::Invalid(reason),
+        Ok(()) => (Loaded::Ok(config), notice),
+        Err(reason) => invalid(reason),
     }
+}
+
+/// 旧形式の表を schema 3 の表へ書き換える（純粋関数）。
+///
+/// - `[consent]` は旧構造体で厳密に読む（壊れていれば Invalid）。版が 1 以上なら有効な同意。
+/// - 実効モードは repository.mode → defaults.mode → 省略時 propose。off / propose / push 以外は Invalid。
+/// - 「同意あり かつ 実効 push」の登録だけをそのまま残し、ほかは `paused = true` と `migrated_from` にする。
+/// - policy が all / remote-owner で「同意あり かつ defaults が push」でなければ explicit に戻す。
+/// - `consent` と `mode` のキーは取り除く。
+fn migrate_legacy(table: &mut toml::Table, from_schema: u32) -> Result<LegacyNotice, String> {
+    let consented = match table.remove("consent") {
+        None => false,
+        Some(value) => {
+            let consent: LegacyConsent = value
+                .try_into()
+                .map_err(|e| crate::t!("config.content_invalid", error = e))?;
+            consent.version >= LEGACY_CONSENT_VERSION
+        }
+    };
+    let take_mode = |parent: &mut toml::Table, field: &str| -> Result<Option<LegacyMode>, String> {
+        match parent.remove("mode") {
+            None => Ok(None),
+            Some(value) => LegacyMode::from_value(&value)
+                .map(Some)
+                .ok_or_else(|| crate::t!("config.invalid_value", field = field)),
+        }
+    };
+    let mut default_mode = None;
+    if let Some(toml::Value::Table(defaults)) = table.get_mut("defaults") {
+        default_mode = take_mode(defaults, "defaults.mode")?;
+    }
+    let default_mode = default_mode.unwrap_or(LegacyMode::Propose);
+    let defaults_push = consented && default_mode == LegacyMode::Push;
+
+    let mut stopped = 0;
+    if let Some(toml::Value::Array(repositories)) = table.get_mut("repository") {
+        for (i, entry) in repositories.iter_mut().enumerate() {
+            let toml::Value::Table(repo) = entry else {
+                continue;
+            };
+            if repo.contains_key("migrated_from") {
+                return Err(crate::t!(
+                    "config.invalid_value",
+                    field = format!("repository[{i}].migrated_from")
+                ));
+            }
+            let mode = take_mode(repo, &format!("repository[{i}].mode"))?.unwrap_or(default_mode);
+            if consented && mode == LegacyMode::Push {
+                continue;
+            }
+            let from = if !consented {
+                MigratedFrom::Unconsented
+            } else if mode == LegacyMode::Off {
+                MigratedFrom::Off
+            } else {
+                MigratedFrom::Propose
+            };
+            repo.insert("paused".into(), toml::Value::Boolean(true));
+            repo.insert(
+                "migrated_from".into(),
+                toml::Value::String(from.as_str().into()),
+            );
+            stopped += 1;
+        }
+    }
+
+    let mut policy_reset = false;
+    if let Some(toml::Value::Table(enrollment)) = table.get_mut("enrollment")
+        && !defaults_push
+        && matches!(
+            enrollment.get("policy").and_then(toml::Value::as_str),
+            Some("all" | "remote-owner")
+        )
+    {
+        enrollment.insert("policy".into(), toml::Value::String("explicit".into()));
+        policy_reset = true;
+    }
+    table.insert(
+        "schema".into(),
+        toml::Value::Integer(i64::from(CURRENT_SCHEMA)),
+    );
+    Ok(LegacyNotice {
+        from_schema,
+        stopped,
+        policy_reset,
+    })
 }
 
 /// 指定ファイルから読む。存在しなければ Missing、読めない・壊れていれば Invalid。
@@ -655,10 +787,9 @@ pub fn save_to(path: &Path, config: &Config) -> io::Result<()> {
 /// 求めるため）。読み直すと、ロックを取らない書き手（旧利用者の自動移行）と競ったときに
 /// 「自分が書いた内容」と違う版を返しうる。
 fn write_config(path: &Path, config: &Config) -> io::Result<Vec<u8>> {
-    // schema は「新機能を使っていれば 2、使っていなければ 1」で書く（メモリ上の値には依存しない）。
-    // 旧設定は書き直しても schema 1 のままなので、旧版の Scriptura でも読める。
+    // schema は常に現行の版で書く（メモリ上の値には依存しない）。
     let mut config = config.clone();
-    config.schema = config.required_schema();
+    config.schema = CURRENT_SCHEMA;
     config
         .validate()
         .map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))?;
@@ -820,7 +951,7 @@ impl Store {
     }
 
     /// 実行環境の場所。設定は `paths::config_file`、状態フォルダーは状態 DB（`SCRIPTURA_DB` →
-    /// `paths::state_dir()`）の親フォルダー。publications・更新案と同じ基点にすることで、
+    /// `paths::state_dir()`）の親フォルダー。publications と同じ基点にすることで、
     /// テストの隔離（`SCRIPTURA_DB`）がロックと履歴にもそのまま効く。
     pub fn current() -> Self {
         let state_dir = crate::maintenance::state_db_path()
@@ -847,6 +978,8 @@ impl Store {
 pub struct Snapshot {
     pub revision: Revision,
     pub loaded: Loaded,
+    /// 旧形式（schema 1・2・省略）から変換して読んだときの要約。ファイルは保存し直すまで旧形式のまま。
+    pub legacy: Option<LegacyNotice>,
 }
 
 /// 設定ファイルの生のバイト列（無ければ None）。読めない場合はその理由。
@@ -858,13 +991,13 @@ fn read_raw(path: &Path) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
-/// バイト列を `load_from` と同じ規則で解釈する。
-fn interpret(bytes: Option<&[u8]>) -> Loaded {
+/// バイト列を `load_from` と同じ規則で解釈する（旧形式は変換した結果と、その要約）。
+fn interpret(bytes: Option<&[u8]>) -> (Loaded, Option<LegacyNotice>) {
     match bytes {
-        None => Loaded::Missing,
+        None => (Loaded::Missing, None),
         Some(b) => match std::str::from_utf8(b) {
-            Ok(text) => parse(text),
-            Err(_) => Loaded::Invalid(crate::t!("config.not_utf8").into()),
+            Ok(text) => parse_with_notice(text),
+            Err(_) => (Loaded::Invalid(crate::t!("config.not_utf8").into()), None),
         },
     }
 }
@@ -872,15 +1005,20 @@ fn interpret(bytes: Option<&[u8]>) -> Loaded {
 /// 指定ファイルの現在の版と内容。ロックは取らない（表示用）。
 pub fn read_at(path: &Path) -> Snapshot {
     match read_raw(path) {
-        Ok(bytes) => Snapshot {
-            revision: Revision::of(bytes.as_deref()),
-            loaded: interpret(bytes.as_deref()),
-        },
+        Ok(bytes) => {
+            let (loaded, legacy) = interpret(bytes.as_deref());
+            Snapshot {
+                revision: Revision::of(bytes.as_deref()),
+                loaded,
+                legacy,
+            }
+        }
         // 読めないファイルは版を求められない。ファイルが在ることは確かなので missing とは区別し、
         // 空のバイト列の版を返す（どの期待値とも照合が合わず、書き込みは Broken で止まる）。
         Err(reason) => Snapshot {
             revision: Revision::of(Some(&[])),
             loaded: Loaded::Invalid(reason),
+            legacy: None,
         },
     }
 }
@@ -901,7 +1039,7 @@ pub enum UpdateError {
     },
     /// ディスク上の設定が壊れている（Invalid）。壊れた設定は書き換えない。
     Broken { path: PathBuf, reason: String },
-    /// 操作が受け付けられない（未登録・同意なし・Git でないなど）。文言をそのまま出す。
+    /// 操作が受け付けられない（未登録・Git でないなど）。文言をそのまま出す。
     Rejected(String),
     /// 変更後の設定が検証に通らない。理由をそのまま出す。
     Invalid(String),
@@ -1006,7 +1144,8 @@ pub fn update_in<T>(
             actual: previous,
         });
     }
-    let (original, existed) = match interpret(bytes.as_deref()) {
+    let (loaded, legacy) = interpret(bytes.as_deref());
+    let (original, existed) = match loaded {
         Loaded::Ok(c) => (c, true),
         Loaded::Missing => (Config::default(), false),
         Loaded::Invalid(reason) => return Err(broken(reason)),
@@ -1015,12 +1154,8 @@ pub fn update_in<T>(
     let mut config = original.clone();
     let value = f(&mut config, existed).map_err(UpdateError::Rejected)?;
     config.validate().map_err(UpdateError::Invalid)?;
-    let normalized = |c: &Config| {
-        let mut c = c.clone();
-        c.schema = c.required_schema();
-        c
-    };
-    if existed && normalized(&config) == normalized(&original) {
+    // 旧形式のファイルは、内容が同じでも必ず schema 3 で保存し直す（変換結果を確定させる）。
+    if existed && legacy.is_none() && config == original {
         drop(lock);
         return Ok(Updated {
             value,
@@ -1044,8 +1179,8 @@ pub fn update_in<T>(
     let written = write_config(&store.config_file, &config)
         .map_err(|e| UpdateError::Io(crate::t!("config.save_failed", error = e)))?;
     drop(lock);
-    // 保存した内容の schema は正規化されているので、返す設定も合わせる。
-    config.schema = config.required_schema();
+    // 保存した内容の schema は現行の版なので、返す設定も合わせる。
+    config.schema = CURRENT_SCHEMA;
     Ok(Updated {
         value,
         config,
@@ -1201,7 +1336,7 @@ pub fn history_read_in(store: &Store, id: &str) -> Result<(Vec<u8>, Loaded), Str
     let path = store.history_dir().join(id);
     match read_raw(&path)? {
         Some(bytes) => {
-            let loaded = interpret(Some(&bytes));
+            let (loaded, _) = interpret(Some(&bytes));
             Ok((bytes, loaded))
         }
         None => Err(crate::t!("config.history_not_found", id = id)),
@@ -1295,14 +1430,12 @@ pub fn normalize_root(root: &str, windows: bool) -> String {
 /// skip の理由。カーソル（処理済み位置）を進めるかどうかを理由ごとに持つ。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SkipReason {
-    /// 同意が無い、または版が古い。
-    NoConsent,
     /// 登録も policy 一致も無い。
     NotEnrolled,
-    /// mode が off。
-    Off,
     /// 一時停止中。
     Paused,
+    /// 旧形式からの移行で止めた登録（`migrated_from`）。`enable` で有効化し直すまで処理しない。
+    Migrated,
     /// 登録された remote と push 先が一致しない。
     RemoteMismatch,
     /// 許可されたブランチではない。
@@ -1313,14 +1446,13 @@ impl SkipReason {
     /// true なら「意図的に見送った」ので処理済み位置を進めてよい（再開後に過去分を一斉処理しない）。
     /// false の理由は、設定が整った時点でその変更を処理できるよう位置を進めない。
     pub fn advances_cursor(self) -> bool {
-        matches!(self, SkipReason::Off | SkipReason::Paused)
+        matches!(self, SkipReason::Paused | SkipReason::Migrated)
     }
 }
 
 /// 判定結果。skip_reason が Some のとき、呼び出し側は何も実行しない。
 #[derive(Clone, Debug, PartialEq)]
 pub struct Decision {
-    pub mode: Mode,
     pub documents: Vec<Document>,
     /// 既定の機密パターン + defaults.exclude + repository.exclude（重複除去済み）。
     pub exclude: Vec<String>,
@@ -1370,7 +1502,6 @@ pub fn resolve_for_os(
         .collect();
 
     let skip = |reason: SkipReason| Decision {
-        mode: Mode::Off,
         documents: config.defaults.documents.clone(),
         exclude: effective_exclude(&[
             &config.defaults.exclude,
@@ -1381,13 +1512,7 @@ pub fn resolve_for_os(
         skip_reason: Some(reason),
     };
 
-    // 1. 同意。無い・古い版なら他の設定が何であれ動かない。
-    match &config.consent {
-        Some(c) if c.version >= CURRENT_CONSENT_VERSION => {}
-        _ => return skip(SkipReason::NoConsent),
-    }
-
-    // 2. 対象かどうか。登録があれば常にそちらが優先。
+    // 1. 対象かどうか。登録があれば常にそちらが優先。
     if let Some(repo) = registered {
         if let Some(expected) = repo.remote.as_deref().and_then(normalize_remote)
             && !normalized.contains(&expected)
@@ -1418,14 +1543,12 @@ pub fn resolve_for_os(
         }
     }
 
-    let mode = registered
-        .and_then(|r| r.mode)
-        .unwrap_or(config.defaults.mode);
+    // 2. 移行で止めた登録は paused に関係なく処理しない。
+    if registered.is_some_and(|r| r.migrated_from.is_some()) {
+        return skip(SkipReason::Migrated);
+    }
     if registered.is_some_and(|r| r.paused) {
         return skip(SkipReason::Paused);
-    }
-    if mode == Mode::Off {
-        return skip(SkipReason::Off);
     }
     if let Some(repo) = registered
         && !repo.branches.is_empty()
@@ -1438,7 +1561,6 @@ pub fn resolve_for_os(
         .and_then(|r| r.documents.clone())
         .unwrap_or_else(|| config.defaults.documents.clone());
     Decision {
-        mode,
         kinds: kinds::resolve_kinds(config, &documents),
         documents,
         exclude: effective_exclude(&[

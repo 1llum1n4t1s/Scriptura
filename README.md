@@ -4,8 +4,7 @@
 
 Scriptura maintains `AGENTS.md` / `DESIGN.md` / `README.md` (and, as opt-ins, `CHANGELOG.md` and user-defined custom documents) in the background after you push to your own repositories. It is launched from a Claude Code Stop hook, and its maintenance worker is the Claude Code CLI (by default `claude -p --model claude-sonnet-5-5 --effort high`). It does not depend on Codex.
 
-- **Safe by default.** Enabling it requires your explicit consent and repository registration, and the default mode is `propose`, which only produces a document update proposal (a patch). It does not change your working tree, `.git`, or remotes.
-- The `push` mode, which commits and pushes documents automatically, is available only when you pass `--mode push` explicitly.
+- **Safe by default.** Nothing runs until you register a repository with `scriptura enable` (or in the admin UI), and enabling requires a remote and an upstream. There is no review step: after each push the worker updates the target documents and Scriptura automatically commits and pushes them, and a post-maintenance check refuses to commit anything outside the target documents. Consent records and the former `propose` mode (update proposals) were removed; see "Migrating old settings".
 - Settings are read only from a single file under the user's home directory (`config.toml`) and the `templates/` folder next to it. Enabling or configuring through files inside a repository is never read (so that merely cloning someone else's repository can never start automatic behavior).
 - Settings can also be edited in `scriptura ui` (the browser-based admin UI, described below).
 
@@ -62,22 +61,14 @@ The worker does not inherit the desktop session's relay settings, so run `claude
 
 In the repository you want maintained, do one of the following.
 
-- If you have installed the plugin: run `/scriptura:setup` in Claude Code (after confirming consent, it runs `scriptura enable`).
+- If you have installed the plugin: run `/scriptura:setup` in Claude Code (it asks you to confirm that documents will be committed and pushed automatically, then runs `scriptura enable`).
 - Directly from the command line:
 
 ```powershell
-scriptura enable --repo D:\Dev\MyRepo --accept-consent 1
+scriptura enable --repo D:\Dev\MyRepo
 ```
 
-`--accept-consent` is the current version of the consent document (currently `1`). If it is omitted or the version is wrong, the command prints an explanation of the data sent and the costs, and refuses. Before registering, `enable` records the "current push state" as already processed, so pushes made before enabling are never processed afterwards.
-
-## Modes
-
-| Mode | Behavior |
-| --- | --- |
-| `propose` (default) | On every push, the worker updates documents in a throwaway clone and **saves the diff as a patch**. The working tree, `.git`, and remotes are not changed. Check it with `review` and apply it to the working tree with `apply` (nothing is staged). |
-| `push` | The worker updates the documents and automatically commits and pushes. Only when `--mode push` is given explicitly. A remote and an upstream are required, and when `--branches` is omitted only the current branch is targeted. |
-| `off` | Does nothing (the registration remains). |
+`enable` requires a remote, a branch (not a detached HEAD) and an upstream; when `--branches` is omitted only the current branch is targeted. From then on, documents are committed and pushed automatically after each push (see "Cost and data transmission"). Before registering, `enable` records the "current push state" as already processed, so pushes made before enabling are never processed afterwards. The former `--mode` and `--accept-consent` options were removed and are refused with an error.
 
 ## Configuration file
 
@@ -89,18 +80,12 @@ scriptura enable --repo D:\Dev\MyRepo --accept-consent 1
 
 You can override it with `SCRIPTURA_CONFIG` (an absolute file path) or `SCRIPTURA_HOME` (`<SCRIPTURA_HOME>/config.toml`). It is normally rewritten by `enable` / `disable` / `pause` / `resume` and the admin UI, so you do not need to edit it by hand. A broken config, unknown keys, or a `schema` that is too new fall back to "do nothing", and commands such as `enable` fail without rewriting it.
 
-`schema` can be 1 or 2. Saving uses "the minimum required version": the file stays at `schema = 1` unless you use per-kind settings (`[kinds.*]`), `[defaults] instructions`, a configuration that lists `CHANGELOG.md` or a custom kind as a target, or consent given in the admin UI (so older Scriptura versions can still read it). Using any of these makes it `schema = 2`, and older versions that read it fall back to "do nothing".
+Saving always writes `schema = 3`. A file with `schema` 1, 2 or none (written by an older Scriptura) is read as the old format and converted on the fly (see "Migrating old settings"); a file with a schema newer than 3 falls back to "do nothing". Older Scriptura versions that read a schema 3 file also do nothing, so when you use both the plugin and the Setup edition, update both.
 
 ```toml
-schema = 1
-
-[consent]
-version = 1
-accepted_at = "2026-11-14T00:00:00+00:00"
-source = "cli"
+schema = 3
 
 [defaults]
-mode = "propose"                                # propose / push / off
 documents = ["AGENTS.md", "DESIGN.md", "README.md"]
 exclude = ["private/**"]                        # ADDED to the default sensitive patterns (patterns containing `)`, whitespace, or control characters are not allowed)
 
@@ -118,7 +103,6 @@ owners = []                                     # for remote-owner, e.g. "github
 [[repository]]
 root = "D:/Dev/MyRepo"
 remote = "github.com/me/myrepo"                 # expected push destination (skipped if it does not match)
-mode = "propose"
 branches = ["main"]                             # empty means no restriction
 documents = ["README.md"]
 paused = false
@@ -127,6 +111,8 @@ paused = false
 ## Document kinds
 
 The documents to maintain are managed as "kinds".
+
+In the admin UI the same settings are edited under Settings > Documents, which also sets the default target documents (`defaults.documents`).
 
 | Kind | Target | Default |
 | --- | --- | --- |
@@ -158,7 +144,7 @@ These are read only from the user's `config.toml`. Every field is optional, and 
 
 ### Post-maintenance checks
 
-Limits (`max_chars` / `max_bytes`), `required_headings`, AGENTS being under 30,000 bytes, and the immutability of released CHANGELOG entries are checked by Rust regardless of the worker's permission mode (`restricted` / `bypass`). On a violation, `push` mode does not commit (the changes remain in the working tree, and the next hook runs the same checks), while `propose` mode does not create an update proposal and rejects it (`rejected`), advancing the processed position. The worker is not rerun for the same push. A `propose` rejection can be recreated only with `run-now`.
+Limits (`max_chars` / `max_bytes`), `required_headings`, AGENTS being under 30,000 bytes, and the immutability of released CHANGELOG entries are checked by Rust regardless of the worker's permission mode (`restricted` / `bypass`). On a violation nothing is committed (the changes remain in the working tree, and the next hook runs the same checks), and the worker is not rerun for the same push.
 
 ### Timing (`[kinds.<id>.timing]`)
 
@@ -176,18 +162,18 @@ Evaluation happens only when a new push is detected and on `run-now`. The minimu
 
 ### CHANGELOG maintenance (`[kinds.changelog.changelog]`)
 
-- It follows the existing format (the Keep a Changelog embedded template is used only when creating the file). Each push updates only the `Unreleased` section, and the worker cannot change released sections. Rust compares before and after maintenance, and if even one byte of a released section changed, a section disappeared or was reordered, or link reference definitions were lost, it is treated as a violation of the checks above (push mode does not commit; propose rejects).
+- It follows the existing format (the Keep a Changelog embedded template is used only when creating the file). Each push updates only the `Unreleased` section, and the worker cannot change released sections. Rust compares before and after maintenance, and if even one byte of a released section changed, a section disappeared or was reordered, or link reference definitions were lost, it is treated as a violation of the checks above (nothing is committed).
 - For history, Rust gathers everything from the commit that last changed `CHANGELOG.md` up to this push and passes it to the prompt as **untrusted data** (commit subjects, changed paths, and tags in the range, up to 48 KiB in total). This is because a restricted worker cannot run `git log`. Scriptura's own maintenance commits are excluded.
 - `on_release = "promote"` (default): if there is no section yet for the version corresponding to a tag in the range, the contents of `Unreleased` are moved into that version's section. If the section already exists, nothing happens (the result is the same even if the release procedure wrote it first). `ignore` does not create version sections.
 - `backfill = "tags"` (default): when `CHANGELOG.md` does not exist, it creates per-version sections by going back through reachable tags, newest first, up to `backfill_max_releases` (1 to 50, default 20) tags and up to `backfill_max_commits` (1 to 1000, default 300) commits in total between adjacent tags. `none` does not go back. `format` (`existing` / `keep-a-changelog`) and `release_tag` (default `v*`) can also be specified.
-- The file name is resolved from its spelling in Git case-insensitively (`Changelog.md` and the like are also targets). When the spelling cannot be settled on a single one, or the pre-edit content cannot be read from Git, it is treated as unverifiable and counts as a violation. In push mode, if `CHANGELOG.md` is ignored by Git, new maintenance is skipped without starting the worker.
+- The file name is resolved from its spelling in Git case-insensitively (`Changelog.md` and the like are also targets). When the spelling cannot be settled on a single one, or the pre-edit content cannot be read from Git, it is treated as unverifiable and counts as a violation. If `CHANGELOG.md` is ignored by Git, new maintenance is skipped without starting the worker.
 - Matching versions with tags also treats the version name without the fixed prefix of `release_tag` (the `v` of `v*`, the `release-` of `release-*`, and so on) as a match (`## [1.2.0]`). Violation reasons do not print heading text and are given by number, such as "the n-th version section". For link reference definitions of released sections, it also checks that their content and order are preserved and that existing labels are not redefined.
-- Limitations: a tag-only push (`git push --tags`) cannot be detected. It is picked up by the next branch push or with `--follow-tags`. When maintaining `CHANGELOG.md` in push mode, a release procedure that updates the same file may conflict (`doctor` points this out).
+- Limitations: a tag-only push (`git push --tags`) cannot be detected. It is picked up by the next branch push or with `--follow-tags`. When maintaining `CHANGELOG.md`, a release procedure that updates the same file may conflict (`doctor` points this out).
 
-### Example configuration (schema 2)
+### Example configuration (schema 3)
 
 ```toml
-schema = 2
+schema = 3
 
 [defaults]
 documents = ["AGENTS.md", "DESIGN.md", "README.md", "CHANGELOG.md", "architecture"]
@@ -223,7 +209,7 @@ documents = ["README.md", "CHANGELOG.md"]
 
 ## Writing settings and change history
 
-All settings writes, whether from the CLI, the admin UI, or the automatic migration of legacy users, go through the same path (`src/ops.rs` and `config::update_in`). Writers are serialized with `config-lock.sqlite3` in the state folder, and the admin UI compares the version it displayed (the file's SHA-256, or `missing` if the file does not exist) and, if the file was changed elsewhere, does not save and tells you to reload (the CLI does not compare versions). Immediately before saving, the previous content is set aside in `config-history/` in the state folder (50 entries are kept), and the save is atomic. A broken config is not rewritten. An operation that changes nothing neither saves nor sets anything aside. From "History" in the admin UI you can inspect diffs and restore; the content from before a restore is also kept in the history. When a restore would add registrations, a confirmation screen is shown, and the starting point of each registration (the position that prevents processing pushes from before enabling) is recorded before saving. A restore that would add push-mode registrations or change registrations to push is refused and directed to `enable --mode push` (which checks the remote and upstream).
+All settings writes, whether from the CLI, the admin UI, or the automatic migration of legacy users, go through the same path (`src/ops.rs` and `config::update_in`). Writers are serialized with `config-lock.sqlite3` in the state folder, and the admin UI compares the version it displayed (the file's SHA-256, or `missing` if the file does not exist) and, if the file was changed elsewhere, does not save and tells you to reload (the CLI does not compare versions). Immediately before saving, the previous content is set aside in `config-history/` in the state folder (50 entries are kept), and the save is atomic. A broken config is not rewritten. An operation that changes nothing neither saves nor sets anything aside. From "Settings history" in the admin UI you can inspect diffs and restore; the content from before a restore is also kept in the history. When a restore would add registrations (paused ones included), the starting point of each registration (the position that prevents processing pushes from before enabling) is recorded before saving. A restore that would add active registrations (neither paused nor stopped by the migration) or turn registrations active is refused and directed to `enable` (which checks the remote and upstream); a registration stopped by the migration cannot be resumed by a restore either.
 
 ## Admin UI (`scriptura ui`)
 
@@ -232,7 +218,7 @@ scriptura ui [--port <n>] [--no-open] [--tray]
 scriptura ui --autostart on|off
 ```
 
-A browser-based screen for handling settings, update proposals, and diagnostics. It is available in 9 languages (ja, en, zh-CN, zh-TW, ko, es, fr, de, pt-BR). The language is chosen in this order: the language selector at the top of the screen (saved in a cookie) → the browser's `Accept-Language` → English. By default it is not resident: the command that launched it ends when you choose "Quit" on the screen, press Ctrl+C, or after 60 minutes of inactivity (add `--tray` to keep it resident; see below). Hooks do not look at whether the screen is open. It is controlled by the cargo feature `ui` (enabled by default) and is not included when built with `--no-default-features` (`scriptura ui` then refuses and exits).
+A browser-based screen for handling repositories, settings (including documents), history, and diagnostics. It is available in 9 languages (ja, en, zh-CN, zh-TW, ko, es, fr, de, pt-BR). The language is chosen in this order: the language selector at the top of the screen (saved in a cookie) → the browser's `Accept-Language` → English. By default it is not resident: the command that launched it ends when you choose "Quit" on the screen, press Ctrl+C, or after 60 minutes of inactivity (add `--tray` to keep it resident; see below). Hooks do not look at whether the screen is open. It is controlled by the cargo feature `ui` (enabled by default) and is not included when built with `--no-default-features` (`scriptura ui` then refuses and exits).
 
 - **Listening**: only on `127.0.0.1` (the default port is 7468; `--port 0` picks a free port). If the port is in use, it exits.
 - **Resident mode (`--tray`)**: stays resident with an icon in the system tray on Windows and in the menu bar on macOS (Linux is not supported; `--tray` refuses and exits). Clicking the icon opens the admin UI, and the right-click menu offers "Open the management screen", "Check for updates" (Setup edition only; opens the overview screen's "App updates" panel), and "Exit". While resident it does not exit on inactivity. Instead, the session expires after 60 minutes of inactivity (tabs left open get 401), and a new one-time key is issued every time you open the screen from the icon (a reissued key expires after 5 minutes, and an earlier unused key becomes invalid). On Windows, running `scriptura ui --tray` again while one is already resident on the default port does not start a second one; the resident one opens the browser. When launched from something other than a terminal (such as the Start menu), it relaunches itself as a process without a console window.
@@ -240,8 +226,9 @@ A browser-based screen for handling settings, update proposals, and diagnostics.
 - **"App updates" panel (Setup edition only)**: the overview screen's "App updates" panel (`#updates`) shows the current version and has checkboxes for auto-update and the resident-at-logon setting, a "Check for updates" button, and an "Install update" button (shown when a new version exists). Checking ignores the 24-hour throttle and downloads nothing. Installing downloads the update, verifies the signer, and, if no other Scriptura process (a hook, a worker, or another admin UI) is running from the install folder and no run-now is in progress, asks the updater to apply it and then ends the admin UI (otherwise it does nothing and asks you to try again later; nothing is force-killed). When the UI is resident, the updater starts the new version; the session is new, so the open tab says to reopen it from the tray (menu bar) icon. An admin UI started from a terminal is only closed. The tray menu's "Check for updates" opens this panel and starts checking automatically. Without JavaScript, the same buttons work and the result is shown on a separate screen. In other editions, the panel only says it is available in the Setup edition.
 - **Protection**: the disposable key URL generated at each launch (`/auth?key=…`) is exchanged once for a session cookie (`HttpOnly; SameSite=Strict`) (without the cookie, the response is 401). Host must be only `127.0.0.1:<port>` or `localhost:<port>`; if an Origin is present it must be same-origin; and a POST requires same-origin (`Origin` or `Sec-Fetch-Site`) plus a CSRF token. Response headers such as CSP, `nosniff`, and `no-store` are added, and secret values are never displayed. Because browsers do not isolate cookies by port, the cookie is also sent to services running on other 127.0.0.1 ports on the same PC (processes of the same user can already touch the settings file, so the only concern is a local service with different privileges).
 - **Conflicts**: a save compares the version it displayed and, if the file was changed elsewhere, tells you to reload.
-- **Confirmation screen**: switching to push mode, switching the permission to `bypass`, changing the enrollment policy to `all` / `remote-owner`, adding a custom kind's target path, recording consent, removing a registration, applying an update proposal, and `run-now` in push mode (and restoring history to a version that includes any of these) do not write on the first submission; they show a list of the changes and ask for a one-time confirmation (valid for 10 minutes).
-- **Screens**: the header has five items: Overview / Repositories (register, enable, pause, resume, remove, mode and target documents, `run-now`) / Document kinds (add, edit, and delete kinds; edit templates in `templates/`) / Update proposals (inspect diffs, apply, discard) / Settings. Settings is shown as tabs: General / Worker / Consent / History (change history, diffs, restore) / Diagnostics. On the Worker screen the model and effort are chosen from lists, not typed: the model list is a built-in one, and if the `ANTHROPIC_API_KEY` environment variable is already set, the "Refresh model list" button fetches the newest models from the Anthropic API into memory (Scriptura never stores or shows the key, nothing is fetched just by opening the screen, and a saved value that is not in the list is kept as "not in the list"). Times are shown in the local time zone of the PC running the UI (`YYYY-MM-DD HH:MM`); the stored format and the CLI's JSON are unchanged. `run-now` takes time, so it runs in the background and you can check its status on the screen.
+- **Confirmation screen**: enabling a repository (documents will be committed and pushed automatically), switching the permission to `bypass`, changing the enrollment policy to `all` / `remote-owner` (every repository you push to, or every one owned by the listed owners, would be maintained), adding a custom kind's target path, removing a registration, and `run-now` (and restoring history to a version that includes any of these) do not write on the first submission; they show a list of the changes and ask for a one-time confirmation (valid for 10 minutes).
+- **Screens**: the header has four items: Overview / Repositories (register, enable, pause, resume, remove, target documents, `run-now`; a registration stopped by the settings migration shows a notice instead of a Resume button and is enabled again with "Enable") / History (the maintenance history: results, commits, reasons) / Settings. Settings is shown as tabs: General (exclusions, shared additional instructions, enrollment policy) / Documents (the default target documents, and adding, editing, and deleting document kinds and editing templates in `templates/`; `/settings/documents`) / Worker / Settings history (change history, diffs, restore) / Diagnostics. The former Document kinds, Update proposals, and Consent screens were removed (their old URLs return 404).On the Worker screen the model and effort are chosen from lists, not typed: the model list is a built-in one, and if the `ANTHROPIC_API_KEY` environment variable is already set, the "Refresh model list" button fetches the newest models from the Anthropic API into memory (Scriptura never stores or shows the key, nothing is fetched just by opening the screen, and a saved value that is not in the list is kept as "not in the list"). Times are shown in the local time zone of the PC running the UI (`YYYY-MM-DD HH:MM`); the stored format and the CLI's JSON are unchanged. `run-now` takes time, so it runs in the background and you can check its status on the screen.
+- **Maintenance history**: each maintenance run that started the worker, and each attempt that failed before it could (from a hook or `run-now`), is recorded in the state DB (`maintenance_runs`) and shown under "History" (filter by repository, 50 per page): the trigger, kinds, result (committed / no changes / rejected / held / failed / outcome unknown), the documents with added and removed line counts, the range and resulting commit, and the reason. Document contents and diffs are not stored. Up to 200 runs per repository (newest first) and 2,000 overall are kept, and repeated identical failures are shown as one row ("×count"). Runs that neither started the worker nor failed (for example, when no kind was due) are not recorded.
 
 ## Language of output
 
@@ -253,17 +240,14 @@ All commands except `ui` accept `--json` (prints a single machine-readable JSON 
 
 | Command | Description |
 | --- | --- |
-| `enable --repo <path> --accept-consent <version> [--mode propose\|push\|off] [--branches a,b] [--documents AGENTS.md,README.md]` | Registers and enables a repository. `--documents` accepts the 4 built-in kinds (including `CHANGELOG.md`; case-insensitive) and the ids of custom kinds defined in the settings. |
+| `enable --repo <path> [--branches a,b] [--documents AGENTS.md,README.md]` | Registers and enables a repository (documents are then committed and pushed automatically); it also enables again a registration stopped by the settings migration. A remote, a branch and an upstream are required, and the current branch is targeted when `--branches` is omitted. `--documents` accepts the 4 built-in kinds (including `CHANGELOG.md`; case-insensitive) and the ids of custom kinds defined in the settings. The removed `--mode` / `--accept-consent` options and the removed `review` / `apply` / `discard` commands are refused with an error (a patch left in `<state>/proposals/` can still be applied with `git apply`). |
 | `disable --repo <path>` | Removes the registration. |
 | `pause [--repo <path>]` / `resume [--repo <path>]` | Pause / resume (the cwd's repository when `--repo` is omitted). |
-| `status` | Shows the installation state, settings, consent, registrations, worker settings, the number of update proposals, and the Setup edition's information (`setup`: whether it is managed, packId, version, executable, auto-update, whether the admin UI stays resident at logon (`trayAutostart`), the last check / failure times, the downloaded version, the registration result, and any leftover old standalone install). `installedVersion` comes from the standalone `install` record (`install.json`, or an earlier version's `current.json` if absent). `installForm` is the form of the running binary (`setup` = Setup edition, `standalone` = standalone `install`, `other` = plugin-bundled or development build), while `installed` only tells whether the standalone `install` location holds an executable. |
+| `status` | Shows the installation state, settings, registrations (each with `paused` and `migratedFrom`), worker settings, `legacy` (whether the settings file is still in the old format), and the Setup edition's information (`setup`: whether it is managed, packId, version, executable, auto-update, whether the admin UI stays resident at logon (`trayAutostart`), the last check / failure times, the downloaded version, the registration result, and any leftover old standalone install). `installedVersion` comes from the standalone `install` record (`install.json`, or an earlier version's `current.json` if absent). `installForm` is the form of the running binary (`setup` = Setup edition, `standalone` = standalone `install`, `other` = plugin-bundled or development build), while `installed` only tells whether the standalone `install` location holds an executable. |
 | `doctor [--verify]` | Diagnoses the environment and settings (described below). |
-| `run-now [--repo <path>] [--documents <id,...>]` | Runs maintenance once right now without waiting for a push (only for registered, consented repositories; timing is ignored and all enabled kinds are processed). `--documents` narrows the kinds to process (an undefined kind, or one that is disabled for this repository, is refused without starting the worker). **Note**: a narrowed `run-now` also advances the processed position, and since there is one update proposal per commit, kinds outside the narrowing are not maintained for that push. A propose that violates the post-maintenance checks returns an `outcome` of `rejected` (with a `reason`; this is not a failure, and that push counts as processed). |
+| `run-now [--repo <path>] [--documents <id,...>]` | Runs maintenance once right now without waiting for a push (only for registered repositories that are not paused; timing is ignored and all enabled kinds are processed). Documents are committed and pushed as in a normal run. `--documents` narrows the kinds to process (an undefined kind, or one that is disabled for this repository, is refused without starting the worker). **Note**: a narrowed `run-now` also advances the processed position, so kinds outside the narrowing are not maintained for that push. On success `outcome` is `completed`. |
 | `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | Lists the document kinds (built-in and custom) and shows the details of one (enabled or disabled, target paths and whether they exist, limits, timing, template status, last completion time; `show` also prints the configured guidance and additional instructions. Read-only, and it does not print document contents). |
 | `ui [--port <n>] [--no-open] [--tray]` / `ui --autostart on\|off` | Launches the admin UI (described above; `--tray` keeps it resident) / switches the Setup edition's resident-at-logon setting. `--json` cannot be used. |
-| `review [sha\|latest] [--repo <path>]` | Inspects an update proposal's diffstat, patch path, and target documents. |
-| `apply [sha\|latest] [--repo <path>]` | Applies an update proposal to the working tree. Refused if the target documents have uncommitted changes. |
-| `discard [sha\|latest] [--repo <path>]` | Discards an update proposal. |
 | `connect claude-code [--apply] [--executable <absolute path>]` / `--remove [--apply]` | Registers the settings.json Stop hook (replacing old maintenance hooks hook by hook) / removes only Scriptura's hook. A preview until you pass `--apply`. |
 | `update [--check] [--auto on\|off]` | Shows the Setup edition's auto-update state / checks and downloads now (does not apply) / switches auto-update. |
 | `update-apply` | Applies a downloaded update only when no other Scriptura process is running, after verifying the signer (started automatically at logon. The result is one JSON line whose `status` is `unmanaged` / `disabled` / `nothingPending` / `busy` / `untrusted` (exit code 2) / `applied`). |
@@ -272,10 +256,10 @@ All commands except `ui` accept `--json` (prints a single machine-readable JSON 
 
 ## Safety
 
-- **Opt-in**: without consent (versioned) and repository registration, nothing runs and no state folder is even created. Registrations are kept only in the user's own settings file.
-- **Does not change the working tree (propose)**: the pushed commit is expanded into a throwaway clone under the state folder, and the worker runs only there. Because the clone is built from the pushed commit, the user's untracked and ignored files (such as `.env`) do not exist in the clone. However, this is only the fact that "the files are not in the clone"; it is not a guarantee that the `restricted` permission rules (`Read(./**)` and the denial of sensitive patterns) forbid reading outside the clone (whether the rules deny paths outside the clone has not been verified). The clone's `origin` is removed, so even if the worker pushes, nothing reaches the user's repository.
+- **Opt-in**: until a repository is registered (`enable` or the admin UI), nothing runs and no state folder is even created. Registrations are kept only in the user's own settings file.
+- **Automatic commit and push**: the worker runs in your real working tree, and Scriptura commits and pushes the target documents without asking. `enable` therefore requires a remote, a branch and an upstream, and nothing is committed if the post-run checks below find a problem. Enable it only for repositories where that is acceptable; the former propose mode (update proposals) no longer exists.
 - **Sensitive patterns**: `.env*` / `*.pem` / `*.key` / `*.p12` / `*.pfx` / `id_rsa*` / `id_ed25519*` / `**/secrets/**` / `.git/config` are applied as the worker's Read / Edit deny rules (`--disallowedTools`) when `restricted`. You can add to them with `exclude`, but you cannot replace them to remove any. With `bypass` (legacy-compatible; skips all permission prompts), these rules are not applied.
-- **Post-run checks**: if the worker changed anything other than the target documents (and `.gitignore`), its result is not adopted. Propose compares the whole throwaway clone (including any growth in ignored files). Push mode runs in the user's real working tree, so only under `restricted` does it compare the working tree's tracked and untracked files before and after the worker (changes to ignored files such as `target/` are excluded because they cannot be told apart from the user's concurrent work), while `bypass` does only the hash check of the documents to be committed, as before. In push mode, uncertain commit and push states are not rerun and are reconciled through the state DB. Limits, required headings, and the immutability of released CHANGELOG entries are checked regardless of permission mode (see above).
+- **Post-run checks**: if the worker changed anything other than the target documents (and `.gitignore`), its result is not adopted. Because the worker runs in the user's real working tree, only under `restricted` does it compare the working tree's tracked and untracked files before and after the worker (changes to ignored files such as `target/` are excluded because they cannot be told apart from the user's concurrent work), while `bypass` does only the hash check of the documents to be committed. Uncertain commit and push states are not rerun and are reconciled through the state DB. Limits, required headings, and the immutability of released CHANGELOG entries are checked regardless of permission mode (see above).
 - **Environment hygiene**: relay settings originating from the parent session (such as the desktop app) are removed from the environment variables passed to the worker.
 
 ## Cost and data transmission
@@ -286,20 +270,29 @@ The maintenance worker (Sonnet by default) runs with **your own Claude authentic
 
 `scriptura doctor [--verify] [--json]` returns `{id, status, detail}` for each item (status is `ok` / `warn` / `fail` / `info`). If there is any `fail`, the exit code is 1.
 
-It checks the supported platform, `git`, `claude` (executable resolution), `claude auth status` (run in the same environment as the worker, looking only at the exit code and `authMethod`), `gh` (only when there is a push-mode GitHub repository), settings and consent, whether the state folder is writable, duplicate hook registrations, `allowManagedHooksOnly` / `disableAllHooks`, and leftover registrations of the old `agents-maintenance`. For the Setup edition, it also reports duplicate registration between the plugin and the Setup edition (`setupPlugin`), whether the Setup edition's hook exists (`setupHook`), a leftover old standalone install (`legacyInstall`), and the auto-update state (`autoUpdate`) (for a non-Setup edition, only a single `info` item, `setup`). The `kinds` item checks whether the document kinds' templates can be read (location and size), and reports `info` when a limit is smaller than an existing document's current size (the next maintenance may be rejected) and when there is a repository that maintains `CHANGELOG.md` in push mode (a conflict with the release procedure). `--verify` checks only the SHA-256 of the binaries listed in the plugin's bundled `SHA256SUMS` (`bin/scriptura.exe` and `libexec/scriptura-*`) (launchers, hooks, and skills are not covered; executables outside the plugin are not covered either).
+It checks the supported platform, `git`, `claude` (executable resolution), `claude auth status` (run in the same environment as the worker, looking only at the exit code and `authMethod`), `gh` (only when there is an enabled GitHub repository), settings (including `configLegacy` for old-format settings, `migratedStopped` for registrations stopped by the migration, and `legacyProposals` for patches left by the removed update proposals), whether the state folder is writable, duplicate hook registrations, `allowManagedHooksOnly` / `disableAllHooks`, and leftover registrations of the old `agents-maintenance`. For the Setup edition, it also reports duplicate registration between the plugin and the Setup edition (`setupPlugin`), whether the Setup edition's hook exists (`setupHook`), a leftover old standalone install (`legacyInstall`), and the auto-update state (`autoUpdate`) (for a non-Setup edition, only a single `info` item, `setup`). The `kinds` item checks whether the document kinds' templates can be read (location and size), and reports `info` when a limit is smaller than an existing document's current size (the next maintenance may be rejected) and when there is a repository that maintains `CHANGELOG.md` (a conflict with the release procedure). `--verify` checks only the SHA-256 of the binaries listed in the plugin's bundled `SHA256SUMS` (`bin/scriptura.exe` and `libexec/scriptura-*`) (launchers, hooks, and skills are not covered; executables outside the plugin are not covered either).
 
 ## State and storage locations
 
 | Location | Windows | macOS | Linux |
 | --- | --- | --- | --- |
 | Install location (the fixed executable `bin\scriptura(.exe)`) | `%LOCALAPPDATA%\Programs\Scriptura` | `~/Library/Application Support/Scriptura/app` | `$XDG_DATA_HOME/scriptura` (default `~/.local/share/scriptura`) |
-| State (DB, locks, publications, update proposals, the settings change history `config-history/`) | `%LOCALAPPDATA%\Scriptura\state` | `~/Library/Application Support/Scriptura/state` | `$XDG_STATE_HOME/scriptura` (default `~/.local/state/scriptura`) |
+| State (DB, locks, publications,  the maintenance history (in the DB), the settings change history `config-history/`) | `%LOCALAPPDATA%\Scriptura\state` | `~/Library/Application Support/Scriptura/state` | `$XDG_STATE_HOME/scriptura` (default `~/.local/state/scriptura`) |
 
 Setting `SCRIPTURA_HOME` to an absolute path puts state in `<SCRIPTURA_HOME>/state`, the install location in `<SCRIPTURA_HOME>/app`, and settings in `<SCRIPTURA_HOME>/config.toml`. `SCRIPTURA_DB` can also move just the state DB elsewhere. Templates go in `templates/` in the same folder as the settings file. Nothing is written to the Codex or Claude Code home (except when `connect claude-code --apply` / `--remove`, the Setup edition's automatic registration, and `uninstall-setup --apply` rewrite `settings.json`). The Setup edition's install location (Windows `%LOCALAPPDATA%\ScripturaApp`) is managed by Velopack and replaced on updates, so no state or settings are kept there.
 
 ## Automatic migration of legacy users
 
-A user who ran an older Scriptura (a version that had no settings file) and still has a state DB, when running a hook without a settings file, gets a settings file automatically created exactly once with the same behavior as before (all repositories, `push` mode, permission bypass), and is notified of this. The origin of the consent is recorded as `legacy-migration`. Nothing is created for new users. If you want to narrow the targets, register again with `enable` and set `policy = "explicit"`. The state of the old `agents-maintenance` (`~/.codex/hooks/state`) is not carried over; it starts from an empty state.
+A user who ran an older Scriptura (a version that had no settings file) and still has a state DB, when running a hook without a settings file, gets a settings file automatically created exactly once with the same behavior as before (all repositories, `push` mode, permission bypass), and is notified of this.  Nothing is created for new users. If you want to narrow the targets, register again with `enable` and set `policy = "explicit"`. The state of the old `agents-maintenance` (`~/.codex/hooks/state`) is not carried over; it starts from an empty state.
+
+## Migrating old settings (consent and propose removed)
+
+- The settings file is now always saved as `schema = 3`. A file with `schema` 1, 2 or none is read as the old format and converted when read; the next hook (or any settings change) saves it as schema 3 once, setting the previous content aside in `config-history/`, and notifies you once of how many registrations were stopped.
+- A registration that had consent and effectively ran in `push` mode keeps running unchanged. Every other registration (`propose`, `off`, or no consent) is paused with a note of where it came from (`migrated_from`) and does nothing until you enable it again with `scriptura enable --repo <path>` or in the admin UI (`resume` and restoring from the history do not resume it, because `enable` checks the remote and upstream). `status` shows `migratedFrom`, and `doctor` reports these registrations.
+- `enrollment.policy` of `all` / `remote-owner` goes back to `explicit` (the owners are kept), unless the file had consent and `defaults.mode = "push"`.
+- The `consent` and `mode` keys are removed. A schema 3 file that still has them is invalid, and nothing runs.
+- Patches left in `<state>/proposals/` are neither read nor deleted. Delete them by hand if you do not need them; an unapplied patch can be applied with `git apply`. Scriptura no longer cleans up the throwaway clones (`work-*`) either.
+- An older Scriptura reading a schema 3 file does nothing, so when you use the plugin and the Setup edition together, update both.
 
 ## Not supported / not verified
 

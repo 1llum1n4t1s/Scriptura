@@ -1,4 +1,4 @@
-use crate::config::{self, Config, Decision, Document, Mode, Permission, SkipReason, Worker};
+use crate::config::{self, Config, Decision, Document, Permission, SkipReason, Worker};
 use crate::kinds::ResolvedKind;
 use crate::process::{Output, capture, command};
 use caseless::Caseless;
@@ -6,6 +6,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     env, fs,
     io::{self, Read},
@@ -73,16 +74,13 @@ impl From<&Decision> for MaintenanceOptions {
 /// push 検知後の処理方針。`handle_hook` が設定の判定結果から 1 か所（`plan_for_decision`）で決める。
 #[derive(Clone, Debug)]
 pub enum PollPlan {
-    /// 保守を実行する（push モード）。
+    /// 保守を実行する。
     Process(MaintenanceOptions),
-    /// 提案を作る（propose モード）。利用者の作業ツリー・.git・remote は変えず、使い捨てクローンで
-    /// 更新案（パッチ）だけを保存する。処理済み位置の進め方は `crate::proposal` の doc コメント参照。
-    Propose(MaintenanceOptions),
-    /// 意図的な見送り（off / paused）。新しい push を検知したら処理済み位置だけ進める（通知なし）。
+    /// 意図的な見送り（paused・移行由来の停止）。新しい push を検知したら処理済み位置だけ進める（通知なし）。
     AdvanceOnly,
     /// 保留。新しい push を検知したらメッセージを返し、処理済み位置は進めない。
     Hold(String),
-    /// 何もしない（同意なし・未登録）。状態 DB にも触れない。
+    /// 何もしない（未登録）。状態 DB にも触れない。
     Silent,
 }
 
@@ -512,6 +510,13 @@ fn nested_repository(root: &Path, path: &Path) -> Result<bool> {
     }
     Ok(false)
 }
+/// 検査対象ディレクトリの一覧を、最初の出現順を保って重複除去する。
+/// 記録済みの一覧を毎回足し戻しても、保存する一覧が増え続けないようにする。
+fn dedup_dirs(dirs: &mut Vec<PathBuf>) {
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
+}
+
 pub fn agents_size_error(
     root: &Path,
     directories: &[PathBuf],
@@ -1022,6 +1027,8 @@ pub fn open_state_db() -> Result<Connection> {
     // （旧利用者判定 `legacy_state_present` と `state_db_is_newer` の契約を変えないため）。
     db.execute_batch(crate::timing::KIND_RUNS_DDL)
         .map_err(err)?;
+    // 保守履歴（`crate::runlog`）。ベストエフォートなので、作れなくても保守は止めない。
+    let _ = db.execute_batch(crate::runlog::DDL);
     db.execute(
         "INSERT OR IGNORE INTO poll_metadata VALUES ('started_at',?1)",
         [now().to_string()],
@@ -1520,11 +1527,130 @@ pub fn run_now(root: &Path, options: MaintenanceOptions) -> Result<Option<String
     )
 }
 /// push 検知から保守・公開までの本体。`plan` が処理するか見送るかを決める。
+/// worker を起動した保守と失敗した回は、本体が積んだ記録候補を戻った後に 1 回だけ保守履歴へ書く
+/// （ベストエフォート。記録の失敗は無視し、保守の結果・処理済み位置・出力に影響させない）。
 pub fn poll_repository_with(
     root: &Path,
     opts: PollOptions,
     cwd: Option<&str>,
     plan: &PollPlan,
+) -> Result<Option<String>> {
+    let started = now();
+    let drafts: RefCell<Vec<crate::runlog::Run>> = RefCell::new(Vec::new());
+    let result = poll_repository_inner(root, opts, cwd, plan, &drafts);
+    let drafts = drafts.into_inner();
+    if !drafts.is_empty()
+        && let Ok(db) = open_state_db()
+    {
+        let finished = now();
+        let origin = if opts.force { "run_now" } else { "hook" };
+        for mut run in drafts {
+            run.started_at = started;
+            run.finished_at = finished;
+            run.origin = origin.to_owned();
+            let _ = crate::runlog::record(&db, &run);
+        }
+    }
+    result
+}
+/// 保守履歴の記録候補（開始・終了時刻と契機は外側が足す）。
+#[allow(clippy::too_many_arguments)]
+fn draft(
+    snapshot: &Value,
+    base: &str,
+    target: &str,
+    outcome: &str,
+    result_commit: &str,
+    detail: crate::runlog::Detail,
+    message: Option<String>,
+) -> crate::runlog::Run {
+    crate::runlog::Run {
+        repo_root: s(snapshot, "repo_root"),
+        base_commit: base.to_owned(),
+        target_commit: target.to_owned(),
+        outcome: outcome.to_owned(),
+        result_commit: result_commit.to_owned(),
+        detail,
+        message,
+        ..Default::default()
+    }
+}
+/// publication 状態に記録された種類 id。
+fn state_kind_ids(state: &Value) -> Vec<String> {
+    state
+        .get("kinds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect()
+}
+/// 保守 commit の文書ごとの追加・削除行数（取れなければ空）。
+fn commit_changes(root: &Path, commit: &str) -> Vec<crate::runlog::DocChange> {
+    run_git(
+        root,
+        &[
+            "show",
+            "--numstat",
+            "-z",
+            "--no-renames",
+            "--format=",
+            commit,
+        ],
+    )
+    .map(|raw| crate::runlog::parse_numstat(&raw))
+    .unwrap_or_default()
+}
+/// 実行結果が未確定で止めた記録か（記録した印、または印を持たない旧版の日本語の文言）。
+/// 保守の本体と保守履歴の分類で同じ判定を使う。
+fn is_outcome_unknown(state: &Value, error: &str) -> bool {
+    (!error.is_empty() && s(state, "outcome_unknown_error") == error)
+        || error.contains("実行結果が未確定")
+}
+/// push モードの失敗の記録候補。publication 状態から結果を分ける
+/// （commit の結果が不明 → unknown、worker 後の検査で commit 前に止めた → held、それ以外 → failed）。
+fn failure_draft(
+    snapshot: &Value,
+    path: &Path,
+    message: &str,
+    base: &str,
+    target: &str,
+) -> crate::runlog::Run {
+    let state = read_state(path).unwrap_or_else(|_| json!({}));
+    let phase = s(&state, "phase");
+    let stored = s(&state, "error");
+    let same = !stored.is_empty() && stored == message;
+    let outcome = if phase == "committing" && same && is_outcome_unknown(&state, &stored) {
+        "unknown"
+    } else if phase == "ready" && same {
+        "held"
+    } else {
+        "failed"
+    };
+    let result = if ["push_pending", "committing"].contains(&phase.as_str()) {
+        s(&state, "commit")
+    } else {
+        String::new()
+    };
+    draft(
+        snapshot,
+        base,
+        target,
+        outcome,
+        &result,
+        crate::runlog::Detail {
+            kinds: state_kind_ids(&state),
+            documents: Vec::new(),
+        },
+        Some(message.to_owned()),
+    )
+}
+fn poll_repository_inner(
+    root: &Path,
+    opts: PollOptions,
+    cwd: Option<&str>,
+    plan: &PollPlan,
+    drafts: &RefCell<Vec<crate::runlog::Run>>,
 ) -> Result<Option<String>> {
     let initialize = opts.initialize;
     let Some(snapshot) = push_snapshot(root) else {
@@ -1599,89 +1725,13 @@ pub fn poll_repository_with(
     // ここまで来れば「処理対象の新しい push がある」。設定の判定結果に従って処理・見送りを分ける。
     // 設定を解決できない種類（定義の無いカスタム種類など）を含む指定は、どの経路（hook・run-now）でも
     // worker を起動せず、位置も進めない。
-    if let PollPlan::Process(run) | PollPlan::Propose(run) = plan
+    if let PollPlan::Process(run) = plan
         && let Some(message) = unresolved_kinds_hold(run)
     {
         return Ok(Some(message));
     }
     let run = match plan {
         PollPlan::Process(run) => run,
-        PollPlan::Propose(run) => {
-            // push モードの publication 状態（commit / push の進行記録）には触れない。
-            // 成功・変更なし・作成済みは位置を進め、失敗は push モードの save_error と同じ形
-            // （前回の fingerprint のまま error を記録）にして次回の hook で再試行する。
-            // 期限が来た種類だけを処理する。どの種類も期限前なら worker を起動せず、
-            // 処理済み位置をそのまま進める（propose は publication 状態を持たないので無条件）。
-            let repo_key = s(&snapshot, "repo_root");
-            let due = due_kinds_for(
-                &db,
-                &repo_key,
-                root,
-                &run.resolved_kinds(),
-                &pushed,
-                &prior_commit,
-                opts.force,
-                || push_range_paths(root, &prior_commit, &pushed),
-            )?;
-            if due.is_empty() {
-                save_cursor(&db, &snapshot, &fingerprint, None, &pushed)?;
-                return Ok(None);
-            }
-            let run = &crate::timing::narrow_options(run, &due);
-            // テンプレートの検査に失敗したら worker を起動せず、位置も進めずに見送る（Hold と同じ）。
-            let templates = match crate::kinds::load_templates(
-                &run.resolved_kinds(),
-                &crate::kinds::settings_dir(),
-                root,
-            ) {
-                Ok(t) => t,
-                Err(message) => return Ok(Some(message)),
-            };
-            return match crate::proposal::propose_with(
-                root,
-                &pushed,
-                &prior_commit,
-                run,
-                opts.force,
-                Some(&templates),
-            ) {
-                Ok(outcome) => {
-                    save_cursor(&db, &snapshot, &fingerprint, None, &pushed)?;
-                    // 成功（作成・変更なし・作成済み）のときだけ、今回対象になった種類の最終完了を記録する。
-                    // 棄却（Rejected）は完了ではないので記録しない（次の push で期限が来ていれば再び対象になる）。
-                    // 処理する文書が無く worker を起動しなかった（NothingToDo）も、何も保守していないので記録しない。
-                    if !matches!(
-                        outcome,
-                        crate::proposal::ProposeOutcome::Rejected { .. }
-                            | crate::proposal::ProposeOutcome::NothingToDo
-                    ) {
-                        crate::timing::record_kind_runs(&db, &repo_key, &due, &pushed, now())?;
-                    }
-                    Ok(match outcome {
-                        crate::proposal::ProposeOutcome::Created { sha, .. } => Some(crate::t!(
-                            "maint.proposal_created",
-                            sha = &sha[..sha.len().min(12)]
-                        )),
-                        // 上限・必須見出し・AGENTS サイズの検査に違反した更新案は作らない。位置は進めたので、
-                        // 同じ push では worker を再実行しない（run-now のときだけ作り直す）。
-                        crate::proposal::ProposeOutcome::Rejected { reason } => {
-                            Some(crate::t!("maint.proposal_rejected", reason = reason))
-                        }
-                        _ => None,
-                    })
-                }
-                Err(message) => {
-                    save_cursor(
-                        &db,
-                        &snapshot,
-                        &prior_fingerprint,
-                        Some(&message),
-                        &prior_commit,
-                    )?;
-                    Ok(Some(message))
-                }
-            };
-        }
         PollPlan::Silent => return Ok(None),
         PollPlan::Hold(message) => return Ok(Some(message.clone())),
         PollPlan::AdvanceOnly => {
@@ -1694,6 +1744,9 @@ pub fn poll_repository_with(
     };
     let save_error = |message: String, prior: &str, commit: &str| -> Result<Option<String>> {
         save_cursor(&db, &snapshot, prior, Some(&message), commit)?;
+        drafts
+            .borrow_mut()
+            .push(failure_draft(&snapshot, &path, &message, commit, &pushed));
         Ok(Some(message))
     };
     if s(&state, "phase") == "complete"
@@ -1762,8 +1815,22 @@ pub fn poll_repository_with(
         if let Some(e) = maintain_and_publish_with(root, "", &[], Some(&fingerprint), &[], run) {
             return save_error(e, &prior_fingerprint, &prior_commit);
         }
-        prior_commit = s(&state, "commit");
+        let resumed_commit = s(&state, "commit");
+        let resumed_base = std::mem::replace(&mut prior_commit, resumed_commit.clone());
         save_cursor(&db, &snapshot, &prior_fingerprint, None, &prior_commit)?;
+        // 保守履歴（処理済み位置の保存の後。再開した commit の対象は publication 状態の head）。
+        drafts.borrow_mut().push(draft(
+            &snapshot,
+            &resumed_base,
+            &s(&state, "head"),
+            "committed",
+            &resumed_commit,
+            crate::runlog::Detail {
+                kinds: state_kind_ids(&state),
+                documents: commit_changes(root, &resumed_commit),
+            },
+            None,
+        ));
         state = json!({});
     }
     let complete_recovery = !opts.force
@@ -1828,6 +1895,7 @@ pub fn poll_repository_with(
             ))?));
         }
     }
+    dedup_dirs(&mut validation_dirs);
     if complete_recovery {
         let changed = state["after"].as_object().is_none_or(|m| {
             m.iter().any(|(relative, digest)| {
@@ -1952,7 +2020,7 @@ pub fn poll_repository_with(
         &kinds,
         &templates,
     );
-    // worker に許す変更パスの元になる一覧（種類ごとの規則は propose モードと共通の `plan_documents`）。
+    // worker に許す変更パスの元になる一覧（種類ごとの規則は `plan_documents`）。
     let docs = crate::kinds::plan_documents(root, &scope, &kinds, &deleted);
     // 処理する文書が 1 つも無い（有効な種類が無い）新しい保守は、worker を起動せず位置だけ進める。
     // 種類別の最終完了（kind_runs）は記録しない（何も保守していないため）。未完了の保守の再開は
@@ -1983,11 +2051,33 @@ pub fn poll_repository_with(
     let processed = if own_pending {
         s(&state, "commit")
     } else {
-        pushed
+        pushed.clone()
     };
     save_cursor(&db, &snapshot, &fingerprint, None, &processed)?;
     // 保守が完了した（処理済み位置を error なしで保存した）ので、今回対象になった種類の最終完了を記録する。
     crate::timing::record_kind_runs(&db, &repo_key, record, &processed, now())?;
+    // 保守履歴: 完了した publication 状態から、commit・push 済みか、変更なしかを分ける。
+    let finished = read_state(&path).unwrap_or_else(|_| json!({}));
+    if s(&finished, "phase") == "complete" {
+        let commit = s(&finished, "commit");
+        let (label, documents) = if commit.is_empty() {
+            ("unchanged", Vec::new())
+        } else {
+            ("committed", commit_changes(root, &commit))
+        };
+        drafts.borrow_mut().push(draft(
+            &snapshot,
+            &prior_commit,
+            &pushed,
+            label,
+            &commit,
+            crate::runlog::Detail {
+                kinds: state_kind_ids(&finished),
+                documents,
+            },
+            None,
+        ));
+    }
     prior_fingerprint.clear();
     Ok(None)
 }
@@ -2003,34 +2093,6 @@ fn recorded_kinds(state: &Value, run: &MaintenanceOptions) -> Vec<ResolvedKind> 
         .into_iter()
         .filter(|k| ids.contains(k.id()))
         .collect()
-}
-/// 今回の push 範囲（`prior..pushed`。`prior` が空なら `pushed` 単体）の変更パス。取得できなければ None。
-/// push モードの AGENTS サイズ検証と同じ取り方（タイミングの `paths` 条件用）。
-fn push_range_paths(root: &Path, prior: &str, pushed: &str) -> Option<Vec<String>> {
-    let raw = if prior.is_empty() {
-        run_git(
-            root,
-            &[
-                "diff-tree",
-                "--root",
-                "--no-commit-id",
-                "--name-only",
-                "-r",
-                "-z",
-                pushed,
-            ],
-        )
-    } else {
-        run_git(root, &["diff", "--name-only", "-z", prior, pushed])
-    }?;
-    Some(
-        String::from_utf8(raw)
-            .ok()?
-            .split('\0')
-            .filter(|n| !n.is_empty())
-            .map(str::to_owned)
-            .collect(),
-    )
 }
 /// 今回処理する（期限が来た）種類。判定本体は `crate::timing::due_kinds`（純粋関数）。
 /// - 最初に、対象が存在せず新規作成も許されない CHANGELOG・カスタム種類を外す（従来 3 種は外さない）。
@@ -2132,11 +2194,20 @@ pub fn handle_hook(payload: &Value) -> Result<Option<String>> {
         return Ok(None);
     }
     // 判定は状態 DB・状態フォルダーに触れる前に行う。設定も旧状態も無い新規利用者は、
-    // ここで何も作らずに終わる（同意なしに状態を残さない）。
+    // ここで何も作らずに終わる（利用者が登録する前に状態を残さない）。
     let mut notice = None;
     let mut lock = None;
-    let config = match config::load() {
-        config::Loaded::Ok(config) => config,
+    let snapshot = config::read();
+    let config = match snapshot.loaded {
+        config::Loaded::Ok(config) => {
+            // 旧形式の設定は、設定ロックだけを取って（poll ロックの前に）schema 3 で保存し直す。
+            // 保存できたときだけ 1 回通知する。版が衝突したら何も書かず、変換した設定のまま処理を続ける
+            // （次の hook がもう一度試す）。
+            if let Some(legacy) = &snapshot.legacy {
+                notice = migrate_legacy_config(&snapshot.revision, legacy);
+            }
+            config
+        }
         config::Loaded::Invalid(reason) => {
             return Ok(Some(crate::t!(
                 "maint.config_invalid_path",
@@ -2231,6 +2302,27 @@ pub fn handle_hook(payload: &Value) -> Result<Option<String>> {
         (n, m) => Ok(n.or(m)),
     }
 }
+/// 旧形式の設定を schema 3 で保存し直す（版つき。設定ロックだけを使う）。
+/// 保存できて、止めた登録や方針の変更があったときだけ、利用者へ知らせる文を返す。
+fn migrate_legacy_config(
+    revision: &config::Revision,
+    legacy: &config::LegacyNotice,
+) -> Option<String> {
+    let updated =
+        config::update_in(&config::Store::current(), Some(revision), |_, _| Ok(())).ok()?;
+    (updated.saved && legacy.changed_behavior()).then(|| {
+        let policy = if legacy.policy_reset {
+            crate::t!("maint.legacy_policy_reset")
+        } else {
+            ""
+        };
+        crate::t!(
+            "maint.legacy_migrated",
+            stopped = legacy.stopped,
+            policy = policy
+        )
+    })
+}
 /// `documents` のうち設定を解決できない種類（定義の無いカスタム種類など）があるときの見送りメッセージ
 /// （無ければ None）。hook 経路の `plan_for_decision` を通らない run-now のように `PollPlan` を直接組み立てる
 /// 経路も同じ判定を通るよう、`poll_repository_with` の入口でまとめて見る。
@@ -2253,24 +2345,18 @@ fn unresolved_kinds_hold(run: &MaintenanceOptions) -> Option<String> {
 }
 
 /// 判定結果から push 検知後の処理方針を決める唯一の場所。
-/// propose モードは `PollPlan::Propose`（`crate::proposal`）。
 pub fn plan_for_decision(decision: &Decision) -> PollPlan {
     match decision.skip_reason {
-        // 同意なし・未登録は完全に静か（状態 DB にも触れない）。
-        Some(SkipReason::NoConsent | SkipReason::NotEnrolled) => PollPlan::Silent,
-        // 意図的な見送りは位置を進める（再開後に過去の push を一斉処理しない）。
-        Some(SkipReason::Off | SkipReason::Paused) => PollPlan::AdvanceOnly,
+        // 未登録は完全に静か（状態 DB にも触れない）。
+        Some(SkipReason::NotEnrolled) => PollPlan::Silent,
+        // 意図的な見送り（一時停止・移行由来の停止）は位置を進める（再開後に過去の push を一斉処理しない）。
+        Some(SkipReason::Paused | SkipReason::Migrated) => PollPlan::AdvanceOnly,
         // 設定が整えば処理できるよう位置を進めず、理由を知らせる。
         Some(SkipReason::RemoteMismatch) => {
             PollPlan::Hold(crate::t!("maint.hold_remote_mismatch").into())
         }
         Some(SkipReason::BranchNotAllowed) => PollPlan::Hold(crate::t!("maint.hold_branch").into()),
-        None => match decision.mode {
-            Mode::Push => PollPlan::Process(MaintenanceOptions::from(decision)),
-            Mode::Propose => PollPlan::Propose(MaintenanceOptions::from(decision)),
-            // resolve は off を skip_reason にするので通常は到達しない。念のため位置を進めて終える。
-            Mode::Off => PollPlan::AdvanceOnly,
-        },
+        None => PollPlan::Process(MaintenanceOptions::from(decision)),
     }
 }
 /// poll ロック（フック同士の排他）。実行中なら None。状態フォルダーを作るので、
@@ -2782,13 +2868,7 @@ fn path_fingerprint(root: &Path, relative: &str) -> String {
 /// 追跡中の変更・未追跡・無視対象・サブモジュール・削除を含み、名前変更は削除と追加に分けて数える。
 /// worker の前後で比べ、許可文書以外の差を検出する。取得できなければ Err（呼び出し側は fail-closed）。
 ///
-/// 無視対象（`!!`）も含める厳格版。propose のクローンは worker だけが触る使い捨てなので、
-/// 無視ファイルの増加も違反として検出する。
-pub fn worktree_snapshot(root: &Path) -> Result<BTreeMap<String, String>> {
-    worktree_snapshot_with(root, true)
-}
-
-/// `worktree_snapshot` の本体。`include_ignored = false` のときは無視対象を比較に含めない。
+/// `include_ignored = false` のときは無視対象（`!!`）を比較に含めない。
 ///
 /// push モードは利用者の実作業ツリーを使い、worker が最長 `timeout_secs` 動く間にも利用者が
 /// 作業する。`target/` や `node_modules/` のようなビルド成果物（無視対象）は利用者・ツールが
@@ -2982,7 +3062,7 @@ pub fn maintain_and_publish_with(
 }
 /// 対象文書と、その各階層（`root` 直下を含む）の `.gitignore` の候補集合。
 /// ignore 訂正のため、worker に許す編集対象は「対象文書 + 各階層の .gitignore」になる。
-/// push モードと propose モードで同じ規則を使うための共通部分で、シンボリックリンク・
+/// 許可パスの共通部分で、シンボリックリンク・
 /// 作業ツリー外への逸脱・index・status による後段の絞り込みは呼び出し側が行う。
 pub(crate) fn with_ancestor_gitignores(root: &Path, documents: &[PathBuf]) -> BTreeSet<PathBuf> {
     let mut candidates: BTreeSet<PathBuf> = documents.iter().cloned().collect();
@@ -3054,6 +3134,7 @@ pub fn publish_locked_with(
             })
             .filter_map(|p| p.parent().map(Path::to_path_buf)),
     );
+    dedup_dirs(&mut size_dirs);
     for d in &size_dirs {
         safe_relative(root, d)?;
     }
@@ -3144,8 +3225,7 @@ pub fn publish_locked_with(
             // 記録した印（`outcome_unknown_error` が今の error と同じ）で行う。表示言語で文言が変わるため。
             // 印を持たない旧版の記録は、従来どおり日本語の文言で判定する。
             let error = s(&state, "error");
-            let marked = !error.is_empty() && s(&state, "outcome_unknown_error") == error;
-            if marked || error.contains("実行結果が未確定") {
+            if is_outcome_unknown(&state, &error) {
                 return Ok(Some(error));
             }
             return fail(
@@ -3751,5 +3831,43 @@ mod case_tests {
             ));
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod failure_draft_tests {
+    use super::failure_draft;
+    use serde_json::json;
+    use std::fs;
+
+    fn outcome(state: serde_json::Value, message: &str) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "scriptura-faildraft-{}-{}",
+            std::process::id(),
+            message.len()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("publication.json");
+        fs::write(&path, state.to_string()).unwrap();
+        let run = failure_draft(&json!({"repo_root": "r"}), &path, message, "b", "t");
+        let _ = fs::remove_dir_all(&dir);
+        run.outcome
+    }
+
+    #[test]
+    fn committing_with_the_unknown_mark_or_the_legacy_wording_is_unknown() {
+        let marked = "marked message";
+        let state =
+            json!({"phase": "committing", "error": marked, "outcome_unknown_error": marked});
+        assert_eq!(outcome(state, marked), "unknown");
+        // 印を持たない旧版の状態は、日本語の文言で判定する。
+        let legacy = "commit の実行結果が未確定です";
+        let state = json!({"phase": "committing", "error": legacy});
+        assert_eq!(outcome(state, legacy), "unknown");
+        // 印も旧文言も無い committing は failed のまま。
+        let plain = "other";
+        let state = json!({"phase": "committing", "error": plain});
+        assert_eq!(outcome(state, plain), "failed");
     }
 }

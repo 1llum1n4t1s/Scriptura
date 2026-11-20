@@ -1,7 +1,7 @@
 //! 管理画面（src/ui/）の契約テスト。
 //!
 //! 方式: axum の Router をそのまま `tower::ServiceExt::oneshot` で呼ぶ（実バインドは 1 本だけ、子プロセスで確認）。
-//! 隔離: 画面の一部（更新案・状態 DB・doctor・settings.json）は環境変数で場所を決めるため、テストごとに
+//! 隔離: 画面の一部（状態 DB・doctor・settings.json）は環境変数で場所を決めるため、テストごとに
 //! `SCRIPTURA_HOME` / `SCRIPTURA_CONFIG` / `SCRIPTURA_DB` / `CLAUDE_CONFIG_DIR` / `LOCALAPPDATA` / `PATH`
 //! （先頭にスタブの claude）を一時フォルダーへ向ける。環境変数はプロセス全体の値なので、グローバルな Mutex で
 //! テストを直列化する（`--test-threads=1` でも念のため）。実環境の設定・状態は読み書きしない。
@@ -15,7 +15,7 @@ use axum::{
 use http_body_util::BodyExt;
 use regex::Regex;
 use scriptura::{
-    config::{self, Config, ConsentSource, Loaded, Mode, Permission, Policy, Store},
+    config::{self, Config, Loaded, Permission, Policy, Store},
     ui::{self, AppState},
 };
 use std::{
@@ -261,29 +261,16 @@ impl Fx {
         }
     }
 
-    /// 画面から有効化する（propose・同意つき）。登録の root を返す。
+    /// 画面から有効化する（常に確認画面を挟む）。登録の root を返す。
     async fn enable(&self, repo: &Path) -> String {
         let rev = self.revision();
         let repo_text = repo.to_string_lossy().into_owned();
-        let pairs = [
-            ("revision", rev.as_str()),
-            ("repo", repo_text.as_str()),
-            ("mode", "propose"),
-            ("consent", "1"),
-            ("consent_version", "1"),
-        ];
-        let needs_consent = !scriptura::ops::keeps_consent(
-            match config::load_from(&self.store.config_file) {
-                Loaded::Ok(c) => c.consent,
-                _ => None,
-            }
-            .as_ref(),
-        );
-        let r = if needs_consent {
-            self.post_confirmed("/repos/enable", &pairs).await
-        } else {
-            self.post("/repos/enable", &pairs).await
-        };
+        let r = self
+            .post_confirmed(
+                "/repos/enable",
+                &[("revision", rev.as_str()), ("repo", repo_text.as_str())],
+            )
+            .await;
         assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
         let c = self.config();
         c.repository.last().unwrap().root.clone()
@@ -630,15 +617,14 @@ async fn get_pages_render_without_creating_state_or_config() {
     for path in [
         "/",
         "/repos",
-        "/kinds",
-        "/kinds/agents",
-        "/kinds/changelog",
-        "/kinds/new",
-        "/proposals",
+        "/settings/documents",
+        "/settings/documents/agents",
+        "/settings/documents/changelog",
+        "/settings/documents/new",
         "/settings/worker",
         "/settings/general",
-        "/consent",
         "/history",
+        "/settings/history",
         "/doctor",
         "/assets/app.css",
         "/assets/app.js",
@@ -649,20 +635,28 @@ async fn get_pages_render_without_creating_state_or_config() {
     // 存在しない画面・種類・履歴は 404。
     assert_eq!(fx.get("/nope").await.status, StatusCode::NOT_FOUND);
     assert_eq!(
-        fx.get("/kinds/unknown-kind").await.status,
+        fx.get("/settings/documents/unknown-kind").await.status,
         StatusCode::NOT_FOUND
     );
+    // 廃止した画面の URL は転送せずに 404（同意・更新案・旧「文書の種類」）。
+    for old in [
+        "/kinds",
+        "/kinds/agents",
+        "/kinds/new",
+        "/proposals",
+        "/proposals/0/abc",
+        "/consent",
+    ] {
+        assert_eq!(fx.get(old).await.status, StatusCode::NOT_FOUND, "{old}");
+    }
     assert_eq!(fx.get("/repos/0").await.status, StatusCode::NOT_FOUND);
     assert_eq!(
-        fx.get("/history/..%2Fconfig.toml").await.status,
+        fx.get("/settings/history/..%2Fconfig.toml").await.status,
         StatusCode::NOT_FOUND
     );
     // 閲覧だけでは設定ファイルも状態フォルダー（DB・ロック・履歴）も作られない。
     assert!(!fx.store.config_file.exists());
     assert!(!fx.base.join("state").exists());
-    // 概要は同意が無いことを知らせる。
-    let r = fx.get("/").await;
-    assert!(r.body.contains("同意が記録されていない"));
     // 診断はスタブの claude で動く（本物の Claude は呼ばない）。
     let r = fx.get("/doctor").await;
     assert!(r.body.contains("claude"));
@@ -802,16 +796,17 @@ async fn dangerous_change_needs_a_one_time_nonce_bound_to_the_content() {
 
 #[test]
 fn dangers_cover_the_listed_changes() {
-    let mut before = Config::default();
-    before.repository.push(config::Repository {
-        root: "D:/r1".into(),
+    let repo = |root: &str| config::Repository {
+        root: root.into(),
         remote: None,
-        mode: Some(Mode::Propose),
         branches: Vec::new(),
         documents: None,
         exclude: Vec::new(),
         paused: false,
-    });
+        migrated_from: None,
+    };
+    let mut before = Config::default();
+    before.repository.push(repo("D:/r1"));
     assert!(ui::dangers(&before, &before).is_empty());
     let check = |f: &dyn Fn(&mut Config), needle: &str| {
         let mut after = before.clone();
@@ -822,8 +817,6 @@ fn dangers_cover_the_listed_changes() {
             "{needle}: {list:?}"
         );
     };
-    check(&|c| c.repository[0].mode = Some(Mode::Push), "push モード");
-    check(&|c| c.defaults.mode = Mode::Push, "既定のモードを push");
     check(&|c| c.worker.permission = Permission::Bypass, "bypass");
     check(&|c| c.enrollment.policy = Policy::All, "all");
     check(
@@ -843,33 +836,40 @@ fn dangers_cover_the_listed_changes() {
         },
         "docs/ARCH.md",
     );
-    check(
-        &|c| {
-            c.consent = Some(config::Consent {
-                version: 1,
-                accepted_at: "now".into(),
-                source: ConsentSource::Ui,
-            })
-        },
-        "同意",
-    );
     check(&|c| c.repository.clear(), "登録を解除");
-    // propose での登録の追加（履歴の復元で解除済みの登録が戻るなど）も確認を挟む。
+    // 有効な登録が増える（履歴の復元で解除済みの登録が戻るなど）と、確認を挟む。
     check(
-        &|c| {
-            let mut r2 = c.repository[0].clone();
-            r2.root = "D:/r2".into();
-            c.repository.push(r2);
-        },
-        "D:/r2 を登録します",
+        &|c| c.repository.push(repo("D:/r2")),
+        "D:/r2 の登録を有効に",
     );
-    // off での登録の追加は worker が動かないので危険ではない。
-    let mut off = before.clone();
-    let mut r3 = off.repository[0].clone();
-    r3.root = "D:/r3".into();
-    r3.mode = Some(Mode::Off);
-    off.repository.push(r3);
-    assert!(ui::dangers(&before, &off).is_empty());
+    // 一時停止から再開する変更も、有効な登録が増えるので確認を挟む。
+    let mut paused = before.clone();
+    paused.repository[0].paused = true;
+    let mut resumed = paused.clone();
+    resumed.repository[0].paused = false;
+    assert!(
+        ui::dangers(&paused, &resumed)
+            .iter()
+            .any(|d| d.contains("D:/r1 の登録を有効に"))
+    );
+    // 停止中（一時停止・移行由来）の登録の追加は worker が動かないので危険ではない。
+    let mut stopped = before.clone();
+    let mut r3 = repo("D:/r3");
+    r3.paused = true;
+    stopped.repository.push(r3);
+    let mut migrated = before.clone();
+    let mut r4 = repo("D:/r4");
+    r4.migrated_from = Some(config::MigratedFrom::Propose);
+    migrated.repository.push(r4);
+    assert!(ui::dangers(&before, &stopped).is_empty());
+    assert!(ui::dangers(&before, &migrated).is_empty());
+    // 同意の記録・既定のモードは廃止した（確認の文面にも出さない）。
+    for list in [
+        ui::dangers(&before, &stopped),
+        ui::dangers(&before, &migrated),
+    ] {
+        assert!(list.iter().all(|d| !d.contains("同意")));
+    }
     // bypass から restricted へ戻す変更は危険ではない。
     let mut a = before.clone();
     a.worker.permission = Permission::Bypass;
@@ -879,40 +879,28 @@ fn dangers_cover_the_listed_changes() {
 }
 
 // ---------------------------------------------------------------------------
-// リポジトリ: 有効化・一時停止・モード・対象文書・解除・run-now
+// リポジトリ: 有効化・一時停止・対象文書・解除・run-now
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn enable_from_ui_records_consent_after_confirmation() {
+async fn enable_from_ui_always_confirms_and_saves_schema_3() {
     let fx = Fx::new().await;
     let rev = fx.revision();
     let repo = fx.repo.to_string_lossy().into_owned();
-    // 同意のチェックが無ければ 400 で何も書かない。
-    let r = fx
-        .post(
-            "/repos/enable",
-            &[
-                ("revision", rev.as_str()),
-                ("repo", repo.as_str()),
-                ("mode", "propose"),
-            ],
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
-    assert!(!fx.store.config_file.exists());
-    // 同意の記録は二段階確認（1 回目は書き込まない）。
+    // 有効化は常に二段階確認（1 回目は書き込まない）。同意・モードの欄は無い。
+    let page = fx.get("/repos").await;
+    for gone in ["name=\"mode\"", "name=\"consent\"", "consent_version"] {
+        assert!(!page.body.contains(gone), "{gone}");
+    }
     let pairs = [
         ("revision", rev.as_str()),
         ("repo", repo.as_str()),
-        ("mode", "propose"),
-        ("consent", "1"),
-        ("consent_version", "1"),
         ("documents", "AGENTS.md"),
         ("documents", "README.md"),
     ];
     let first = fx.post("/repos/enable", &pairs).await;
     assert_eq!(first.status, StatusCode::OK);
-    assert!(first.body.contains("同意を記録"));
+    assert!(first.body.contains("を有効化します"), "{}", first.body);
     assert!(!fx.store.config_file.exists());
     let r = fx
         .post_exact("/repos/enable", &hidden_fields(&first.body))
@@ -920,22 +908,45 @@ async fn enable_from_ui_records_consent_after_confirmation() {
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     assert_eq!(r.location(), "/repos/0?msg=enabled");
     let c = fx.config();
-    let consent = c.consent.as_ref().unwrap();
-    assert_eq!(consent.source, ConsentSource::Ui);
+    assert_eq!(c.schema, 3);
     assert_eq!(c.repository.len(), 1);
-    assert_eq!(c.repository[0].mode, Some(Mode::Propose));
+    assert!(c.repository[0].is_active());
     assert_eq!(
         c.repository[0].documents,
         Some(vec![config::Document::Agents, config::Document::Readme])
     );
-    // 詳細画面と一覧に出る。
+    let text = fs::read_to_string(&fx.store.config_file).unwrap();
+    assert!(
+        !text.contains("consent") && !text.contains("\nmode ="),
+        "{text}"
+    );
+    // 詳細画面と一覧に出る（モードの欄・更新案の欄は無い）。
     let r = fx.get("/repos/0").await;
     assert_eq!(r.status, StatusCode::OK);
-    assert!(r.body.contains("propose"));
+    for gone in ["propose", "action=\"/repos/mode\"", "/proposals"] {
+        assert!(!r.body.contains(gone), "{gone}");
+    }
     assert!(fx.get("/repos").await.body.contains("/repos/0"));
-    // 変更履歴は ops 経由の保存なので、初回作成では退避なし。以降の変更で残る。
+    // remote の無いリポジトリは有効化できない（確認の後に ops が拒否し、登録は増えない）。
+    let lonely = fx.base.join("lonely");
+    make_repo(&lonely);
+    let lonely_text = lonely.to_string_lossy().into_owned();
+    let rev = fx.revision();
+    let first = fx
+        .post(
+            "/repos/enable",
+            &[("revision", rev.as_str()), ("repo", lonely_text.as_str())],
+        )
+        .await;
+    assert_eq!(first.status, StatusCode::OK);
+    let r = fx
+        .post_exact("/repos/enable", &hidden_fields(&first.body))
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert_eq!(fx.config().repository.len(), 1);
+    // 変更履歴は ops 経由の保存なので、初回作成では退避なし。
     assert!(
-        fx.get("/history")
+        fx.get("/settings/history")
             .await
             .body
             .contains("変更履歴はまだありません")
@@ -954,12 +965,13 @@ async fn repository_operations_go_through_ops() {
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     assert!(fx.config().repository[0].paused);
     let rev = fx.revision();
+    // 再開は有効な登録が増えるので確認を挟む。
     let r = fx
-        .post("/repos/resume", &[("revision", &rev), ("root", &root)])
+        .post_confirmed("/repos/resume", &[("revision", &rev), ("root", &root)])
         .await;
-    assert_eq!(r.status, StatusCode::SEE_OTHER);
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     assert!(!fx.config().repository[0].paused);
-    // モード off・push は拒否（push は有効化から）。
+    // モードの変更は無い（廃止した URL は受け付けず、設定は変わらない。/repos/{n} は GET だけなので 405）。
     let rev = fx.revision();
     let r = fx
         .post(
@@ -967,18 +979,16 @@ async fn repository_operations_go_through_ops() {
             &[("revision", &rev), ("root", &root), ("mode", "off")],
         )
         .await;
-    assert_eq!(r.status, StatusCode::SEE_OTHER);
-    assert_eq!(fx.config().repository[0].mode, Some(Mode::Off));
-    let rev = fx.revision();
-    let r = fx
-        .post(
-            "/repos/mode",
-            &[("revision", &rev), ("root", &root), ("mode", "push")],
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
-    assert_eq!(fx.config().repository[0].mode, Some(Mode::Off));
-    // 対象文書: CHANGELOG を追加（schema 2 になる）→ 既定に戻す。
+    assert!(
+        matches!(
+            r.status,
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ),
+        "{}",
+        r.status
+    );
+    assert_eq!(fx.revision(), rev);
+    // 対象文書: CHANGELOG を追加 → 既定に戻す。
     let r = fx
         .post(
             "/repos/documents",
@@ -1031,21 +1041,26 @@ async fn repository_operations_go_through_ops() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_now_runs_as_a_background_job_and_push_mode_needs_confirmation() {
+async fn run_now_always_confirms_and_runs_as_a_background_job() {
     let fx = Fx::new().await;
-    // remote の無いリポジトリは run-now が即座に失敗する（本物の worker を起動しない）。
-    let lonely = fx.base.join("lonely");
-    make_repo(&lonely);
-    let root = fx.enable(&lonely).await;
+    let root = fx.enable(&fx.repo).await;
+    // run-now は commit と push をするので、常に確認画面を挟み、確認前はジョブを作らない。
     let rev = fx.revision();
-    let r = fx
+    let first = fx
         .post("/repos/run-now", &[("revision", &rev), ("root", &root)])
+        .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    assert!(first.body.contains("保守をいま実行"), "{}", first.body);
+    assert_eq!(fx.get("/jobs/1").await.status, StatusCode::NOT_FOUND);
+    // 確認後はバックグラウンドのジョブになる（スタブの claude。本物の worker は起動しない）。
+    let r = fx
+        .post_exact("/repos/run-now", &hidden_fields(&first.body))
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     let job = r.location();
     assert!(job.starts_with("/jobs/"), "{job}");
     let mut body = String::new();
-    for _ in 0..200 {
+    for _ in 0..300 {
         let page = fx.get(&job).await;
         assert_eq!(page.status, StatusCode::OK);
         body = page.body;
@@ -1054,23 +1069,50 @@ async fn run_now_runs_as_a_background_job_and_push_mode_needs_confirmation() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(body.contains("upstream"), "{body}");
-    // push モードの登録の run-now は確認画面を挟み、確認前はジョブを作らない。
-    let mut c = fx.config();
-    c.repository[0].mode = Some(Mode::Push);
-    config::save_to(&fx.store.config_file, &c).unwrap();
-    let rev = fx.revision();
-    let r = fx
-        .post("/repos/run-now", &[("revision", &rev), ("root", &root)])
-        .await;
-    assert_eq!(r.status, StatusCode::OK);
-    assert!(r.body.contains("push モード"));
-    assert_eq!(fx.get("/jobs/2").await.status, StatusCode::NOT_FOUND);
+    assert!(!body.contains("実行中です"), "{body}");
+    // 更新案へのリンクは無い。
+    assert!(!body.contains("/proposals"), "{body}");
 }
 
 // ---------------------------------------------------------------------------
 // 文書の種類・テンプレート
 // ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kind_form_shows_builtin_defaults_as_placeholders_without_saving_them() {
+    let fx = Fx::new().await;
+    let agents = fx.get("/settings/documents/agents").await;
+    assert_eq!(agents.status, StatusCode::OK);
+    assert!(
+        agents
+            .body
+            .contains(r#"name="max_bytes" inputmode="numeric" value="" placeholder="29999（既定・30,000 バイト未満）""#),
+        "{}",
+        agents.body
+    );
+    let design = fx.get("/settings/documents/design").await;
+    assert!(
+        design.body.contains(
+            r#"name="max_bytes" inputmode="numeric" value="" placeholder="上限なし（既定）""#
+        ),
+        "{}",
+        design.body
+    );
+    assert!(design.body.contains(r#"placeholder="0（既定）""#));
+    assert!(
+        design
+            .body
+            .contains("既存の文書に合わせる（新規は日本語）（既定）")
+    );
+    assert!(design.body.contains(r#"placeholder="例: architecture.md""#));
+    // プレースホルダーは値ではない: 既定のまま保存しても設定には何も書かれない。
+    let rev = fx.revision();
+    let r = fx
+        .post("/settings/documents/agents", &[("revision", &rev)])
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    assert!(fx.config().kinds.is_empty());
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kinds_are_edited_and_user_text_is_escaped() {
@@ -1079,7 +1121,7 @@ async fn kinds_are_edited_and_user_text_is_escaped() {
     // 組み込みの種類に追加指示と上限（利用者の文面に <script> を入れても文字として表示される）。
     let r = fx
         .post(
-            "/kinds/agents",
+            "/settings/documents/agents",
             &[
                 ("revision", &rev),
                 ("instructions", "<script>alert(1)</script>"),
@@ -1092,7 +1134,7 @@ async fn kinds_are_edited_and_user_text_is_escaped() {
     let k = fx.config().kinds["agents"].clone();
     assert_eq!(k.max_bytes, Some(20000));
     assert_eq!(k.required_headings, vec!["## 概要", "## 構成"]);
-    let page = fx.get("/kinds/agents").await;
+    let page = fx.get("/settings/documents/agents").await;
     assert!(!page.body.contains("<script>alert"));
     // askama の自動エスケープ（数値参照）を通っている。
     assert!(
@@ -1103,14 +1145,16 @@ async fn kinds_are_edited_and_user_text_is_escaped() {
     let rev = fx.revision();
     let r = fx
         .post(
-            "/kinds/agents",
+            "/settings/documents/agents",
             &[("revision", &rev), ("max_bytes", "40000")],
         )
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     assert_eq!(fx.revision(), rev);
     // 全項目を空にすると定義ごと消える。
-    let r = fx.post("/kinds/agents", &[("revision", &rev)]).await;
+    let r = fx
+        .post("/settings/documents/agents", &[("revision", &rev)])
+        .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
     assert!(fx.config().kinds.is_empty());
     // カスタム種類の追加は対象パスの追加なので二段階確認。
@@ -1123,12 +1167,12 @@ async fn kinds_are_edited_and_user_text_is_escaped() {
         ("template", "file"),
         ("template_file", "architecture.md"),
     ];
-    let first = fx.post("/kinds/new", &pairs).await;
+    let first = fx.post("/settings/documents/new", &pairs).await;
     assert_eq!(first.status, StatusCode::OK);
     assert!(first.body.contains("docs/ARCHITECTURE.md"));
     assert!(!fx.config().kinds.contains_key("architecture"));
     let r = fx
-        .post_exact("/kinds/new", &hidden_fields(&first.body))
+        .post_exact("/settings/documents/new", &hidden_fields(&first.body))
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     let k = fx.config().kinds["architecture"].clone();
@@ -1138,7 +1182,7 @@ async fn kinds_are_edited_and_user_text_is_escaped() {
     let rev = fx.revision();
     let r = fx
         .post(
-            "/kinds/new",
+            "/settings/documents/new",
             &[
                 ("revision", &rev),
                 ("id", "readme"),
@@ -1199,7 +1243,7 @@ async fn kinds_are_edited_and_user_text_is_escaped() {
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     // 編集画面にテンプレートの内容が出る。
-    let page = fx.get("/kinds/architecture").await;
+    let page = fx.get("/settings/documents/architecture").await;
     assert!(page.body.contains("## 概要"));
     // 編集欄は見出しで名前が付く（textarea の aria-labelledby が見出しの id を指す）。
     assert!(page.body.contains(r#"<h2 id="template-editor-title">"#));
@@ -1210,68 +1254,212 @@ async fn kinds_are_edited_and_user_text_is_escaped() {
     // カスタム種類の削除。
     let rev = fx.revision();
     let r = fx
-        .post("/kinds/architecture/delete", &[("revision", &rev)])
+        .post(
+            "/settings/documents/architecture/delete",
+            &[("revision", &rev)],
+        )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
     assert!(!fx.config().kinds.contains_key("architecture"));
 }
 
 // ---------------------------------------------------------------------------
-// 全般設定・同意・履歴の復元
+// 全般設定・文書タブ・履歴の復元
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn general_settings_refuse_default_push_and_confirm_policy() {
+async fn general_settings_confirm_policy_and_leave_default_documents_alone() {
     let fx = Fx::new().await;
+    // 全般には既定のモード・既定の対象の文書の欄は無い（対象の文書は「文書」タブ）。
+    let page = fx.get("/settings/general").await;
+    for gone in ["name=\"mode\"", "name=\"documents\""] {
+        assert!(!page.body.contains(gone), "{gone}");
+    }
     let rev = fx.revision();
-    let r = fx
-        .post(
-            "/settings/general",
-            &[
-                ("revision", &rev),
-                ("mode", "push"),
-                ("documents", "AGENTS.md"),
-                ("policy", "explicit"),
-            ],
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
-    assert!(!fx.store.config_file.exists());
     let pairs = [
         ("revision", rev.as_str()),
-        ("mode", "propose"),
-        ("documents", "AGENTS.md"),
-        ("documents", "README.md"),
         ("instructions", "日本語で書く"),
         ("policy", "all"),
     ];
-    let r = fx.post_confirmed("/settings/general", &pairs).await;
+    let first = fx.post("/settings/general", &pairs).await;
+    assert_eq!(first.status, StatusCode::OK);
+    assert!(first.body.contains("all"));
+    assert!(!fx.store.config_file.exists());
+    let r = fx
+        .post_exact("/settings/general", &hidden_fields(&first.body))
+        .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     let c = fx.config();
     assert_eq!(c.enrollment.policy, Policy::All);
     assert_eq!(c.defaults.instructions, "日本語で書く");
-    assert_eq!(c.defaults.documents.len(), 2);
+    // 全般の保存は既定の対象の文書を変えない（空にもしない）。
+    assert_eq!(c.defaults.documents, Config::default().defaults.documents);
+    // 警告と確認の文面は、自動で commit・push することを伝える。
+    let overview = fx.get("/").await;
+    assert!(
+        overview.body.contains("自動で commit・push"),
+        "{}",
+        overview.body
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn consent_page_records_ui_consent() {
+async fn documents_tab_saves_default_targets_with_revision_check() {
     let fx = Fx::new().await;
+    let page = fx.get("/settings/documents").await;
+    assert_eq!(page.status, StatusCode::OK);
+    // 上段: 既定の対象の文書（チェックボックス）。下段: 種類の一覧と追加の入口。「既定で対象」の列は無い。
+    assert!(
+        page.body
+            .contains(r#"name="documents" value="AGENTS.md" checked"#)
+    );
+    assert!(page.body.contains(r#"href="/settings/documents/agents""#));
+    assert!(page.body.contains(r#"href="/settings/documents/new""#));
+    assert!(page.body.contains(r#"action="/settings/documents""#));
+    assert!(!page.body.contains("既定で対象"));
+    // 保存（版の照合つき）。CHANGELOG はオプトインで、ここで既定の対象にできる。
     let rev = fx.revision();
     let r = fx
-        .post("/consent", &[("revision", &rev), ("version", "1")])
-        .await;
-    assert_eq!(r.status, StatusCode::BAD_REQUEST);
-    let r = fx
-        .post_confirmed(
-            "/consent",
-            &[("revision", &rev), ("version", "1"), ("agree", "1")],
+        .post(
+            "/settings/documents",
+            &[
+                ("revision", &rev),
+                ("documents", "AGENTS.md"),
+                ("documents", "CHANGELOG.md"),
+            ],
         )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    assert_eq!(r.location(), "/settings/documents?msg=saved");
+    assert_eq!(
+        fx.config().defaults.documents,
+        vec![config::Document::Agents, config::Document::Changelog]
+    );
+    // 古い版は 409 で、設定を書き換えない。
+    let stale = rev;
+    let before = fs::read(&fx.store.config_file).unwrap();
+    let r = fx
+        .post(
+            "/settings/documents",
+            &[("revision", &stale), ("documents", "README.md")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.body);
+    assert_eq!(fs::read(&fx.store.config_file).unwrap(), before);
+    // 1 つも選ばない・不正な値は 400。
+    let rev = fx.revision();
+    let r = fx.post("/settings/documents", &[("revision", &rev)]).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    let r = fx
+        .post(
+            "/settings/documents",
+            &[("revision", &rev), ("documents", "../evil.md")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert_eq!(fs::read(&fx.store.config_file).unwrap(), before);
+    // 保存後の画面にチェックが反映される。
+    let page = fx.get("/settings/documents").await;
+    assert!(page.body.contains(r#"value="CHANGELOG.md" checked"#));
+    assert!(!page.body.contains(r#"value="README.md" checked"#));
+    // CSRF の無い POST は拒否（保護は guard の 1 か所）。
+    let rev = fx.revision();
+    let r = fx
+        .post_exact(
+            "/settings/documents",
+            &[
+                ("revision".into(), rev),
+                ("documents".into(), "README.md".into()),
+            ],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(fs::read(&fx.store.config_file).unwrap(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn migrated_registration_is_not_resumable_and_enable_clears_it() {
+    let fx = Fx::new().await;
+    let root = fx.enable(&fx.repo).await;
+    scriptura::ops::edit(&fx.store, None, |c| {
+        c.repository[0].paused = true;
+        c.repository[0].migrated_from = Some(config::MigratedFrom::Propose);
+        Ok(())
+    })
+    .unwrap();
+    // 一覧・詳細・概要が「移行で停止」と案内し、詳細には再開ボタンも run-now も無い。
+    let list = fx.get("/repos").await;
+    assert!(list.body.contains("移行で停止"), "{}", list.body);
+    let page = fx.get("/repos/0").await;
+    assert!(page.body.contains("移行で停止"));
+    assert!(page.body.contains("有効化し直す"));
+    for gone in [
+        "action=\"/repos/resume\"",
+        "action=\"/repos/pause\"",
+        "action=\"/repos/run-now\"",
+    ] {
+        assert!(!page.body.contains(gone), "{gone}");
+    }
+    assert!(page.body.contains("action=\"/repos/enable\""));
+    let overview = fx.get("/").await;
+    assert!(
+        overview.body.contains("設定の移行で止めた登録が 1 件"),
+        "{}",
+        overview.body
+    );
+    // 再開の POST を直接送っても拒否される（有効化し直す案内つき）。
+    let rev = fx.revision();
+    let r = fx
+        .post("/repos/resume", &[("revision", &rev), ("root", &root)])
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(r.body.contains("有効化し直して"), "{}", r.body);
+    assert!(fx.config().repository[0].migrated_from.is_some());
+    // 有効化し直すと、移行由来の停止も一時停止も消える。
+    fx.enable(&fx.repo).await;
     let c = fx.config();
-    assert_eq!(c.consent.unwrap().source, ConsentSource::Ui);
-    assert_eq!(c.schema, 2);
-    assert!(fx.get("/consent").await.body.contains("記録済み"));
+    assert_eq!(c.repository.len(), 1);
+    assert!(c.repository[0].migrated_from.is_none());
+    assert!(c.repository[0].is_active());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_config_is_shown_as_converted_without_being_rewritten() {
+    let fx = Fx::new().await;
+    let text = format!(
+        "schema = 2\n[[repository]]\nroot = '{}'\n",
+        fx.repo.to_string_lossy()
+    );
+    fs::write(&fx.store.config_file, &text).unwrap();
+    // 閲覧は旧形式のまま変換して表示するだけで、ファイルを書き換えない。
+    let r = fx.get("/").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(r.body.contains("旧形式"), "{}", r.body);
+    assert!(r.body.contains("移行で停止"), "{}", r.body);
+    assert_eq!(fs::read_to_string(&fx.store.config_file).unwrap(), text);
+    for path in [
+        "/repos",
+        "/repos/0",
+        "/settings/documents",
+        "/settings/general",
+    ] {
+        assert_eq!(fx.get(path).await.status, StatusCode::OK, "{path}");
+    }
+    assert_eq!(fs::read_to_string(&fx.store.config_file).unwrap(), text);
+    // 設定を変えると新形式（schema 3）で保存され、直前の旧形式が変更履歴へ残る。
+    let rev = fx.revision();
+    let r = fx
+        .post(
+            "/settings/worker",
+            &worker_pairs(&rev, "opus", "restricted"),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    let saved = fs::read_to_string(&fx.store.config_file).unwrap();
+    assert!(saved.contains("schema = 3"), "{saved}");
+    assert!(saved.contains("migrated_from"), "{saved}");
+    assert_eq!(scriptura::ops::history(&fx.store).unwrap().len(), 1);
+    assert!(!fx.get("/").await.body.contains("旧形式"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1297,15 +1485,18 @@ async fn history_lists_backups_and_restore_is_confirmed_when_dangerous() {
     let history = scriptura::ops::history(&fx.store).unwrap();
     assert_eq!(history.len(), 1);
     let id = history[0].id.clone();
-    let page = fx.get("/history").await;
+    let page = fx.get("/settings/history").await;
     assert!(page.body.contains(&id));
-    let page = fx.get(&format!("/history/{id}")).await;
+    let page = fx.get(&format!("/settings/history/{id}")).await;
     assert_eq!(page.status, StatusCode::OK);
     assert!(page.body.contains("opus"));
     // 危険を含まない復元はそのまま。
     let rev = fx.revision();
     let r = fx
-        .post("/history/restore", &[("revision", &rev), ("id", &id)])
+        .post(
+            "/settings/history/restore",
+            &[("revision", &rev), ("id", &id)],
+        )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     assert_eq!(fx.config().worker.model, "opus");
@@ -1327,7 +1518,7 @@ async fn history_lists_backups_and_restore_is_confirmed_when_dangerous() {
     let rev = fx.revision();
     let first = fx
         .post(
-            "/history/restore",
+            "/settings/history/restore",
             &[("revision", &rev), ("id", &bypass_id)],
         )
         .await;
@@ -1335,7 +1526,7 @@ async fn history_lists_backups_and_restore_is_confirmed_when_dangerous() {
     assert!(first.body.contains("bypass"));
     assert_eq!(fx.config().worker.permission, Permission::Restricted);
     let r = fx
-        .post_exact("/history/restore", &hidden_fields(&first.body))
+        .post_exact("/settings/history/restore", &hidden_fields(&first.body))
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER);
     assert_eq!(fx.config().worker.permission, Permission::Bypass);
@@ -1343,104 +1534,11 @@ async fn history_lists_backups_and_restore_is_confirmed_when_dangerous() {
     let rev = fx.revision();
     let r = fx
         .post(
-            "/history/restore",
+            "/settings/history/restore",
             &[("revision", &rev), ("id", "../config.toml")],
         )
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
-}
-
-// ---------------------------------------------------------------------------
-// 更新案: 一覧・差分（エスケープ）・適用（二段階）・破棄
-// ---------------------------------------------------------------------------
-
-/// 登録済みリポジトリに更新案を 1 件置く（proposal::list が読む形式: `<sha>.json` と `<sha>.patch`）。
-fn place_proposal(root: &str, readme: &str) -> String {
-    let root = Path::new(root);
-    let sha = git_in(root, &["rev-parse", "HEAD"]).trim().to_string();
-    fs::write(root.join("README.md"), readme).unwrap();
-    let patch = git_in(root, &["diff", "--", "README.md"]);
-    git_in(root, &["checkout", "--", "README.md"]);
-    let dir = scriptura::proposal::proposals_dir(root);
-    fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join(format!("{sha}.patch")), patch).unwrap();
-    fs::write(
-        dir.join(format!("{sha}.json")),
-        serde_json::json!({
-            "commit": sha,
-            "status": "pending",
-            "created_at": "2026-11-15T00:00:00Z",
-            "created_unix": 1.0,
-            "diffstat": " README.md | 1 +",
-            "documents": ["README.md"],
-        })
-        .to_string(),
-    )
-    .unwrap();
-    sha
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn proposals_show_escaped_diff_and_apply_after_confirmation() {
-    let fx = Fx::new().await;
-    let root = fx.enable(&fx.repo).await;
-    let sha = place_proposal(&root, "readme\n<script>alert('x')</script>\n");
-    let list = fx.get("/proposals").await;
-    assert!(list.body.contains(&sha[..12]), "{}", list.body);
-    let page = fx.get(&format!("/proposals/0/{sha}")).await;
-    assert_eq!(page.status, StatusCode::OK);
-    assert!(!page.body.contains("<script>alert"));
-    assert!(page.body.contains("&#60;script&#62;"));
-    // 不正な sha・番号は 404。
-    assert_eq!(
-        fx.get("/proposals/0/abc").await.status,
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(
-        fx.get(&format!("/proposals/9/{sha}")).await.status,
-        StatusCode::NOT_FOUND
-    );
-    // 適用は二段階確認。1 回目は作業ツリーを変えない。
-    let rev = fx.revision();
-    let first = fx
-        .post(
-            "/proposals/apply",
-            &[("revision", &rev), ("root", &root), ("sha", &sha)],
-        )
-        .await;
-    assert_eq!(first.status, StatusCode::OK);
-    assert!(first.body.contains("適用します"));
-    assert_eq!(
-        fs::read_to_string(Path::new(&root).join("README.md")).unwrap(),
-        "readme\n"
-    );
-    let r = fx
-        .post_exact("/proposals/apply", &hidden_fields(&first.body))
-        .await;
-    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
-    assert!(
-        fs::read_to_string(Path::new(&root).join("README.md"))
-            .unwrap()
-            .contains("<script>")
-    );
-    assert!(scriptura::proposal::list(Path::new(&root))[0].applied);
-    // 破棄（確認なし）。
-    let r = fx
-        .post(
-            "/proposals/discard",
-            &[("revision", &rev), ("root", &root), ("sha", &sha)],
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
-    assert!(scriptura::proposal::list(Path::new(&root)).is_empty());
-    // 登録されていない root の更新案には触れない。
-    let r = fx
-        .post(
-            "/proposals/discard",
-            &[("revision", &rev), ("root", "D:/elsewhere"), ("sha", &sha)],
-        )
-        .await;
-    assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
 
 // ---------------------------------------------------------------------------
@@ -1466,6 +1564,15 @@ async fn secrets_never_appear_in_pages() {
     db.execute(
         "INSERT OR REPLACE INTO poll_cursors (repo_root, upstream, destination, fingerprint, updated_at, error, pushed_commit) VALUES (?1, 'refs/remotes/origin/main', 'd', 'f', 1.0, ?2, '')",
         rusqlite::params![key, "push に失敗: https://x:SENTINELCURSOR@github.com/acme/repo.git"],
+    )
+    .unwrap();
+    scriptura::runlog::record(
+        &db,
+        &sample_run(
+            &key,
+            "failed",
+            Some("run failed: https://y:SENTINELRUN@github.com/acme/repo.git"),
+        ),
     )
     .unwrap();
     drop(db);
@@ -1496,7 +1603,7 @@ async fn secrets_never_appear_in_pages() {
             .unwrap()
             .contains("SENTINELREMOTE")
     );
-    let history_page = format!("/history/{history_id}");
+    let history_page = format!("/settings/history/{history_id}");
     // 検証エラーの文言（設定の値を含みうる）にも出さない。
     let rev = fx.revision();
     let r = fx
@@ -1508,11 +1615,11 @@ async fn secrets_never_appear_in_pages() {
         "/",
         "/repos",
         "/repos/0",
-        "/kinds",
-        "/proposals",
+        "/settings/documents",
+        "/settings/documents/agents",
         "/settings/worker",
         "/settings/general",
-        "/consent",
+        "/settings/history",
         "/history",
         history_page.as_str(),
         "/doctor",
@@ -1528,6 +1635,7 @@ async fn secrets_never_appear_in_pages() {
         "SENTINELCURSOR",
         "SENTINELPUB",
         "SENTINELHISTORY",
+        "SENTINELRUN",
     ] {
         assert!(!seen.contains(sentinel), "{sentinel} が画面に出ています");
     }
@@ -1643,28 +1751,29 @@ fn real_server_binds_loopback_on_port_zero_and_shuts_down_from_the_page() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restoring_a_removed_registration_confirms_and_records_its_baseline() {
+async fn restoring_a_removed_paused_registration_records_its_baseline() {
     let fx = Fx::new().await;
     let root = fx.enable(&fx.repo).await;
-    // 登録を解除し（直前の内容 = 登録ありの版が履歴に残る）、解除中に push する。
+    // 一時停止にしてから解除し（直前の内容 = 停止中の登録ありの版が履歴に残る）、解除中に push する。
+    scriptura::ops::set_paused(&fx.store, &root, true, None).unwrap();
     scriptura::ops::disable(&fx.store, &root, None).unwrap();
     let id = scriptura::ops::history(&fx.store).unwrap()[0].id.clone();
     fs::write(fx.repo.join("source.txt"), "pushed while disabled").unwrap();
     git_in(&fx.repo, &["commit", "-am", "while disabled"]);
     git_in(&fx.repo, &["push"]);
-    // 登録が増える復元は確認を挟む（修正前は確認なしで保存していた）。
+    // 停止中の登録が戻る復元は、worker が動かないので確認なしで通る（有効な登録は増えない）。
     let rev = fx.revision();
-    let first = fx
-        .post("/history/restore", &[("revision", &rev), ("id", &id)])
-        .await;
-    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
-    assert!(first.body.contains("を登録します"), "{}", first.body);
     let r = fx
-        .post_exact("/history/restore", &hidden_fields(&first.body))
+        .post(
+            "/settings/history/restore",
+            &[("revision", &rev), ("id", &id)],
+        )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     assert_eq!(fx.config().repository.len(), 1);
-    // 復元時に起点を記録したので、解除中の push は処理しない（worker を起動しない）。
+    assert!(fx.config().repository[0].paused);
+    // 復元時に起点を記録したので、再開しても解除中の push は処理しない（worker を起動しない）。
+    scriptura::ops::set_paused(&fx.store, &root, false, None).unwrap();
     let message = scriptura::maintenance::handle_hook(
         &serde_json::json!({"hook_event_name": "Stop", "cwd": fx.repo}),
     )
@@ -1674,8 +1783,7 @@ async fn restoring_a_removed_registration_confirms_and_records_its_baseline() {
         !fx.base.join("prompt.json").exists(),
         "解除中の push で worker を起動してはならない"
     );
-    assert!(scriptura::proposal::list(Path::new(&root)).is_empty());
-    // 復元後の新しい push は通常どおり処理する。
+    // 再開後の新しい push は通常どおり処理する。
     fs::write(fx.repo.join("source.txt"), "after restore").unwrap();
     git_in(&fx.repo, &["commit", "-am", "after restore"]);
     git_in(&fx.repo, &["push"]);
@@ -1687,28 +1795,24 @@ async fn restoring_a_removed_registration_confirms_and_records_its_baseline() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn restoring_a_push_registration_is_refused_before_confirmation() {
+async fn restoring_a_version_that_activates_a_registration_is_refused_before_confirmation() {
     let fx = Fx::new().await;
     let root = fx.enable(&fx.repo).await;
-    // push の登録を持つ版を履歴に作る（設定の直接編集。画面の経路は push を enable にしか許さない）。
-    scriptura::ops::edit(&fx.store, None, |c| {
-        c.repository[0].mode = Some(Mode::Push);
-        Ok(())
-    })
-    .unwrap();
-    scriptura::ops::edit(&fx.store, None, |c| {
-        c.repository[0].mode = Some(Mode::Propose);
-        Ok(())
-    })
-    .unwrap();
+    // 有効な登録を持つ版を履歴に作る（一時停止にすると、直前の有効な版が退避される）。
+    scriptura::ops::set_paused(&fx.store, &root, true, None).unwrap();
     let id = scriptura::ops::history(&fx.store).unwrap()[0].id.clone();
     let rev = fx.revision();
     let r = fx
-        .post("/history/restore", &[("revision", &rev), ("id", &id)])
+        .post(
+            "/settings/history/restore",
+            &[("revision", &rev), ("id", &id)],
+        )
         .await;
+    // 確認画面を出す前に拒否する（有効化は enable だけが経路）。
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
-    assert!(r.body.contains("enable --mode push"), "{}", r.body);
-    assert_eq!(fx.config().repository[0].mode, Some(Mode::Propose));
+    assert!(r.body.contains("保守が有効になる"), "{}", r.body);
+    assert!(!r.body.contains("確認してください"), "{}", r.body);
+    assert!(fx.config().repository[0].paused);
     assert_eq!(fx.config().repository[0].root, root, "登録はそのまま");
 }
 
@@ -1831,11 +1935,15 @@ fn time_tags(body: &str) -> Vec<(String, String)> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn times_are_shown_in_local_time_without_fractions() {
     let fx = Fx::new().await;
-    fx.enable(&fx.repo).await;
+    let root = fx.enable(&fx.repo).await;
+    let key = scriptura::timing::repo_key(Path::new(&root)).unwrap();
+    let db = scriptura::maintenance::open_state_db().unwrap();
+    scriptura::runlog::record(&db, &sample_run(&key, "unchanged", None)).unwrap();
+    drop(db);
     let raw_nanos = Regex::new(r"\d{2}:\d{2}:\d{2}\.\d+").unwrap();
     let pretty = Regex::new(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}").unwrap();
-    // 概要・同意画面の「同意 版 N・時刻」は整形済みで、ナノ秒つきの UTC をそのまま出さない。
-    for path in ["/", "/consent"] {
+    // 保守履歴の時刻は整形済みで、ナノ秒つきの UTC をそのまま出さない。
+    for path in ["/history"] {
         let r = fx.get(path).await;
         assert_eq!(r.status, StatusCode::OK);
         assert!(!raw_nanos.is_match(&r.body), "{path}: {}", r.body);
@@ -1851,7 +1959,7 @@ async fn times_are_shown_in_local_time_without_fractions() {
         )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
-    let page = fx.get("/history").await;
+    let page = fx.get("/settings/history").await;
     let tags = time_tags(&page.body);
     assert_eq!(tags.len(), 1, "{}", page.body);
     let (raw, shown) = &tags[0];
@@ -1862,13 +1970,10 @@ async fn times_are_shown_in_local_time_without_fractions() {
         .to_string();
     assert_eq!(shown, &local);
     assert!(!page.body.contains(&format!(">{raw}<")));
-    // 保存形式（設定ファイルの同意時刻）は変えない（RFC 3339 のまま）。
-    let c = fx.config();
-    assert!(chrono::DateTime::parse_from_rfc3339(&c.consent.as_ref().unwrap().accepted_at).is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn header_has_five_items_and_settings_screens_share_a_subnav() {
+async fn header_has_four_items_and_settings_screens_share_a_subnav() {
     let fx = Fx::new().await;
     let header = |body: &str| -> String {
         let start = body.find("<header").unwrap();
@@ -1877,17 +1982,20 @@ async fn header_has_five_items_and_settings_screens_share_a_subnav() {
     let r = fx.get("/").await;
     let head = header(&r.body);
     let nav = &head[head.find("<nav").unwrap()..head.find("</nav>").unwrap()];
-    assert_eq!(nav.matches("<a ").count(), 5, "{nav}");
-    for href in ["/", "/repos", "/kinds", "/proposals", "/settings/general"] {
+    assert_eq!(nav.matches("<a ").count(), 4, "{nav}");
+    for href in ["/", "/repos", "/history", "/settings/general"] {
         assert!(nav.contains(&format!("href=\"{href}\"")), "{href}: {nav}");
+    }
+    for gone in ["/kinds", "/proposals", "/consent"] {
+        assert!(!nav.contains(gone), "{gone}: {nav}");
     }
     assert!(!r.body.contains("class=\"subnav\""));
     // 設定系の 5 画面: ヘッダーの「設定」が強調され、同じサブナビで現在の画面だけが強調される。
     let settings = [
         "/settings/general",
+        "/settings/documents",
         "/settings/worker",
-        "/consent",
-        "/history",
+        "/settings/history",
         "/doctor",
     ];
     for path in settings {
@@ -1913,6 +2021,17 @@ async fn header_has_five_items_and_settings_screens_share_a_subnav() {
             "{path}: {sub}"
         );
     }
+    // 種類の編集画面・追加画面も「文書」として強調される。
+    for path in ["/settings/documents/agents", "/settings/documents/new"] {
+        let r = fx.get(path).await;
+        assert_eq!(r.status, StatusCode::OK, "{path}");
+        let sub = &r.body[r.body.find("class=\"subnav\"").expect(path)..];
+        let sub = &sub[..sub.find("</nav>").unwrap()];
+        assert!(
+            sub.contains("href=\"/settings/documents\" aria-current=\"page\""),
+            "{path}: {sub}"
+        );
+    }
     // 履歴の個別画面（/history/{id}）も履歴として強調される。他のグループの画面は強調されない。
     for model in ["opus", "haiku"] {
         let rev = fx.revision();
@@ -1922,8 +2041,11 @@ async fn header_has_five_items_and_settings_screens_share_a_subnav() {
         assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     }
     let id = scriptura::ops::history(&fx.store).unwrap()[0].id.clone();
-    let r = fx.get(&format!("/history/{id}")).await;
-    assert!(r.body.contains("href=\"/history\" aria-current=\"page\""));
+    let r = fx.get(&format!("/settings/history/{id}")).await;
+    assert!(
+        r.body
+            .contains("href=\"/settings/history\" aria-current=\"page\"")
+    );
     let r = fx.get("/repos").await;
     assert!(!header(&r.body).contains("href=\"/settings/general\" aria-current=\"page\""));
     assert!(!r.body.contains("class=\"subnav\""));
@@ -2267,7 +2389,11 @@ async fn update_panel_is_unsupported_outside_setup_and_touches_no_state() {
     }
     // 概要の閲覧は状態フォルダーを作らない（JS・CSS は同梱の静的ファイルだけ）。
     assert!(!fx.base.join("state").exists());
-    assert!(fx.get("/assets/app.js").await.body.contains("data-updates"));
+    let js = fx.get("/assets/app.js").await.body;
+    assert!(js.contains("data-updates"));
+    // 更新のインストールの確認は、ブラウザー標準の確認ではなく画面の中のダイアログで行う。
+    assert!(!js.contains("window.confirm"), "native confirm is not used");
+    assert!(js.contains("showModal"));
 
     let json_post = |path: &'static str| {
         let body = url::form_urlencoded::Serializer::new(String::new())
@@ -2319,4 +2445,187 @@ async fn update_panel_is_unsupported_outside_setup_and_touches_no_state() {
     assert!(!fx.base.join("state").exists());
     // インストールの要求は、サーバーを止めない（非対応のときは shutdown を通知しない）。
     assert_eq!(fx.get("/").await.status, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// 保守履歴（/history）
+// ---------------------------------------------------------------------------
+
+fn sample_run(root: &str, outcome: &str, message: Option<&str>) -> scriptura::runlog::Run {
+    scriptura::runlog::Run {
+        repo_root: root.to_string(),
+        started_at: 1_700_000_000.0,
+        finished_at: 1_700_000_005.0,
+        origin: "hook".into(),
+        base_commit: "a".repeat(40),
+        target_commit: "b".repeat(40),
+        outcome: outcome.into(),
+        result_commit: String::new(),
+        detail: scriptura::runlog::Detail {
+            kinds: vec!["agents".into()],
+            documents: vec![scriptura::runlog::DocChange {
+                path: "AGENTS.md".into(),
+                added: 3,
+                removed: 1,
+            }],
+        },
+        message: message.map(str::to_string),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runs_page_lists_maintenance_runs_and_does_not_create_state() {
+    let fx = Fx::new().await;
+    // DB が無いときの閲覧は、空の案内を出すだけで状態フォルダー・DB を作らない。
+    let r = fx.get("/history").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(r.body.contains("保守の記録はまだありません"), "{}", r.body);
+    assert!(!fx.base.join("state").exists());
+    // 登録した後、記録を直接入れる（失敗の理由に <script> と資格情報入り URL）。
+    let root = fx.enable(&fx.repo).await;
+    let key = scriptura::timing::repo_key(Path::new(&root)).unwrap();
+    let db = scriptura::maintenance::open_state_db().unwrap();
+    scriptura::runlog::record(&db, &sample_run(&key, "proposed", None)).unwrap();
+    // 未知の結果は失敗扱いにせず、元の文字列を中立の見た目で出す（伏せ字処理は通す）。
+    scriptura::runlog::record(
+        &db,
+        &sample_run(&key, "future_outcome https://u:tok2@example.com/y", None),
+    )
+    .unwrap();
+    scriptura::runlog::record(
+        &db,
+        &sample_run(
+            &key,
+            "failed",
+            Some("<script>alert(1)</script> https://u:tok@example.com/x"),
+        ),
+    )
+    .unwrap();
+    drop(db);
+    let r = fx.get("/history").await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(r.body.contains("AGENTS.md +3 \u{2212}1"), "{}", r.body);
+    // 旧版が残した行（proposed）も読める。更新案はもう無いのでリンクにしない。モードの列も無い。
+    assert!(r.body.contains("更新案を作成"));
+    assert!(!r.body.contains("/proposals"));
+    assert!(!r.body.contains("<th>モード</th>"));
+    assert!(r.body.contains("失敗"));
+    assert!(r.body.contains("href=\"/repos/0\""));
+    assert!(!r.body.contains("<script>alert(1)"));
+    assert!(r.body.contains("&#60;script&#62;alert(1)"), "{}", r.body);
+    assert!(!r.body.contains("u:tok@") && !r.body.contains("u:tok2@"));
+    assert!(r.body.contains("future_outcome"), "{}", r.body);
+    assert!(
+        !Regex::new(r#"status-fail">future_outcome"#)
+            .unwrap()
+            .is_match(&r.body)
+    );
+    assert!(r.body.contains("https://***@example.com/x"));
+    // ヘッダーの「履歴」だけが強調され、設定のサブナビは出ない。
+    assert!(r.body.contains("href=\"/history\" aria-current=\"page\""));
+    assert!(!r.body.contains("class=\"subnav\""));
+    // 絞り込み: 登録済みのリポジトリ・全体・範囲外・不正値。
+    assert_eq!(fx.get("/history?repo=0").await.status, StatusCode::OK);
+    assert!(fx.get("/history?repo=0").await.body.contains("AGENTS.md"));
+    assert_eq!(fx.get("/history?repo=").await.status, StatusCode::OK);
+    for bad in [
+        "/history?repo=9",
+        "/history?repo=x",
+        "/history?repo=-1",
+        "/history?before=0",
+        "/history?before=x",
+    ] {
+        assert_eq!(fx.get(bad).await.status, StatusCode::BAD_REQUEST, "{bad}");
+    }
+    // /repos/0 に最近の保守が出る。
+    let page = fx.get("/repos/0").await;
+    assert!(page.body.contains("/history?repo=0"));
+    assert!(page.body.contains("AGENTS.md +3"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runs_page_filters_by_repository_and_pages_with_before() {
+    let fx = Fx::new().await;
+    let root = fx.enable(&fx.repo).await;
+    let key = scriptura::timing::repo_key(Path::new(&root)).unwrap();
+    let db = scriptura::maintenance::open_state_db().unwrap();
+    // 別のリポジトリ（登録なし）の行と、登録済みの行 60 件。
+    for i in 0..60 {
+        let mut run = sample_run(&key, "unchanged", None);
+        run.target_commit = format!("{i:040x}");
+        scriptura::runlog::record(&db, &run).unwrap();
+    }
+    scriptura::runlog::record(&db, &sample_run("D:/unregistered/repo", "unchanged", None)).unwrap();
+    drop(db);
+    let all = fx.get("/history").await;
+    assert!(all.body.contains("D:/unregistered/repo"), "{}", all.body);
+    // 登録解除済み（設定に無い）リポジトリはリンクにならず、パスだけが出る。
+    assert!(!all.body.contains("<a href=\"/repos/1\""));
+    // 50 件で区切られ、古い方へのリンクが出る。
+    let next = Regex::new(r#"href="(/history\?before=\d+)""#)
+        .unwrap()
+        .captures(&all.body)
+        .expect("古い方へのリンク")[1]
+        .to_string();
+    assert_eq!(all.body.matches("<tr>").count(), 51, "ヘッダー 1 + 50 行");
+    let second = fx.get(&next).await;
+    assert_eq!(second.status, StatusCode::OK);
+    assert_eq!(second.body.matches("<tr>").count(), 1 + 11);
+    assert!(!second.body.contains("D:/unregistered/repo"));
+    assert!(!second.body.contains("古い記録を表示"));
+    // リポジトリで絞ると、別のリポジトリの行は出ない。次のページのリンクも絞り込みを引き継ぐ。
+    let one = fx.get("/history?repo=0").await;
+    assert!(!one.body.contains("D:/unregistered/repo"));
+    assert!(one.body.contains("repo=0&#38;before="), "{}", one.body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_history_moved_under_settings_and_old_urls_are_not_it() {
+    let fx = Fx::new().await;
+    for model in ["opus", "haiku"] {
+        let rev = fx.revision();
+        let r = fx
+            .post("/settings/worker", &worker_pairs(&rev, model, "restricted"))
+            .await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    }
+    let rev = fx.revision();
+    let id = scriptura::ops::history(&fx.store).unwrap()[0].id.clone();
+    // 設定の変更履歴は /settings/history（サブナビ内）。戻り先・復元フォームの action も移っている。
+    let page = fx.get("/settings/history").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains(&format!("/settings/history/{id}")));
+    assert!(page.body.contains("設定の変更履歴"));
+    let entry = fx.get(&format!("/settings/history/{id}")).await;
+    assert!(entry.body.contains("action=\"/settings/history/restore\""));
+    assert!(entry.body.contains("href=\"/settings/history\""));
+    // 旧 URL の個別画面・復元は無い。
+    assert_eq!(
+        fx.get(&format!("/history/{id}")).await.status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        fx.post("/history/restore", &[("revision", &rev), ("id", &id)])
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        fx.get("/settings/history/..%2Fconfig.toml").await.status,
+        StatusCode::NOT_FOUND
+    );
+    // 復元後は設定の変更履歴へ戻る。
+    let rev = fx.revision();
+    let r = fx
+        .post(
+            "/settings/history/restore",
+            &[("revision", &rev), ("id", &id)],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    assert!(
+        r.location().starts_with("/settings/history?msg="),
+        "{}",
+        r.location()
+    );
 }

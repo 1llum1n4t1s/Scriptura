@@ -1,0 +1,32 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<div class="heading"><h1>{{ crate::locale::tr("ui.nav.documents") }}</h1></div>
+<section class="panel">
+  <h2>{{ crate::locale::tr("ui.documents.defaults_heading") }}</h2>
+  <form method="post" action="/settings/documents" class="stack">
+    <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}">
+    <fieldset class="choices"><legend>{{ crate::locale::tr("ui.documents.defaults_legend") }}</legend>
+      {% for d in documents %}<label class="checkbox"><input type="checkbox" name="documents" value="{{ d.value }}"{% if d.selected %} checked{% endif %}>{{ d.label }}</label>
+      {% endfor %}
+    </fieldset>
+    <div class="actions"><button class="primary" type="submit">{{ crate::locale::tr("ui.common.save") }}</button></div>
+  </form>
+  <p class="note">{{ crate::locale::tr("ui.documents.defaults_note") }}</p>
+</section>
+<section class="panel">
+  <div class="heading"><h2>{{ crate::locale::tr("ui.documents.kinds_heading") }}</h2><a class="button primary small" href="/settings/documents/new">＋ {{ crate::locale::tr("ui.kinds.add") }}</a></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>{{ crate::locale::tr("ui.kinds.kind") }}</th><th>{{ crate::locale::tr("ui.kind.summary_limits") }}</th><th>{{ crate::locale::tr("ui.kind.summary_timing") }}</th><th>{{ crate::locale::tr("ui.kind.summary_template") }}</th><th>{{ crate::locale::tr("ui.kinds.settings") }}</th></tr></thead>
+    <tbody>
+    {% for k in kinds %}<tr>
+      <td><a href="/settings/documents/{{ k.id }}">{{ k.name }}</a>{% if !k.builtin %} <span class="tag">{{ crate::locale::tr("cli.docs.custom") }}</span>{% endif %}</td>
+      <td>{{ k.limits }}</td>
+      <td>{{ k.when }}</td>
+      <td><code>{{ k.template }}</code></td>
+      <td>{% if k.customized %}{{ crate::locale::tr("ui.kinds.customized") }}{% else %}{{ crate::locale::tr("ui.kind.default") }}{% endif %}</td>
+    </tr>{% endfor %}
+    </tbody>
+  </table></div>
+  <p class="note">{{ crate::locale::tr("ui.kinds.note") }}</p>
+</section>
+{% endblock %}

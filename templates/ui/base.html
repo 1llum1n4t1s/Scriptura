@@ -7,8 +7,7 @@
   <nav aria-label="{{ crate::locale::tr("ui.base.nav_label") }}">
     <a href="/" aria-current="{% if layout.nav == "overview" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.overview") }}</a>
     <a href="/repos" aria-current="{% if layout.nav == "repos" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.repos") }}</a>
-    <a href="/kinds" aria-current="{% if layout.nav == "kinds" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.kinds") }}</a>
-    <a href="/proposals" aria-current="{% if layout.nav == "proposals" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.proposals") }}</a>
+    <a href="/history" aria-current="{% if layout.nav == "history" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.runs") }}</a>
     <a href="/settings/general" aria-current="{% if layout.in_settings() %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.settings") }}</a>
   </nav>
   <form method="post" action="/language" class="inline language" data-language-selector><input type="hidden" name="csrf" value="{{ layout.csrf }}"><label><span class="visually-hidden">{{ crate::locale::tr("ui.lang.label") }}</span><select name="language" aria-label="{{ crate::locale::tr("ui.lang.label") }}" data-autosubmit>{% for c in crate::ui::views::language_choices() %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label><button class="small" type="submit" data-autosubmit-fallback>{{ crate::locale::tr("ui.lang.apply") }}</button></form>

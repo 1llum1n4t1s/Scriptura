@@ -9,6 +9,7 @@ use std::{
 use scriptura::config::*;
 use scriptura::paths::resolve_config_file;
 
+/// 旧形式の同意ブロック（変換のテスト用）。
 fn consent() -> &'static str {
     "[consent]\nversion = 1\naccepted_at = \"2026-01-01T00:00:00Z\"\nsource = \"cli\"\n"
 }
@@ -38,40 +39,46 @@ fn urls(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
 }
 
-fn with_consent(extra: &str) -> Config {
-    ok(&format!("schema = 1\n{}\n{extra}", consent()))
+/// 現行形式（schema 3）の設定。
+fn v3(extra: &str) -> Config {
+    ok(&format!("schema = 3\n{extra}"))
+}
+
+/// 旧形式（schema 2・同意あり）の設定を変換して読む。
+fn legacy(extra: &str) -> (Config, LegacyNotice) {
+    let text = format!("schema = 2\n{}\n{extra}", consent());
+    let (loaded, notice) = parse_with_notice(&text);
+    match loaded {
+        Loaded::Ok(c) => (c, notice.expect("旧形式として変換される")),
+        other => panic!("Ok を期待: {other:?}"),
+    }
 }
 
 #[test]
 fn defaults_are_safe() {
     let c = ok("");
     assert_eq!(c, Config::default());
-    assert!(c.consent.is_none());
-    assert_eq!(c.defaults.mode, Mode::Propose);
+    assert_eq!(c.schema, CURRENT_SCHEMA);
     assert_eq!(c.defaults.documents, Document::ALL.to_vec());
     assert_eq!(c.worker.model, "claude-sonnet-5-5");
     assert_eq!(c.worker.effort, "high");
     assert_eq!(c.worker.timeout_secs, 1200);
     assert_eq!(c.worker.permission, Permission::Restricted);
     assert_eq!(c.enrollment.policy, Policy::Explicit);
-    // 同意が無ければ全リポジトリ off。
+    // 登録も policy も無ければ対象外。
     let d = resolve(
         &c,
         Path::new("/x"),
         &urls(&["https://github.com/a/b"]),
         "main",
     );
-    assert_eq!(d.skip_reason, Some(SkipReason::NoConsent));
-    assert_eq!(d.mode, Mode::Off);
+    assert_eq!(d.skip_reason, Some(SkipReason::NotEnrolled));
 }
 
 #[test]
 fn rejects_unknown_keys_and_bad_values() {
     assert!(invalid("bogus = 1").contains("不正"));
-    assert!(matches!(
-        parse("[defaults]\nmode = \"propose\"\nzzz = 1"),
-        Loaded::Invalid(_)
-    ));
+    assert!(matches!(parse("[defaults]\nzzz = 1"), Loaded::Invalid(_)));
     assert!(matches!(
         parse("[worker]\npermission = \"yolo\""),
         Loaded::Invalid(_)
@@ -81,7 +88,7 @@ fn rejects_unknown_keys_and_bad_values() {
         Loaded::Invalid(_)
     ));
     assert!(matches!(parse("this is = not toml ["), Loaded::Invalid(_)));
-    // CHANGELOG.md は組み込みの種類として受け付ける（schema 2 の機能。省略時の schema でも読める）。
+    // CHANGELOG.md は組み込みの種類として受け付ける。
     assert!(matches!(
         parse("[defaults]\ndocuments = [\"CHANGELOG.md\"]"),
         Loaded::Ok(_)
@@ -122,75 +129,308 @@ fn documents_subset_accepted() {
 
 #[test]
 fn newer_schema_is_invalid_even_with_unknown_keys() {
-    // schema 2 は現行。未知キーは（schema が同じでも）Invalid だが、理由は schema ではなくキー。
+    // schema 3 は現行。未知キーは（schema が同じでも）Invalid だが、理由は schema ではなくキー。
     assert!(matches!(
-        parse("schema = 2\nfuture_key = true\n"),
+        parse("schema = 3\nfuture_key = true\n"),
         Loaded::Invalid(_)
     ));
-    // schema 3 以上は「新しい schema」として未知キーの有無に関わらず断る。
-    let r = invalid("schema = 3\nfuture_key = true\n");
+    // schema 4 以上は「新しい schema」として未知キーの有無に関わらず断る。
+    let r = invalid("schema = 4\nfuture_key = true\n");
     assert!(r.contains("schema"));
-    assert!(invalid("schema = 3\n").contains("schema"));
+    assert!(invalid("schema = 4\n").contains("schema"));
+    assert!(invalid("schema = 99\n").contains("schema"));
     assert!(matches!(parse("schema = \"1\""), Loaded::Invalid(_)));
     assert!(matches!(parse("schema = 0"), Loaded::Invalid(_)));
-    assert!(matches!(ok("schema = 1"), Config { .. }));
-    assert!(matches!(ok("schema = 2"), Config { .. }));
+    assert!(matches!(parse("schema = -1"), Loaded::Invalid(_)));
+    // 1・2・3 は読める（1・2 は旧形式）。
+    for n in 1..=3 {
+        assert!(matches!(ok(&format!("schema = {n}")), Config { .. }));
+    }
 }
 
 #[test]
-fn schema_two_round_trips_and_schema_one_stays_one() {
+fn schema_three_round_trips_and_old_schemas_are_saved_as_three() {
     let dir = tmp("schema-roundtrip");
-    // 新機能を使わない設定は、読み込み後に保存し直しても schema 1 のまま（旧版でも読める）。
-    let file = dir.join("v1.toml");
-    save_to(&file, &ok("schema = 1\n")).unwrap();
-    assert!(
-        std::fs::read_to_string(&file)
-            .unwrap()
-            .contains("schema = 1")
-    );
-    // schema = 2 と書いただけで機能を使っていない設定も、保存すると必要最小の 1 になる。
-    let plain = ok("schema = 2\n");
-    assert_eq!(plain.required_schema(), 1);
-    save_to(&file, &plain).unwrap();
-    assert!(
-        std::fs::read_to_string(&file)
-            .unwrap()
-            .contains("schema = 1")
-    );
-    // 新機能（kinds・CHANGELOG・追加指示・UI での同意）を使うと 2 で書き、往復で同じ内容に戻る。
+    let file = dir.join("config.toml");
+    // 旧形式（1・2・省略）で読んだ設定も、保存すると常に schema 3。
+    for text in ["schema = 1\n", "schema = 2\n", ""] {
+        let c = ok(text);
+        assert_eq!(c.schema, 3, "{text:?}");
+        save_to(&file, &c).unwrap();
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("schema = 3")
+        );
+    }
+    // 新機能（kinds・CHANGELOG・追加指示）を使っても schema 3 で書かれ、往復で同じ内容に戻る。
     for extra in [
         "[kinds.agents]\nmax_bytes = 20000\n",
         "[defaults]\ninstructions = \"日本語で書く\"\n",
         "[defaults]\ndocuments = [\"README.md\", \"CHANGELOG.md\"]\n",
         "[kinds.architecture]\nguidance = \"構成\"\npaths = [\"docs/ARCHITECTURE.md\"]\n[defaults]\ndocuments = [\"architecture\"]\n",
+        "[[repository]]\nroot = \"/w/x\"\npaused = true\nmigrated_from = \"propose\"\n",
     ] {
-        let c = ok(&format!("schema = 2\n{extra}"));
-        assert_eq!(c.required_schema(), 2, "{extra}");
-        let file = dir.join("v2.toml");
+        let c = v3(extra);
         save_to(&file, &c).unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
-        assert!(text.contains("schema = 2"), "{text}");
-        let Loaded::Ok(back) = load_from(&file) else {
-            panic!("読み戻せません: {text}")
-        };
-        assert_eq!(back, Config { schema: 2, ..c });
+        assert!(text.contains("schema = 3"), "{text}");
+        assert_eq!(load_from(&file), Loaded::Ok(c), "{extra}");
     }
-    // 旧設定のメモリ上の値が 1 のままでも、機能を足して保存すれば 2 で書かれる。
-    let mut c = ok("schema = 1\n");
-    c.defaults.documents.push(Document::Changelog);
+    // メモリ上の schema が古くても、保存は現行の版で書く。
+    let mut c = ok("");
+    c.schema = 1;
     save_to(&file, &c).unwrap();
     assert!(
         std::fs::read_to_string(&file)
             .unwrap()
-            .contains("schema = 2")
+            .contains("schema = 3")
     );
-    // 管理画面での同意（設定ファイル上の綴り `source = "ui"`）は、読み取りで ConsentSource::Ui になり、
-    // 保存時に必要な schema を 2 にする。綴りの固定もここで見る。
-    let ui = ok(
-        "schema = 2\n[consent]\nversion = 1\naccepted_at = \"2026-01-01T00:00:00Z\"\nsource = \"ui\"\n",
+}
+
+#[test]
+fn schema_three_rejects_consent_and_mode_keys() {
+    assert!(matches!(
+        parse(&format!("schema = 3\n{}", consent())),
+        Loaded::Invalid(_)
+    ));
+    assert!(matches!(
+        parse("schema = 3\n[defaults]\nmode = \"push\"\n"),
+        Loaded::Invalid(_)
+    ));
+    assert!(matches!(
+        parse("schema = 3\n[[repository]]\nroot = \"/r\"\nmode = \"push\"\n"),
+        Loaded::Invalid(_)
+    ));
+    // schema 3 は変換の対象ではない。
+    assert_eq!(parse_with_notice("schema = 3\n").1, None);
+}
+
+// ---------------------------------------------------------------------------
+// 旧形式の変換
+// ---------------------------------------------------------------------------
+
+fn repo<'a>(c: &'a Config, root: &str) -> &'a Repository {
+    c.repository.iter().find(|r| r.root == root).unwrap()
+}
+
+#[test]
+fn legacy_push_with_consent_is_kept_as_is() {
+    let (c, notice) = legacy(
+        "[defaults]\nmode = \"push\"\n[[repository]]\nroot = \"/a\"\n\
+         [[repository]]\nroot = \"/b\"\nmode = \"push\"\npaused = true\n",
     );
-    assert_eq!(ui.consent.as_ref().unwrap().source, ConsentSource::Ui);
-    assert_eq!(ui.required_schema(), 2);
+    assert_eq!(
+        notice,
+        LegacyNotice {
+            from_schema: 2,
+            stopped: 0,
+            policy_reset: false
+        }
+    );
+    assert!(!notice.changed_behavior());
+    assert_eq!(c.schema, 3);
+    let a = repo(&c, "/a");
+    assert!(!a.paused && a.migrated_from.is_none());
+    // 一時停止は元の値のまま（移行由来の停止にはしない）。
+    let b = repo(&c, "/b");
+    assert!(b.paused && b.migrated_from.is_none());
+    assert_eq!(
+        resolve_for_os(&c, Path::new("/a"), &[], "main", false).skip_reason,
+        None
+    );
+    assert_eq!(
+        resolve_for_os(&c, Path::new("/b"), &[], "main", false).skip_reason,
+        Some(SkipReason::Paused)
+    );
+}
+
+#[test]
+fn legacy_propose_off_and_unconsented_are_stopped_with_their_origin() {
+    // 既定 propose（mode 省略を含む）・登録ごとの off・登録ごとの push（既定が propose でも push は残る）。
+    let (c, notice) = legacy(
+        "[[repository]]\nroot = \"/default\"\n\
+         [[repository]]\nroot = \"/off\"\nmode = \"off\"\n\
+         [[repository]]\nroot = \"/push\"\nmode = \"push\"\n\
+         [[repository]]\nroot = \"/propose\"\nmode = \"propose\"\n",
+    );
+    assert_eq!(notice.stopped, 3);
+    assert!(notice.changed_behavior());
+    let stopped = |root: &str| {
+        let r = repo(&c, root);
+        (r.paused, r.migrated_from)
+    };
+    assert_eq!(stopped("/default"), (true, Some(MigratedFrom::Propose)));
+    assert_eq!(stopped("/off"), (true, Some(MigratedFrom::Off)));
+    assert_eq!(stopped("/push"), (false, None));
+    assert_eq!(stopped("/propose"), (true, Some(MigratedFrom::Propose)));
+    // 移行由来の停止は paused に関係なく Migrated。位置は進める。
+    let skip = resolve_for_os(&c, Path::new("/off"), &[], "main", false)
+        .skip_reason
+        .unwrap();
+    assert_eq!(skip, SkipReason::Migrated);
+    assert!(skip.advances_cursor());
+}
+
+#[test]
+fn legacy_without_consent_or_with_old_consent_version_stops_everything() {
+    // キーの無い手書きの旧ファイル（同意なし）は、push モードでも全登録を止める。
+    for text in [
+        "[defaults]\nmode = \"push\"\n[[repository]]\nroot = \"/a\"\n[[repository]]\nroot = \"/b\"\nmode = \"push\"\n",
+        "[[repository]]\nroot = \"/a\"\n[[repository]]\nroot = \"/b\"\n",
+        // 同意の版が 0 は無効な同意。
+        "[consent]\nversion = 0\naccepted_at = \"x\"\nsource = \"ui\"\n[defaults]\nmode = \"push\"\n[[repository]]\nroot = \"/a\"\n[[repository]]\nroot = \"/b\"\n",
+    ] {
+        let (loaded, notice) = parse_with_notice(text);
+        let Loaded::Ok(c) = loaded else {
+            panic!("Ok を期待: {text}");
+        };
+        let notice = notice.unwrap();
+        assert_eq!(notice.from_schema, 1, "{text}");
+        assert_eq!(notice.stopped, 2, "{text}");
+        for r in &c.repository {
+            assert!(r.paused, "{text}");
+            assert_eq!(r.migrated_from, Some(MigratedFrom::Unconsented), "{text}");
+        }
+    }
+}
+
+#[test]
+fn legacy_policy_is_reset_unless_consented_push_default() {
+    let policy = |text: &str| {
+        let (loaded, notice) = parse_with_notice(text);
+        let Loaded::Ok(c) = loaded else {
+            panic!("Ok を期待: {text}");
+        };
+        (c.enrollment, notice.unwrap().policy_reset)
+    };
+    let enrollment = |policy: &str| {
+        format!("[enrollment]\npolicy = \"{policy}\"\nowners = [\"github.com/acme\"]\n")
+    };
+    // all / remote-owner + propose（既定）→ explicit（owners は保つ）。
+    for p in ["all", "remote-owner"] {
+        let (e, reset) = policy(&format!("schema = 2\n{}\n{}", consent(), enrollment(p)));
+        assert_eq!(e.policy, Policy::Explicit, "{p}");
+        assert_eq!(e.owners, vec!["github.com/acme".to_string()]);
+        assert!(reset);
+        // 同意なしの push 既定も explicit。
+        let (e, reset) = policy(&format!("[defaults]\nmode = \"push\"\n{}", enrollment(p)));
+        assert_eq!(e.policy, Policy::Explicit, "{p}");
+        assert!(reset);
+    }
+    // 同意あり・defaults push はそのまま（既存機能として残す）。
+    for p in ["all", "remote-owner"] {
+        let (e, reset) = policy(&format!(
+            "schema = 2\n{}\n[defaults]\nmode = \"push\"\n{}",
+            consent(),
+            enrollment(p)
+        ));
+        assert_eq!(
+            e.policy,
+            if p == "all" {
+                Policy::All
+            } else {
+                Policy::RemoteOwner
+            }
+        );
+        assert!(!reset);
+    }
+    // 旧利用者の自動移行の設定（同意・push・policy all）は、移行後の形でもそのまま動く。
+    let legacy_all = Config::legacy_all_push();
+    assert_eq!(legacy_all.enrollment.policy, Policy::All);
+    assert_eq!(legacy_all.schema, 3);
+    assert_eq!(
+        resolve(&legacy_all, Path::new("/r"), &[], "x").skip_reason,
+        None
+    );
+}
+
+#[test]
+fn legacy_with_broken_consent_or_mode_is_invalid() {
+    for text in [
+        // 同意の未知キー・不正な出所・欠けた項目。
+        "[consent]\nversion = 1\naccepted_at = \"x\"\nsource = \"cli\"\nextra = 1\n",
+        "[consent]\nversion = 1\naccepted_at = \"x\"\nsource = \"bogus\"\n",
+        "[consent]\nversion = 1\n",
+        "consent = 1\n",
+        // 不正なモード。
+        "[defaults]\nmode = \"pushh\"\n",
+        "[defaults]\nmode = 1\n",
+        "[[repository]]\nroot = \"/r\"\nmode = \"auto\"\n",
+        // 変換後の設定で出てくるはずのない値は旧形式では書けない。
+        "[[repository]]\nroot = \"/r\"\nmigrated_from = \"off\"\n",
+    ] {
+        let (loaded, notice) = parse_with_notice(&format!("schema = 2\n{text}"));
+        assert!(matches!(loaded, Loaded::Invalid(_)), "{text}: {loaded:?}");
+        assert_eq!(notice, None, "{text}");
+    }
+}
+
+#[test]
+fn update_in_always_saves_a_legacy_file_as_schema_three_with_a_backup() {
+    let dir = tmp("legacy-save");
+    let store = Store::new(dir.join("config.toml"), dir.join("state"));
+    let text = format!(
+        "schema = 1\n{}\n[defaults]\nmode = \"push\"\n[[repository]]\nroot = \"/w/a\"\n",
+        consent()
+    );
+    std::fs::write(&store.config_file, &text).unwrap();
+    let snapshot = read_at(&store.config_file);
+    assert!(matches!(snapshot.loaded, Loaded::Ok(_)));
+    assert_eq!(snapshot.legacy.as_ref().map(|l| l.from_schema), Some(1));
+    // 内容が変わらない更新でも、旧形式なら保存する（変換結果を確定させる）。
+    let updated = update_in(&store, Some(&snapshot.revision), |_, _| Ok(())).unwrap();
+    assert!(updated.saved);
+    assert_eq!(updated.previous, snapshot.revision);
+    let backup = updated.backup.expect("変更前の内容を退避する");
+    assert_eq!(std::fs::read_to_string(backup).unwrap(), text);
+    let saved = std::fs::read_to_string(&store.config_file).unwrap();
+    assert!(saved.contains("schema = 3"), "{saved}");
+    assert!(
+        !saved.contains("consent") && !saved.lines().any(|l| l.starts_with("mode ")),
+        "{saved}"
+    );
+    let after = read_at(&store.config_file);
+    assert_eq!(after.legacy, None);
+    assert_eq!(after.revision, updated.revision);
+    // 2 回目は新形式なので、内容が同じなら保存しない。
+    let again = update_in(&store, None, |_, _| Ok(())).unwrap();
+    assert!(!again.saved && again.backup.is_none());
+    assert_eq!(history_in(&store).unwrap().len(), 1);
+    // 版が違えば衝突として何も書かない。
+    let other = tmp("legacy-conflict");
+    let store2 = Store::new(other.join("config.toml"), other.join("state"));
+    std::fs::write(&store2.config_file, &text).unwrap();
+    let before = std::fs::read(&store2.config_file).unwrap();
+    assert!(matches!(
+        update_in(&store2, Some(&Revision::missing()), |_, _| Ok(())),
+        Err(UpdateError::Conflict { .. })
+    ));
+    assert_eq!(std::fs::read(&store2.config_file).unwrap(), before);
+}
+
+#[test]
+fn history_entries_in_the_old_format_are_converted_when_read() {
+    let dir = tmp("legacy-history");
+    let store = Store::new(dir.join("config.toml"), dir.join("state"));
+    // 旧形式の内容を履歴へ退避させる（最初の保存で退避される）。
+    std::fs::write(
+        &store.config_file,
+        format!(
+            "schema = 2\n{}\n[[repository]]\nroot = \"/w/a\"\n",
+            consent()
+        ),
+    )
+    .unwrap();
+    update_in(&store, None, |_, _| Ok(())).unwrap();
+    let id = history_in(&store).unwrap().remove(0).id;
+    let (_, loaded) = history_read_in(&store, &id).unwrap();
+    let Loaded::Ok(c) = loaded else {
+        panic!("Ok を期待");
+    };
+    let r = &c.repository[0];
+    assert!(r.paused);
+    assert_eq!(r.migrated_from, Some(MigratedFrom::Propose));
 }
 
 #[test]
@@ -243,8 +483,7 @@ fn normalize_remote_forms() {
 
 #[test]
 fn owners_match_all_push_urls() {
-    let c =
-        with_consent("[enrollment]\npolicy = \"remote-owner\"\nowners = [\"GitHub.com/Acme\"]\n");
+    let c = v3("[enrollment]\npolicy = \"remote-owner\"\nowners = [\"GitHub.com/Acme\"]\n");
     let root = Path::new("/w/r");
     let go = |u: &[&str]| resolve(&c, root, &urls(u), "main");
     assert_eq!(go(&["git@github.com:acme/r.git"]).skip_reason, None);
@@ -274,26 +513,23 @@ fn owners_match_all_push_urls() {
 
 #[test]
 fn policy_explicit_and_all() {
-    let explicit = with_consent("");
+    let explicit = v3("");
     let u = urls(&["https://github.com/a/b"]);
     assert_eq!(
         resolve(&explicit, Path::new("/r"), &u, "main").skip_reason,
         Some(SkipReason::NotEnrolled)
     );
-    let all = with_consent("[enrollment]\npolicy = \"all\"\n");
+    let all = v3("[enrollment]\npolicy = \"all\"\n");
     let d = resolve(&all, Path::new("/r"), &[], "anything");
     assert_eq!(d.skip_reason, None);
-    assert_eq!(d.mode, Mode::Propose);
     let legacy = Config::legacy_all_push();
-    assert_eq!(
-        legacy.consent.as_ref().unwrap().source,
-        ConsentSource::LegacyMigration
-    );
     assert_eq!(legacy.enrollment.policy, Policy::All);
-    assert_eq!(legacy.defaults.mode, Mode::Push);
     assert_eq!(legacy.worker.permission, Permission::Bypass);
     assert_eq!(legacy.defaults.documents.len(), 3);
-    assert_eq!(resolve(&legacy, Path::new("/r"), &[], "x").mode, Mode::Push);
+    assert_eq!(
+        resolve(&legacy, Path::new("/r"), &[], "x").skip_reason,
+        None
+    );
     // 往復しても同一。
     let dir = tmp("legacy");
     let file = dir.join("config.toml");
@@ -302,33 +538,15 @@ fn policy_explicit_and_all() {
 }
 
 #[test]
-fn consent_required_and_version_checked() {
-    let none = ok("[[repository]]\nroot = \"/r\"\nmode = \"push\"\n");
-    assert_eq!(
-        resolve(&none, Path::new("/r"), &[], "main").skip_reason,
-        Some(SkipReason::NoConsent)
-    );
-    let mut old = with_consent("[[repository]]\nroot = \"/r\"\nmode = \"push\"\n");
-    old.consent.as_mut().unwrap().version = 0;
-    assert_eq!(
-        resolve(&old, Path::new("/r"), &[], "main").skip_reason,
-        Some(SkipReason::NoConsent)
-    );
-}
-
-#[test]
 fn registered_repository_settings_and_priority() {
-    let c = with_consent(
-        "[defaults]\nmode = \"propose\"\nexclude = [\"*.secret\"]\n\
-         [[repository]]\nroot = \"/w/foo\"\nremote = \"github.com/me/foo\"\nmode = \"push\"\n\
+    let c = v3("[defaults]\nexclude = [\"*.secret\"]\n\
+         [[repository]]\nroot = \"/w/foo\"\nremote = \"github.com/me/foo\"\n\
          branches = [\"main\"]\ndocuments = [\"README.md\"]\nexclude = [\"private/**\", \"*.secret\"]\n\
-         [[repository]]\nroot = \"/w/bar\"\n",
-    );
+         [[repository]]\nroot = \"/w/bar\"\n");
     let u = urls(&["git@github.com:Me/Foo.git"]);
     let d = resolve_for_os(&c, Path::new("/w/foo"), &u, "main", false);
     assert_eq!(d.skip_reason, None);
-    assert_eq!(d.mode, Mode::Push); // repository が defaults に優先
-    assert_eq!(d.documents, vec![Document::Readme]);
+    assert_eq!(d.documents, vec![Document::Readme]); // repository が defaults に優先
     // 既定の機密パターン + defaults + repo、重複は 1 つ。
     let mut want: Vec<String> = DEFAULT_SENSITIVE_PATTERNS
         .iter()
@@ -340,44 +558,53 @@ fn registered_repository_settings_and_priority() {
     // 未指定項目は defaults を使う。
     let d = resolve_for_os(&c, Path::new("/w/bar"), &[], "dev", false);
     assert_eq!(d.skip_reason, None);
-    assert_eq!(d.mode, Mode::Propose);
     assert_eq!(d.documents, Document::ALL.to_vec());
 }
 
 #[test]
 fn skip_reasons_and_cursor_attributes() {
-    let c = with_consent(
+    let c = v3(
         "[[repository]]\nroot = \"/w/a\"\nremote = \"github.com/me/a\"\nbranches = [\"main\"]\n\
          [[repository]]\nroot = \"/w/paused\"\npaused = true\n\
-         [[repository]]\nroot = \"/w/off\"\nmode = \"off\"\n",
+         [[repository]]\nroot = \"/w/migrated\"\nmigrated_from = \"off\"\n\
+         [[repository]]\nroot = \"/w/both\"\npaused = true\nmigrated_from = \"unconsented\"\n",
     );
     let u = urls(&["https://github.com/me/a"]);
     let run = |root: &str, u: &[String], b: &str| resolve_for_os(&c, Path::new(root), u, b, false);
     assert_eq!(run("/w/a", &u, "main").skip_reason, None);
     let mismatch = run("/w/a", &urls(&["https://github.com/other/a"]), "main");
     assert_eq!(mismatch.skip_reason, Some(SkipReason::RemoteMismatch));
-    assert_eq!(mismatch.mode, Mode::Off);
     let branch = run("/w/a", &u, "feature").skip_reason.unwrap();
     assert_eq!(branch, SkipReason::BranchNotAllowed);
     let paused = run("/w/paused", &[], "main").skip_reason.unwrap();
-    let off = run("/w/off", &[], "main").skip_reason.unwrap();
+    // migrated_from があれば paused に関係なく Migrated。
+    let migrated = run("/w/migrated", &[], "main").skip_reason.unwrap();
+    let both = run("/w/both", &[], "main").skip_reason.unwrap();
     let not_enrolled = run("/w/unknown", &[], "main").skip_reason.unwrap();
     assert_eq!(
-        (paused, off, not_enrolled),
-        (SkipReason::Paused, SkipReason::Off, SkipReason::NotEnrolled)
+        (paused, migrated, both, not_enrolled),
+        (
+            SkipReason::Paused,
+            SkipReason::Migrated,
+            SkipReason::Migrated,
+            SkipReason::NotEnrolled
+        )
     );
-    // カーソルを進めるのは paused と off だけ。
+    // カーソルを進めるのは paused と migrated だけ。
     assert!(paused.advances_cursor());
-    assert!(off.advances_cursor());
+    assert!(migrated.advances_cursor());
     assert!(!SkipReason::RemoteMismatch.advances_cursor());
     assert!(!SkipReason::BranchNotAllowed.advances_cursor());
-    assert!(!SkipReason::NoConsent.advances_cursor());
     assert!(!not_enrolled.advances_cursor());
+    // 登録の「有効」判定。
+    assert!(repo(&c, "/w/a").is_active());
+    assert!(!repo(&c, "/w/paused").is_active());
+    assert!(!repo(&c, "/w/migrated").is_active());
 }
 
 #[test]
 fn root_matching_normcase() {
-    let c = with_consent("[[repository]]\nroot = \"D:/Dev/Foo\"\nmode = \"push\"\n");
+    let c = v3("[[repository]]\nroot = \"D:/Dev/Foo\"\n");
     let hit = |root: &str, windows: bool| {
         resolve_for_os(&c, Path::new(root), &[], "main", windows)
             .skip_reason
@@ -457,7 +684,7 @@ fn load_states_and_atomic_save() {
     let file = dir.join("sub").join("config.toml");
     assert_eq!(load_from(&file), Loaded::Missing);
 
-    let mut c = with_consent(
+    let mut c = v3(
         "[[repository]]\nroot = \"/w/x\"\nremote = \"git@github.com:me/x.git\"\nbranches = [\"main\"]\n",
     );
     c.defaults.exclude = vec!["a/**".into()];
@@ -478,7 +705,7 @@ fn load_states_and_atomic_save() {
     assert_eq!(std::fs::read(&file).unwrap(), before);
 
     // 上書き保存。
-    c.defaults.mode = Mode::Off;
+    c.defaults.exclude = vec!["b/**".into()];
     save_to(&file, &c).unwrap();
     assert_eq!(load_from(&file), Loaded::Ok(c));
 
@@ -506,17 +733,12 @@ fn exclude_patterns_that_could_break_permission_rules_are_invalid() {
                 "defaults" => format!("[defaults]\nexclude = [\"{bad}\"]\n"),
                 _ => format!("[[repository]]\nroot = \"D:/x\"\nexclude = [\"{bad}\"]\n"),
             };
-            let r = parse(&with_consent_text(&text));
+            let r = parse(&format!("schema = 3\n{text}"));
             assert!(matches!(r, Loaded::Invalid(_)), "{table} {bad:?}: {r:?}");
         }
     }
     // 通常のグロブは受理される。
-    let text = with_consent_text(
-        "[defaults]\nexclude = [\"private/**\", \"*.secret\", \"a[0-9]?.txt\"]\n",
-    );
-    assert!(matches!(parse(&text), Loaded::Ok(_)));
-}
-
-fn with_consent_text(extra: &str) -> String {
-    format!("{}\n{extra}", consent())
+    let text =
+        "schema = 3\n[defaults]\nexclude = [\"private/**\", \"*.secret\", \"a[0-9]?.txt\"]\n";
+    assert!(matches!(parse(text), Loaded::Ok(_)));
 }

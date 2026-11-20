@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use super::{AppState, NONCE_TTL, guard};
 use crate::{
-    config::{Config, Mode, Permission, Policy, Repository, normalize_root},
+    config::{Config, Permission, Policy, normalize_root},
     kinds,
 };
 
@@ -23,11 +23,10 @@ pub(crate) struct Pending {
 
 /// 設定の変更 `before → after` に含まれる危険な変更の説明（利用者向けの文）。空なら確認は不要。
 ///
-/// 対象: push モード化（登録・既定）、propose での登録の追加、権限 bypass 化、自動登録の方針を all / remote-owner にする変更と
-/// remote-owner の owner 追加、カスタム種類の対象パスの追加、同意の記録、登録の解除。
+/// 対象: 有効な登録が増える変更（追加・再開）、権限 bypass 化、自動登録の方針を all / remote-owner にする変更と
+/// remote-owner の owner 追加、カスタム種類の対象パスの追加、登録の解除。
 pub fn dangers(before: &Config, after: &Config) -> Vec<String> {
     let windows = cfg!(windows);
-    let effective = |c: &Config, r: &Repository| r.mode.unwrap_or(c.defaults.mode);
     let find = |c: &Config, root: &str| {
         let wanted = normalize_root(root, windows);
         c.repository
@@ -37,19 +36,13 @@ pub fn dangers(before: &Config, after: &Config) -> Vec<String> {
     };
     let mut out = Vec::new();
     for repo in &after.repository {
-        let was_push =
-            find(before, &repo.root).is_some_and(|r| effective(before, &r) == Mode::Push);
-        if effective(after, repo) == Mode::Push && !was_push {
-            out.push(crate::t!("ui.danger.push_mode", repo = repo.root));
-        } else if effective(after, repo) == Mode::Propose && find(before, &repo.root).is_none() {
-            // 登録が増える（履歴の復元で解除済みの登録が戻るなど）。propose でも push のたびに worker が
-            // 動いて利用料金が発生するので確認を挟む。有効化の画面は事前の写しに変更を当てないので
-            // ここには来ない（有効化は同意と push の確認を別に持つ）。
+        // 有効な登録が増える（登録の追加・停止からの再開）と、push のたびに worker が動いて利用料金が
+        // 発生し、commit と push が自動で行われるので確認を挟む。有効化の画面は事前の写しに変更を
+        // 当てないので、ここには来ない（有効化は固定の確認 `enable_push` を持つ）。
+        let was_active = find(before, &repo.root).is_some_and(|r| r.is_active());
+        if repo.is_active() && !was_active {
             out.push(crate::t!("ui.danger.register", repo = repo.root));
         }
-    }
-    if after.defaults.mode == Mode::Push && before.defaults.mode != Mode::Push {
-        out.push(crate::t!("ui.danger.default_push").into());
     }
     if after.worker.permission == Permission::Bypass
         && before.worker.permission != Permission::Bypass
@@ -85,9 +78,6 @@ pub fn dangers(before: &Config, after: &Config) -> Vec<String> {
         for path in settings.paths.iter().filter(|p| !old.contains(p)) {
             out.push(crate::t!("ui.danger.custom_path", id = id, path = path));
         }
-    }
-    if after.consent.is_some() && after.consent != before.consent {
-        out.push(crate::t!("ui.danger.consent").into());
     }
     for repo in &before.repository {
         if find(after, &repo.root).is_none() {

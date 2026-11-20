@@ -5,14 +5,13 @@
   <h2>{{ crate::locale::tr("ui.repos.registered") }} <span class="count">{{ repos.len() }}</span></h2>
   {% if repos.is_empty() %}<p class="note">{{ crate::locale::tr("ui.repos.none") }}</p>{% else %}
   <div class="table-wrap"><table>
-    <thead><tr><th>{{ crate::locale::tr("ui.common.repository") }}</th><th>{{ crate::locale::tr("ui.repo.mode") }}</th><th>{{ crate::locale::tr("ui.repo.documents") }}</th><th>{{ crate::locale::tr("ui.repos.branches") }}</th><th>{{ crate::locale::tr("ui.nav.proposals") }}</th></tr></thead>
+    <thead><tr><th>{{ crate::locale::tr("ui.common.repository") }}</th><th>{{ crate::locale::tr("ui.repos.status") }}</th><th>{{ crate::locale::tr("ui.repo.documents") }}</th><th>{{ crate::locale::tr("ui.repos.branches") }}</th></tr></thead>
     <tbody>
     {% for r in repos %}<tr>
-      <td><a href="/repos/{{ r.index }}"><code>{{ r.root }}</code></a>{% if r.paused %} <span class="badge">{{ crate::locale::tr("ui.common.paused") }}</span>{% endif %}{% if !r.remote.is_empty() %}<br><span class="path">{{ r.remote }}</span>{% endif %}</td>
-      <td><span class="badge{% if r.push %} warning{% endif %}">{{ r.mode }}</span></td>
+      <td><a href="/repos/{{ r.index }}"><code>{{ r.root }}</code></a>{% if !r.remote.is_empty() %}<br><span class="path">{{ r.remote }}</span>{% endif %}</td>
+      <td>{% if r.migrated %}<span class="badge warning">{{ crate::locale::tr("ui.repo.migrated") }}</span>{% else if r.paused %}<span class="badge">{{ crate::locale::tr("ui.common.paused") }}</span>{% else %}<span class="badge published">{{ crate::locale::tr("ui.repo.active") }}</span>{% endif %}</td>
       <td>{{ r.documents }}</td>
       <td>{{ r.branches }}</td>
-      <td>{{ crate::locale::tr2("ui.repo.proposal_counts", "pending", r.pending, "applied", r.applied) }}</td>
     </tr>{% endfor %}
     </tbody>
   </table></div>
@@ -24,23 +23,12 @@
     <input type="hidden" name="csrf" value="{{ layout.csrf }}">
     <input type="hidden" name="revision" value="{{ revision }}">
     <label>{{ crate::locale::tr("ui.repos.path") }}<input name="repo" required placeholder="D:\Dev\MyRepo"></label>
-    <label>{{ crate::locale::tr("ui.repo.mode") }}<select name="mode">
-      <option value="propose" selected>{{ crate::locale::tr("ui.repos.mode_propose") }}</option>
-      <option value="off">{{ crate::locale::tr("ui.repos.mode_off") }}</option>
-      <option value="push">{{ crate::locale::tr("ui.repos.mode_push") }}</option>
-    </select></label>
     <label>{{ crate::locale::tr("ui.repos.branches_label") }}<input name="branches" placeholder="main"></label>
     <fieldset class="choices"><legend>{{ crate::locale::tr("ui.repos.documents_legend") }}</legend>
       {% for d in documents %}<label class="checkbox"><input type="checkbox" name="documents" value="{{ d.value }}">{{ d.label }}</label>
       {% endfor %}
     </fieldset>
-    {% if needs_consent %}
-    <div class="consent">
-      <p>{{ consent_text }}</p>
-      <input type="hidden" name="consent_version" value="{{ consent_version }}">
-      <label class="checkbox"><input type="checkbox" name="consent" value="1">{{ crate::locale::tr1("ui.consent.agree", "version", consent_version) }}</label>
-    </div>
-    {% endif %}
+    <p class="note">{{ crate::locale::tr("ui.repos.enable_note") }}</p>
     <div class="actions"><button class="primary" type="submit">{{ crate::locale::tr("ui.repos.enable") }}</button></div>
   </form>
 </section>

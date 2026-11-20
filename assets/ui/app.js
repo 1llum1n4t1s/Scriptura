@@ -101,9 +101,46 @@
       }
     };
     checkForm.addEventListener("submit", event => { event.preventDefault(); check(); });
+    // ブラウザー標準の確認ではなく、画面の中のダイアログで確認する（フォーカスは「やめる」に置く）。
+    const askConfirmation = message => new Promise(resolve => {
+      const previousFocus = document.activeElement;
+      const dialog = document.createElement("dialog");
+      dialog.className = "confirmation-dialog";
+      dialog.setAttribute("aria-labelledby", "confirmation-title");
+      dialog.setAttribute("aria-describedby", "confirmation-message");
+      const title = document.createElement("h2");
+      title.id = "confirmation-title";
+      title.textContent = text("confirmTitle");
+      const body = document.createElement("p");
+      body.id = "confirmation-message";
+      body.textContent = message;
+      const actions = document.createElement("div");
+      actions.className = "confirmation-actions";
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.textContent = text("confirmCancel");
+      cancel.autofocus = true;
+      const accept = document.createElement("button");
+      accept.type = "button";
+      accept.className = "primary";
+      accept.textContent = text("confirmOk");
+      actions.append(cancel, accept);
+      dialog.append(title, body, actions);
+      document.body.append(dialog);
+      cancel.addEventListener("click", () => dialog.close("cancel"));
+      accept.addEventListener("click", () => dialog.close("confirm"));
+      dialog.addEventListener("cancel", e => { e.preventDefault(); dialog.close("cancel"); });
+      dialog.addEventListener("close", () => {
+        const accepted = dialog.returnValue === "confirm";
+        dialog.remove();
+        if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus();
+        resolve(accepted);
+      }, { once: true });
+      dialog.showModal();
+    });
     installForm.addEventListener("submit", async event => {
       event.preventDefault();
-      if (!window.confirm(text("confirm"))) return;
+      if (!await askConfirmation(text("confirm"))) return;
       busy(true);
       show(text("msgInstalling"));
       try {

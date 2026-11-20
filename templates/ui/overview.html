@@ -10,8 +10,6 @@
     <dt>{{ crate::locale::tr("ui.overview.version") }}</dt><dd>{{ version }}{{ install_label }}{% if install_hint %} <span class="note">{{ crate::locale::tr("ui.overview.install_hint") }} <code>scriptura install</code></span>{% endif %}</dd>
     <dt>{{ crate::locale::tr("ui.overview.config_file") }}</dt><dd><code>{{ config_path }}</code></dd>
     <dt>{{ crate::locale::tr("ui.overview.config_state") }}</dt><dd>{{ config_state }}</dd>
-    <dt>{{ crate::locale::tr("ui.nav.consent") }}</dt><dd>{% if let Some(c) = consent %}{{ c }}{% if !consent_current %}{{ crate::locale::tr("ui.overview.consent_old") }}{% endif %}{% else %}{{ crate::locale::tr("ui.consent.none") }} (<a href="/consent">{{ crate::locale::tr("ui.nav.consent") }}</a>){% endif %}</dd>
-    <dt>{{ crate::locale::tr("ui.overview.pending") }}</dt><dd>{{ pending }} (<a href="/proposals">{{ crate::locale::tr("ui.nav.proposals") }}</a>)</dd>
   </dl>
   <p class="note">{{ crate::locale::tr("ui.overview.doctor_note") }} <a href="/doctor">{{ crate::locale::tr("ui.nav.doctor") }}</a></p>
 </section>
@@ -20,13 +18,13 @@
   {% if repos.is_empty() %}<p class="note">{{ crate::locale::tr("ui.overview.no_repos") }} <a href="/repos">{{ crate::locale::tr("ui.nav.repos") }}</a></p>
   {% else %}
   <ul class="plain">
-  {% for r in repos %}<li><a href="/repos/{{ r.index }}"><code>{{ r.root }}</code></a> <span class="badge{% if r.push %} warning{% endif %}">{{ r.mode }}</span>{% if r.paused %} <span class="badge">{{ crate::locale::tr("ui.common.paused") }}</span>{% endif %}{% if r.pending > 0 %} <span class="badge published">{{ crate::locale::tr1("ui.overview.repo_pending", "count", r.pending) }}</span>{% endif %}</li>
+  {% for r in repos %}<li><a href="/repos/{{ r.index }}"><code>{{ r.root }}</code></a>{% if r.migrated %} <span class="badge warning">{{ crate::locale::tr("ui.repo.migrated") }}</span>{% else if r.paused %} <span class="badge">{{ crate::locale::tr("ui.common.paused") }}</span>{% endif %}</li>
   {% endfor %}
   </ul>
   {% endif %}
 </section>
 </div>
-<section class="panel" id="updates" data-updates data-confirm="{{ crate::locale::tr("ui.updates.confirm") }}" data-msg-checking="{{ crate::locale::tr("ui.updates.checking") }}" data-msg-installing="{{ crate::locale::tr("ui.updates.installing") }}" data-msg-waiting="{{ crate::locale::tr("ui.updates.waiting") }}" data-msg-done="{{ crate::locale::tr("ui.updates.done_reopen") }}" data-msg-failed="{{ crate::locale::tr("ui.updates.request_failed") }}">
+<section class="panel" id="updates" data-updates data-confirm="{{ crate::locale::tr("ui.updates.confirm") }}" data-confirm-title="{{ crate::locale::tr("ui.confirm.title") }}" data-confirm-cancel="{{ crate::locale::tr("ui.confirm.cancel") }}" data-confirm-ok="{{ crate::locale::tr("ui.updates.install") }}" data-msg-checking="{{ crate::locale::tr("ui.updates.checking") }}" data-msg-installing="{{ crate::locale::tr("ui.updates.installing") }}" data-msg-waiting="{{ crate::locale::tr("ui.updates.waiting") }}" data-msg-done="{{ crate::locale::tr("ui.updates.done_reopen") }}" data-msg-failed="{{ crate::locale::tr("ui.updates.request_failed") }}">
   <h2>{{ crate::locale::tr("ui.updates.title") }}</h2>
   {% if updates.managed %}
   <dl class="facts"><dt>{{ crate::locale::tr("ui.updates.current") }}</dt><dd>{{ version }}</dd></dl>

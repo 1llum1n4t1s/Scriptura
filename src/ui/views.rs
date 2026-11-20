@@ -26,11 +26,11 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// 設定系の画面（全般・worker・同意・履歴・診断）か。ヘッダーの「設定」の強調と、サブナビの表示に使う。
+    /// 設定系の画面（全般・文書・worker・履歴・診断）か。ヘッダーの「設定」の強調と、サブナビの表示に使う。
     pub fn in_settings(&self) -> bool {
         matches!(
             self.nav,
-            "general" | "worker" | "consent" | "history" | "doctor"
+            "general" | "documents" | "worker" | "settings_history" | "doctor"
         )
     }
 }
@@ -46,6 +46,11 @@ pub fn redact(text: &str) -> String {
     });
     let text = USERINFO.replace_all(text, "${1}***@");
     TOKENS.replace_all(&text, "***").into_owned()
+}
+
+/// コミットの短縮表示（先頭 12 文字。DB の値は文字単位で切り、非 ASCII でもパニックさせない）。
+pub fn short_sha(sha: &str) -> String {
+    sha.chars().take(12).collect()
 }
 
 /// 表示用の時刻（サーバー機のローカルタイムゾーン。`YYYY-MM-DD HH:MM`）。RFC 3339 として読めない文字列は
@@ -88,10 +93,7 @@ pub fn flash_text(code: Option<&str>) -> Option<&'static str> {
         "paused" => crate::t!("ui.flash.paused"),
         "resumed" => crate::t!("ui.flash.resumed"),
         "disabled" => crate::t!("ui.flash.disabled"),
-        "consent" => crate::t!("ui.flash.consent"),
         "restored" => crate::t!("ui.flash.restored"),
-        "applied" => crate::t!("ui.flash.applied"),
-        "discarded" => crate::t!("ui.flash.discarded"),
         "deleted" => crate::t!("ui.flash.deleted"),
         "created" => crate::t!("ui.flash.created"),
         "template" => crate::t!("ui.flash.template"),
@@ -205,14 +207,12 @@ pub struct DonePage {
 pub struct RepoRow {
     pub index: usize,
     pub root: String,
-    pub mode: String,
-    pub push: bool,
     pub paused: bool,
+    /// 旧版の設定から引き継いで一時停止した登録か（再開はできず、有効化し直す）。
+    pub migrated: bool,
     pub documents: String,
     pub branches: String,
     pub remote: String,
-    pub pending: usize,
-    pub applied: usize,
 }
 
 #[derive(Template)]
@@ -226,10 +226,7 @@ pub struct OverviewPage {
     pub install_hint: bool,
     pub config_path: String,
     pub config_state: String,
-    pub consent: Option<String>,
-    pub consent_current: bool,
     pub repos: Vec<RepoRow>,
-    pub pending: usize,
     pub warnings: Vec<String>,
     /// 「アプリの更新」パネル。
     pub updates: UpdatePanel,
@@ -263,9 +260,6 @@ pub struct ReposPage {
     pub revision: String,
     pub repos: Vec<RepoRow>,
     pub documents: Vec<Choice>,
-    pub needs_consent: bool,
-    pub consent_text: String,
-    pub consent_version: u32,
 }
 
 /// 種類 1 件のリポジトリでの状態（docs list と同じ情報）。
@@ -301,17 +295,45 @@ pub struct RepoPage {
     pub layout: Layout,
     pub revision: String,
     pub repo: RepoRow,
-    pub mode_choices: Vec<Choice>,
     pub uses_default_documents: bool,
     pub documents: Vec<Choice>,
-    pub needs_consent: bool,
-    pub consent_text: String,
-    pub consent_version: u32,
     pub kinds: Vec<KindStatus>,
     pub kinds_error: String,
     pub cursors: Vec<CursorRow>,
     pub publication: Option<EventRow>,
     pub events: Vec<EventRow>,
+    /// 最近の保守（保守履歴の新しい順 5 件）。
+    pub recent_runs: Vec<RunView>,
+    /// このリポジトリの保守履歴への絞り込みリンク。
+    pub runs_href: String,
+}
+
+/// 保守履歴 1 行の表示用の値（文言は表示言語で作る。自由文は伏せ済み）。
+#[derive(Clone, Debug)]
+pub struct RunView {
+    pub time: String,
+    pub attempts: i64,
+    pub repo_label: String,
+    pub repo_index: Option<usize>,
+    pub origin: String,
+    pub kinds: String,
+    pub outcome: String,
+    pub outcome_class: &'static str,
+    pub documents: Vec<String>,
+    pub range: String,
+    pub result_short: String,
+    pub message: String,
+}
+
+#[derive(Template)]
+#[template(path = "ui/runs.html")]
+pub struct RunsPage {
+    pub layout: Layout,
+    pub rows: Vec<RunView>,
+    /// 絞り込みの選択肢（先頭は「すべて」）。
+    pub repos: Vec<Choice>,
+    /// 古い方へのリンク（無ければ最後のページ）。
+    pub next_href: Option<String>,
 }
 
 #[derive(Template)]
@@ -325,7 +347,6 @@ pub struct JobPage {
     pub running: bool,
     pub ok: bool,
     pub message: String,
-    pub proposal: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -333,17 +354,19 @@ pub struct KindRow {
     pub id: String,
     pub name: String,
     pub builtin: bool,
-    pub default_enabled: bool,
     pub limits: String,
     pub when: String,
     pub template: String,
     pub customized: bool,
 }
 
+/// 「設定 › 文書」タブ。上段は既定の対象の文書（版つきの保存）、下段は種類の一覧。
 #[derive(Template)]
-#[template(path = "ui/kinds.html")]
-pub struct KindsPage {
+#[template(path = "ui/documents.html")]
+pub struct DocumentsPage {
     pub layout: Layout,
+    pub revision: String,
+    pub documents: Vec<Choice>,
     pub kinds: Vec<KindRow>,
 }
 
@@ -374,6 +397,13 @@ pub struct KindForm {
     pub cl_backfill: Vec<Choice>,
     pub cl_backfill_max_releases: String,
     pub cl_backfill_max_commits: String,
+    /// 空欄（既定に従う）の入力欄に出す既定値の説明（値は入れない）。
+    pub ph_none: String,
+    pub ph_max_chars: String,
+    pub ph_max_bytes: String,
+    pub ph_language: String,
+    pub ph_min_interval: String,
+    pub ph_template_file: String,
 }
 
 /// テンプレートファイルの編集欄。
@@ -400,35 +430,6 @@ pub struct KindPage {
     pub template_max: u64,
 }
 
-#[derive(Clone, Debug)]
-pub struct ProposalRow {
-    pub index: usize,
-    pub root: String,
-    pub sha: String,
-    pub short: String,
-    pub created_at: String,
-    pub diffstat: String,
-    pub documents: String,
-    pub applied: bool,
-}
-
-#[derive(Template)]
-#[template(path = "ui/proposals.html")]
-pub struct ProposalsPage {
-    pub layout: Layout,
-    pub rows: Vec<ProposalRow>,
-}
-
-#[derive(Template)]
-#[template(path = "ui/proposal.html")]
-pub struct ProposalPage {
-    pub layout: Layout,
-    pub revision: String,
-    pub row: ProposalRow,
-    pub lines: Vec<DiffLine>,
-    pub truncated: bool,
-}
-
 #[derive(Template)]
 #[template(path = "ui/worker.html")]
 pub struct WorkerPage {
@@ -453,24 +454,11 @@ pub struct WorkerPage {
 pub struct GeneralPage {
     pub layout: Layout,
     pub revision: String,
-    pub modes: Vec<Choice>,
-    pub documents: Vec<Choice>,
     pub exclude: String,
     pub instructions: String,
     pub instructions_max: usize,
     pub policies: Vec<Choice>,
     pub owners: String,
-}
-
-#[derive(Template)]
-#[template(path = "ui/consent.html")]
-pub struct ConsentPage {
-    pub layout: Layout,
-    pub revision: String,
-    pub text: String,
-    pub version: u32,
-    pub current: Option<String>,
-    pub kept: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -535,10 +523,7 @@ mod tests {
             install_hint: false,
             config_path: "c".into(),
             config_state: "s".into(),
-            consent: None,
-            consent_current: false,
             repos: Vec::new(),
-            pending: 0,
             warnings: Vec::new(),
             updates,
         }
@@ -621,7 +606,7 @@ mod tests {
     fn times_are_shown_in_the_given_zone_without_fractions() {
         let jst = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
         let utc = chrono::Utc;
-        // ナノ秒つきの UTC（同意・更新案の保存形式）。
+        // ナノ秒つきの UTC（保守履歴・設定履歴の保存形式）。
         let raw = "2026-11-18T17:04:45.339306100+00:00";
         assert_eq!(format_time_in(raw, &utc, false), "2026-11-18 17:04");
         assert_eq!(format_time_in(raw, &utc, true), "2026-11-18 17:04:45");
@@ -638,6 +623,16 @@ mod tests {
         // 読めない文字列・空はそのまま（fail-safe）。
         assert_eq!(format_time_in("", &utc, false), "");
         assert_eq!(format_time_in("not a time", &utc, true), "not a time");
+    }
+
+    #[test]
+    fn short_sha_cuts_by_characters_not_bytes() {
+        assert_eq!(short_sha("0123456789abcdef"), "0123456789ab");
+        assert_eq!(short_sha("abc"), "abc");
+        assert_eq!(short_sha(""), "");
+        // 先頭 12 文字の境界が多バイト文字の途中でもパニックしない。
+        let wide = "あいうえおかきくけこさしすせそ";
+        assert_eq!(short_sha(wide), "あいうえおかきくけこさし");
     }
 
     #[test]

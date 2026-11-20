@@ -4,14 +4,14 @@
 // - 項目ごとに {id, status: ok|warn|fail|info, detail} を返す。status は「利用者が次に何をすべきか」で決める
 //   （fail = このままでは動かない、warn = 動くが要確認、info = 参考）。
 // - 診断は読み取り中心。設定・settings.json は書き換えない。状態フォルダーは、まだ無いときに作らない
-//   （同意前に状態を残さない契約）ため、既存の最寄りの親フォルダーへ書込み試験をする。
+//   （登録前に状態を残さない契約）ため、既存の最寄りの親フォルダーへ書込み試験をする。
 // - **秘密値を出力しない**。`claude auth status` は worker と同じ環境変数除去（`scrub_host_env`）をかけて
 //   実行し、終了コードと `authMethod`（定型の語だけ許可）しか読まない。トークン・メール等は読み捨てる。
 //   detail に入れるのはパス・固定文言・定型の語だけで、環境変数の値や設定ファイルの内容は載せない。
 // - `--verify` はプラグイン同梱の SHA256SUMS に載る本体（bin/scriptura.exe・libexec/scriptura-*）だけを照合する
 //   （配布物の改変・取り違え検知）。ランチャー（bin/scriptura）・hooks・skills は照合の対象外。
 use crate::{
-    config::{self, Loaded, Mode, Worker},
+    config::{self, Loaded, Worker},
     connect, maintenance,
     process::{capture, command},
 };
@@ -31,8 +31,8 @@ fn item(id: &str, status: &str, detail: impl Into<String>) -> Value {
 
 /// 診断を実行する。結果の `ok` は fail が 1 つも無いとき true。
 pub fn run(verify: bool) -> Value {
-    let loaded = config::load();
-    let valid = match &loaded {
+    let snapshot = config::read();
+    let valid = match &snapshot.loaded {
         Loaded::Ok(c) => Some(c),
         _ => None,
     };
@@ -49,7 +49,8 @@ pub fn run(verify: bool) -> Value {
     if github_push_registered(valid) {
         items.push(gh_auth());
     }
-    items.extend(config_items(&loaded));
+    items.extend(config_items(&snapshot));
+    items.extend(legacy_proposals_item());
     items.extend(kinds_items(valid));
     items.push(state_dir());
     items.extend(settings_items());
@@ -132,11 +133,11 @@ fn claude_auth(claude: &Path) -> Value {
     }
 }
 
-/// push モードで GitHub のリポジトリが登録されているか（gh が必要になる条件）。
+/// 有効な登録（一時停止でも移行由来の停止でもない）に GitHub のリポジトリがあるか（gh が必要になる条件）。
 fn github_push_registered(config: Option<&config::Config>) -> bool {
     config.is_some_and(|c| {
         c.repository.iter().any(|r| {
-            r.mode.unwrap_or(c.defaults.mode) == Mode::Push
+            r.is_active()
                 && r.remote
                     .as_deref()
                     .and_then(config::normalize_remote)
@@ -159,9 +160,9 @@ fn gh_auth() -> Value {
     }
 }
 
-fn config_items(loaded: &Loaded) -> Vec<Value> {
+fn config_items(snapshot: &config::Snapshot) -> Vec<Value> {
     let path = config::config_path();
-    match loaded {
+    match &snapshot.loaded {
         Loaded::Missing => vec![item(
             "config",
             "warn",
@@ -177,37 +178,74 @@ fn config_items(loaded: &Loaded) -> Vec<Value> {
             ),
         )],
         Loaded::Ok(c) => {
-            let consent = match &c.consent {
-                None => item("consent", "warn", crate::t!("doctor.consent_missing")),
-                Some(x) if x.version < config::CURRENT_CONSENT_VERSION => item(
-                    "consent",
+            let mut items = vec![item(
+                "config",
+                "ok",
+                crate::t!(
+                    "doctor.config_ok",
+                    path = path.display(),
+                    count = c.repository.len()
+                ),
+            )];
+            // 旧形式（同意と mode を持つ設定）のまま。変換して扱っており、次の hook か設定の変更で保存し直される。
+            if let Some(legacy) = &snapshot.legacy {
+                items.push(item(
+                    "configLegacy",
                     "warn",
                     crate::t!(
-                        "doctor.consent_old",
-                        recorded = x.version,
-                        current = config::CURRENT_CONSENT_VERSION
+                        "doctor.config_legacy",
+                        schema = legacy.from_schema,
+                        stopped = legacy.stopped
                     ),
-                ),
-                Some(x) => item(
-                    "consent",
-                    "ok",
-                    crate::t!("doctor.consent_ok", version = x.version),
-                ),
-            };
-            vec![
-                item(
-                    "config",
-                    "ok",
+                ));
+            }
+            // 旧形式からの移行で止めた登録は、enable で有効化し直すまで動かない（保存済みの設定でも表示し続ける）。
+            let stopped: Vec<&str> = c
+                .repository
+                .iter()
+                .filter(|r| r.migrated_from.is_some())
+                .map(|r| r.root.as_str())
+                .collect();
+            if !stopped.is_empty() {
+                items.push(item(
+                    "migratedStopped",
+                    "warn",
                     crate::t!(
-                        "doctor.config_ok",
-                        path = path.display(),
-                        count = c.repository.len()
+                        "doctor.migrated_stopped",
+                        count = stopped.len(),
+                        repos = stopped.join(", ")
                     ),
-                ),
-                consent,
-            ]
+                ));
+            }
+            items
         }
     }
+}
+
+/// 廃止した更新案（propose）が状態フォルダーに残していたパッチ。読みも消しもせず、場所と件数だけを知らせる
+/// （未適用のパッチは `git apply` で当てられ、不要なら手で削除できる）。フォルダーが無ければ項目を出さない。
+fn legacy_proposals_item() -> Option<Value> {
+    let dir = maintenance::state_db_path().parent()?.join("proposals");
+    if !dir.is_dir() {
+        return None;
+    }
+    let patches = fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .flat_map(|e| fs::read_dir(e.path()).into_iter().flatten().flatten())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "patch"))
+        .count();
+    Some(item(
+        "legacyProposals",
+        "info",
+        crate::t!(
+            "doctor.legacy_proposals",
+            path = dir.display(),
+            count = patches
+        ),
+    ))
 }
 
 /// 文書の種類（`[kinds.<id>]`）の診断。設定が読めているときだけ出す（読めない設定は `config` 項目が fail にする。
@@ -215,7 +253,7 @@ fn config_items(loaded: &Loaded) -> Vec<Value> {
 /// - `kinds`: 種類の数と、`templates/` のテンプレートが読めるか。読めない種類が登録リポジトリで有効なら fail
 ///   （保守が見送られ続ける）、どこでも有効でなければ warn。
 /// - `kindsLimits`（info）: 上限が既存文書の現在の大きさより小さい（次の保守は棄却されうる）。
-/// - `kindsChangelog`（info）: push モードで CHANGELOG を保守するリポジトリがある（リリース作業との競合の注意）。
+/// - `kindsChangelog`（info）: CHANGELOG を保守する有効な登録がある（リリース作業との競合の注意）。
 ///
 /// 出力はパス・数・定型の語だけ（設定ファイルや文書の内容は載せない）。読み取りだけで何も書かない。
 fn kinds_items(config: Option<&config::Config>) -> Vec<Value> {
@@ -302,13 +340,12 @@ fn kinds_items(config: Option<&config::Config>) -> Vec<Value> {
         )
     }];
 
-    // 上限と現在の大きさ、CHANGELOG と push モードの併用。
+    // 上限と現在の大きさ、CHANGELOG の保守とリリース作業の併用。
     let mut over: Vec<String> = Vec::new();
     let mut push_changelog: Vec<&str> = Vec::new();
     for repo in &config.repository {
-        let mode = repo.mode.unwrap_or(config.defaults.mode);
         let docs = documents_of(repo);
-        if mode == Mode::Push && docs.contains(&Document::Changelog) {
+        if repo.is_active() && docs.contains(&Document::Changelog) {
             push_changelog.push(&repo.root);
         }
         for kind in crate::kinds::resolve_kinds(config, &docs) {

@@ -1,6 +1,8 @@
 #![cfg(feature = "test-support")]
 use rusqlite::Connection;
-use scriptura::config::{self, Config, Document, Mode, Permission, Policy, Repository, Worker};
+use scriptura::config::{
+    self, Config, Document, MigratedFrom, Permission, Policy, Repository, Worker,
+};
 use scriptura::maintenance::*;
 use serde_json::{Value, json};
 use std::{
@@ -432,11 +434,11 @@ impl Fixture {
         let mut repo = Repository {
             root: self.root.to_string_lossy().into_owned(),
             remote: None,
-            mode: None,
             branches: vec![],
             documents: None,
             exclude: vec![],
             paused: false,
+            migrated_from: None,
         };
         edit(&mut repo);
         config.repository.push(repo);
@@ -1201,6 +1203,31 @@ fn oversized_worker_output_is_not_committed() {
     assert_eq!(f.state()["phase"], "ready");
 }
 #[test]
+fn stopped_ready_state_does_not_grow_validation_dirs() {
+    let f = Fixture::new();
+    f.writes(json!({f.root.join("AGENTS.md").to_str().unwrap():"a".repeat(30000)}));
+    assert!(f.maintain().unwrap().contains("サイズ超過"));
+    let count = |f: &Fixture| -> Vec<String> {
+        f.state()["validation_dirs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let first = count(&f);
+    for _ in 0..4 {
+        assert!(f.maintain().is_some());
+        assert_eq!(f.state()["phase"], "ready");
+        let dirs = count(&f);
+        let mut unique = dirs.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), dirs.len(), "duplicates: {dirs:?}");
+        assert_eq!(dirs, first);
+    }
+}
+#[test]
 fn clean_filter_expansion_is_retained_without_push() {
     let f = Fixture::new();
     f.stubs(&["filter"]);
@@ -1653,12 +1680,8 @@ fn legacy_state_without_config_migrates_once_and_behaves_as_before() {
     assert!(message.contains("引き継"), "{message}");
     match config::load_from(&f.config_path()) {
         config::Loaded::Ok(c) => {
-            assert_eq!(
-                c.consent.unwrap().source,
-                config::ConsentSource::LegacyMigration
-            );
+            assert_eq!(c.schema, 3);
             assert_eq!(c.enrollment.policy, Policy::All);
-            assert_eq!(c.defaults.mode, Mode::Push);
             assert_eq!(c.worker.permission, Permission::Bypass);
             assert_eq!(c.defaults.documents, Document::ALL.to_vec());
         }
@@ -1683,12 +1706,20 @@ fn legacy_state_without_config_migrates_once_and_behaves_as_before() {
     assert_eq!(version, STATE_SCHEMA_VERSION);
 }
 #[test]
-fn missing_consent_and_unenrolled_repositories_are_ignored_silently() {
-    let mut no_consent = Config::legacy_all_push();
-    no_consent.consent = None;
+fn unenrolled_repositories_are_ignored_silently() {
     let mut unenrolled = Config::legacy_all_push();
     unenrolled.enrollment.policy = Policy::Explicit;
-    for config in [no_consent, unenrolled] {
+    let mut elsewhere = unenrolled.clone();
+    elsewhere.repository.push(Repository {
+        root: "/somewhere/else".into(),
+        remote: None,
+        branches: vec![],
+        documents: None,
+        exclude: vec![],
+        paused: false,
+        migrated_from: None,
+    });
+    for config in [unenrolled, elsewhere] {
         let f = Fixture::with_config(Some(config));
         assert_eq!(f.hook("UserPromptSubmit"), None);
         f.push_change("ignored push");
@@ -1719,17 +1750,16 @@ fn remote_mismatch_and_disallowed_branch_hold_the_cursor() {
     assert_ne!(f.cursor().unwrap(), before);
 }
 #[test]
-fn paused_and_off_advance_the_cursor_without_running() {
-    for off in ["paused", "mode-off"] {
+fn paused_and_migrated_stops_advance_the_cursor_without_running() {
+    for off in ["paused", "migrated"] {
         let f = Fixture::new();
         f.hook("UserPromptSubmit");
         let before = f.cursor().unwrap();
         f.push_change("skipped push");
         f.set_config(&f.registered_config(|r| {
-            if off == "paused" {
-                r.paused = true
-            } else {
-                r.mode = Some(Mode::Off)
+            r.paused = true;
+            if off == "migrated" {
+                r.migrated_from = Some(MigratedFrom::Off);
             }
         }));
         assert_eq!(f.hook("Stop"), None);
@@ -1744,6 +1774,102 @@ fn paused_and_off_advance_the_cursor_without_running() {
         assert!(f.base.join("prompt.json").exists(), "{off}");
     }
 }
+/// 旧形式（schema 2）の設定ファイルの本文。`defaults.mode` と同意の有無を引数で変える。
+fn old_format_config(root: &std::path::Path, consent: bool, mode: &str, policy: &str) -> String {
+    let root = root.to_string_lossy().replace('\\', "/");
+    format!(
+        "schema = 2\n{}[defaults]\nmode = \"{mode}\"\n[enrollment]\npolicy = \"{policy}\"\n[[repository]]\nroot = \"{root}\"\n",
+        if consent {
+            "[consent]\nversion = 1\naccepted_at = \"2026-01-01T00:00:00Z\"\nsource = \"cli\"\n"
+        } else {
+            ""
+        }
+    )
+}
+
+#[test]
+fn hook_converts_an_old_format_config_once_and_notifies_once() {
+    let f = Fixture::new();
+    // 旧 propose の登録 + 自動登録 all。変換で登録は止まり、policy は explicit に戻る。
+    let old = old_format_config(&f.root, true, "propose", "all");
+    fs::write(f.config_path(), &old).unwrap();
+    let message = f.hook("UserPromptSubmit").expect("変換の通知がある");
+    assert!(
+        message.contains("新形式") && message.contains("1 件") && message.contains("explicit"),
+        "{message}"
+    );
+    assert!(message.contains("enable"), "{message}");
+    let saved = fs::read_to_string(f.config_path()).unwrap();
+    assert!(saved.contains("schema = 3"), "{saved}");
+    assert!(saved.contains("migrated_from = \"propose\""), "{saved}");
+    assert!(!saved.contains("[consent]"), "{saved}");
+    // 変更前の内容が設定の変更履歴へ退避される。
+    let history = state_db_path().parent().unwrap().join("config-history");
+    let saved_old: Vec<_> = fs::read_dir(&history)
+        .unwrap()
+        .flatten()
+        .map(|e| fs::read_to_string(e.path()).unwrap())
+        .collect();
+    assert_eq!(saved_old, vec![old]);
+    // 2 回目は通知も書き直しも無い。
+    assert_eq!(f.hook("UserPromptSubmit"), None);
+    assert_eq!(fs::read_to_string(f.config_path()).unwrap(), saved);
+    assert_eq!(fs::read_dir(&history).unwrap().count(), 1);
+    // 移行で止めた登録は worker を起動せず、処理済み位置だけを進める。
+    let before = f.cursor().unwrap();
+    f.push_change("push while stopped");
+    assert_eq!(f.hook("Stop"), None);
+    assert_ne!(f.cursor().unwrap(), before);
+    assert!(!f.base.join("prompt.json").exists());
+    assert_eq!(fs::read_to_string(f.config_path()).unwrap(), saved);
+}
+
+#[test]
+fn hook_keeps_a_consented_push_registration_running_after_conversion() {
+    let f = Fixture::new();
+    // 同意あり・push の登録は変換後もそのまま動く。止めた登録も方針の変更も無いので通知しない。
+    fs::write(
+        f.config_path(),
+        old_format_config(&f.root, true, "push", "explicit"),
+    )
+    .unwrap();
+    assert_eq!(f.hook("UserPromptSubmit"), None);
+    let saved = fs::read_to_string(f.config_path()).unwrap();
+    assert!(
+        saved.contains("schema = 3") && !saved.contains("migrated_from"),
+        "{saved}"
+    );
+    f.push_change("push after conversion");
+    f.writes(json!({f.root.join("README.md").to_str().unwrap():"documented"}));
+    assert_eq!(f.hook("Stop"), None);
+    assert!(f.base.join("prompt.json").exists());
+    assert_eq!(f.state()["phase"], "complete");
+    assert_eq!(
+        f.git(&["rev-parse", "HEAD"]),
+        f.git(&["rev-parse", "origin/main"])
+    );
+}
+
+#[test]
+fn hook_stops_everything_for_an_old_format_config_without_consent() {
+    let f = Fixture::new();
+    fs::write(
+        f.config_path(),
+        old_format_config(&f.root, false, "push", "explicit"),
+    )
+    .unwrap();
+    let message = f.hook("UserPromptSubmit").expect("変換の通知がある");
+    assert!(message.contains("1 件"), "{message}");
+    assert!(
+        fs::read_to_string(f.config_path())
+            .unwrap()
+            .contains("migrated_from = \"unconsented\"")
+    );
+    f.push_change("push without consent");
+    assert_eq!(f.hook("Stop"), None);
+    assert!(!f.base.join("prompt.json").exists());
+}
+
 #[test]
 fn repository_local_files_never_enable_maintenance() {
     let enabling = toml::to_string_pretty(&Config::legacy_all_push()).unwrap();
@@ -3103,6 +3229,46 @@ fn released_changelog_entries_are_protected_in_every_permission_mode() {
 }
 
 #[test]
+fn differently_cased_changelog_is_still_checked() {
+    // Git 上は `Changelog.md`。大文字小文字を区別しないファイルシステムでは既定の `CHANGELOG.md` として
+    // 見えるので保守の対象になる。修正前は `<HEAD>:CHANGELOG.md` が無いため新規作成扱いになり、
+    // リリース済みの節の改変が素通りしていた（fail-open）。
+    let f = Fixture::with_config(Some(changelog_config(
+        Permission::Bypass,
+        vec![Document::Changelog],
+    )));
+    f.commit_push_file("Changelog.md", KAC_CHANGELOG);
+    if !f.root.join("CHANGELOG.md").exists() {
+        // 大文字小文字を区別するファイルシステムでは別のファイル（対象外）なので、この経路は起きない。
+        return;
+    }
+    f.hook("UserPromptSubmit");
+    f.push_change("rewrite released through another spelling");
+    let head = f.head();
+    f.writes(json!({f.changelog_path(): KAC_CHANGELOG.replace("- 初版", "- 初版!")}));
+    let message = f.hook("Stop").expect("不変検査の違反で止まるはず");
+    assert!(message.contains("リリース済み"), "{message}");
+    assert_eq!(f.head(), head, "commit しない");
+    assert_eq!(f.state()["phase"], "ready");
+    // Unreleased への追記だけなら、同じ綴りの違いでも commit される。
+    drop(f);
+    let f = Fixture::with_config(Some(changelog_config(
+        Permission::Bypass,
+        vec![Document::Changelog],
+    )));
+    f.commit_push_file("Changelog.md", KAC_CHANGELOG);
+    f.hook("UserPromptSubmit");
+    f.push_change("append unreleased");
+    let head = f.head();
+    f.writes(
+        json!({f.changelog_path(): KAC_CHANGELOG.replace("- 新機能 A", "- 新機能 A\n- 新機能 B")}),
+    );
+    assert_eq!(f.hook("Stop"), None);
+    assert_ne!(f.head(), head, "追記は commit される");
+    assert_eq!(f.state()["phase"], "complete");
+}
+
+#[test]
 fn changelog_prompt_carries_rules_and_history_and_promote_is_committed() {
     let f = Fixture::with_config(Some(changelog_config(
         Permission::Restricted,
@@ -3427,4 +3593,319 @@ fn untracked_but_not_ignored_changelog_does_not_hold_other_kinds() {
         "{message:?}"
     );
     assert!(f.base.join("prompt.json").exists(), "{message:?}");
+}
+
+// ---------------------------------------------------------------------------
+// 保守履歴（runlog / maintenance_runs）
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// 保守履歴（古い順）。DB・表が無ければ空（読み取り専用で開く公開 API）。
+    fn runs(&self) -> Vec<scriptura::runlog::Row> {
+        let mut rows = scriptura::runlog::load(None, None, 1000).rows;
+        rows.reverse();
+        rows
+    }
+}
+
+fn agents_path(f: &Fixture) -> String {
+    f.root.join("AGENTS.md").to_str().unwrap().to_owned()
+}
+
+#[test]
+fn committed_and_unchanged_runs_are_recorded_and_later_hooks_add_no_rows() {
+    let f = Fixture::new();
+    // 起点の記録（UserPromptSubmit）は worker を起動しないので記録しない。
+    f.hook("UserPromptSubmit");
+    assert!(f.runs().is_empty());
+    f.push_change("one");
+    let pushed = f.head();
+    f.writes(json!({agents_path(&f): "a\nb\nc\n"}));
+    assert_eq!(f.hook("Stop"), None);
+    let maintenance_commit = f.head();
+    assert_ne!(maintenance_commit, pushed);
+    let runs = f.runs();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let r = &runs[0];
+    assert_eq!((r.run.outcome.as_str(), r.attempts), ("committed", 1));
+    assert_eq!(r.run.origin.as_str(), "hook");
+    assert_eq!(r.run.target_commit, pushed);
+    assert_eq!(r.run.result_commit, maintenance_commit);
+    assert!(!r.run.base_commit.is_empty());
+    assert_eq!(
+        r.run.detail.documents,
+        vec![scriptura::runlog::DocChange {
+            path: "AGENTS.md".into(),
+            added: 3,
+            removed: 1
+        }]
+    );
+    assert!(r.run.detail.kinds.contains(&"agents".to_string()));
+    assert!(r.run.finished_at >= r.run.started_at && r.run.started_at > 0.0);
+    // 次の hook（送信済みの復旧）は commit ごとの重複を作らない。
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.runs().len(), 1);
+    // 続けて worker が何も変えない push: unchanged（直前の commit を引き継がない）。
+    unsafe { env::remove_var("HOOK_STUB_WRITES") };
+    f.push_change("two");
+    let pushed2 = f.head();
+    assert_eq!(f.hook("Stop"), None);
+    let runs = f.runs();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(runs[1].run.outcome, "unchanged");
+    assert_eq!(runs[1].run.result_commit, "");
+    assert_eq!(runs[1].run.target_commit, pushed2);
+    assert!(runs[1].run.detail.documents.is_empty());
+    // 記録しても状態 DB の版は上がらない。
+    let db = Connection::open(state_db_path()).unwrap();
+    let version: i64 = db
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, STATE_SCHEMA_VERSION);
+    assert_eq!(STATE_SCHEMA_VERSION, 1);
+}
+
+#[test]
+fn runs_that_never_start_the_worker_are_not_recorded() {
+    let mut config = Config::legacy_all_push();
+    for id in ["agents", "design", "readme"] {
+        set_timing(
+            &mut config,
+            id,
+            timing(config::When::Push, &["src/**"], None),
+        );
+    }
+    let f = Fixture::with_config(Some(config));
+    f.hook("UserPromptSubmit");
+    f.push_change("no source change");
+    assert_eq!(f.hook("Stop"), None);
+    assert!(
+        !f.base.join("prompt.json").exists(),
+        "worker を起動してはならない"
+    );
+    assert!(f.runs().is_empty());
+}
+
+#[test]
+fn repeated_held_runs_are_merged_into_one_row_with_attempts() {
+    let config = kinds_config(|c| arch(c).max_chars = Some(10));
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("docs/ARCHITECTURE.md", "short");
+    f.hook("UserPromptSubmit");
+    f.push_change("limit");
+    f.writes(json!({f.arch_path(): "x".repeat(20)}));
+    assert!(f.hook("Stop").is_some());
+    let runs = f.runs();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(
+        (runs[0].run.outcome.as_str(), runs[0].attempts),
+        ("held", 1)
+    );
+    assert!(runs[0].run.message.as_deref().unwrap().contains("上限"));
+    // 同じ失敗の再試行（ready からの再開）は新しい行を作らず、attempts と終了時刻を進める。
+    assert!(f.hook("Stop").is_some());
+    let runs = f.runs();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].attempts, 2);
+    assert!(runs[0].run.finished_at >= runs[0].run.started_at);
+}
+
+#[test]
+fn push_failure_is_recorded_then_merged_and_the_resumed_push_is_committed() {
+    let f = Fixture::new();
+    f.hook("UserPromptSubmit");
+    f.push_change("new");
+    f.stub_git();
+    f.writes(json!({agents_path(&f): "changed"}));
+    unsafe { env::set_var("HOOK_GIT_FAIL_PUSH", "1") };
+    assert!(f.hook("Stop").unwrap().contains("push"));
+    let commit = f.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    let runs = f.runs();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].run.outcome, "failed");
+    assert_eq!(runs[0].run.result_commit, commit);
+    // 同じ失敗の繰り返しは 1 行にまとめる。
+    assert!(f.hook("Stop").unwrap().contains("push"));
+    let runs = f.runs();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].attempts, 2);
+    // push が通れば、worker を起動せずに再開して committed を 1 行足す。
+    unsafe {
+        env::remove_var("HOOK_GIT_FAIL_PUSH");
+        env::set_var("HOOK_STUB_EXIT", "9");
+    }
+    assert_eq!(f.hook("Stop"), None);
+    let runs = f.runs();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(runs[1].run.outcome, "committed");
+    assert_eq!(runs[1].run.result_commit, commit);
+}
+
+#[test]
+fn resumed_push_after_a_newer_push_records_the_original_target() {
+    let f = Fixture::new();
+    f.hook("UserPromptSubmit");
+    f.push_change("one");
+    let original = f.head();
+    f.stub_git();
+    f.writes(json!({agents_path(&f): "changed"}));
+    unsafe { env::set_var("HOOK_GIT_FAIL_PUSH", "1") };
+    assert!(f.hook("Stop").unwrap().contains("push"));
+    let state = f.state();
+    assert_eq!(state["phase"], "push_pending");
+    let commit = state["commit"].as_str().unwrap().to_owned();
+    assert_eq!(state["head"], original.as_str());
+    // push は実は届いていて（保守 commit が upstream に入り）、その上に新しい push（HEAD = upstream）が来た状態。
+    unsafe { env::remove_var("HOOK_GIT_FAIL_PUSH") };
+    f.git(&["push"]);
+    f.push_change("two");
+    let newer = f.head();
+    assert_ne!(newer, original);
+    unsafe { env::set_var("HOOK_STUB_EXIT", "9") };
+    f.hook("Stop");
+    let runs = f.runs();
+    let resumed = runs
+        .iter()
+        .find(|r| r.run.outcome == "committed")
+        .unwrap_or_else(|| panic!("{runs:?}"));
+    assert_eq!(resumed.run.result_commit, commit);
+    assert_eq!(resumed.run.target_commit, original);
+}
+
+#[test]
+fn uncertain_commit_is_recorded_as_unknown() {
+    let f = Fixture::new();
+    f.hook("UserPromptSubmit");
+    f.push_change("one");
+    f.stub_git();
+    f.stubs(&["pipe-grandchild"]);
+    f.helper_environment();
+    f.writes(json!({agents_path(&f): "maintained"}));
+    unsafe {
+        env::set_var("HOOK_GIT_UNCERTAIN_OPERATION", "commit");
+        env::set_var("SCRIPTURA_TEST_GIT_TIMEOUT_MS", "1500")
+    };
+    assert!(f.hook("Stop").unwrap().contains("未確定"));
+    let runs = f.runs();
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].run.outcome, "unknown");
+    f.finish_live_helper();
+}
+
+#[test]
+fn a_broken_runlog_table_never_fails_the_maintenance() {
+    let f = Fixture::new();
+    // 同名で形の違う表を先に作る（記録は失敗するが、保守は成功し処理済み位置も進む）。
+    let path = state_db_path();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("CREATE TABLE maintenance_runs (x TEXT);")
+        .unwrap();
+    f.hook("UserPromptSubmit");
+    f.push_change("one");
+    let pushed = f.head();
+    f.writes(json!({agents_path(&f): "changed"}));
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.state()["phase"], "complete");
+    assert_eq!(f.cursor().unwrap().1, pushed);
+    assert!(f.runs().is_empty());
+}
+
+#[test]
+fn runlog_keeps_the_newest_200_per_repository_and_2000_overall() {
+    let _f = Fixture::new();
+    let db = open_state_db().unwrap();
+    db.execute_batch("PRAGMA synchronous=OFF; PRAGMA journal_mode=MEMORY;")
+        .unwrap();
+    let run = |repo: &str, i: usize| scriptura::runlog::Run {
+        repo_root: repo.into(),
+        started_at: 1.0,
+        finished_at: 1.0,
+        origin: "hook".into(),
+        target_commit: format!("{i:040x}"),
+        outcome: "unchanged".into(),
+        ..Default::default()
+    };
+    let count = |repo: Option<&str>| -> i64 {
+        match repo {
+            Some(r) => db
+                .query_row(
+                    "SELECT count(*) FROM maintenance_runs WHERE repo_root=?1",
+                    [r],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            None => db
+                .query_row("SELECT count(*) FROM maintenance_runs", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+        }
+    };
+    for i in 0..201 {
+        scriptura::runlog::record(&db, &run("r0", i)).unwrap();
+    }
+    assert_eq!(count(Some("r0")), 200);
+    // 古い方が消える（最古の target_commit は 1 になる）。
+    let oldest: String = db
+        .query_row(
+            "SELECT target_commit FROM maintenance_runs WHERE repo_root='r0' ORDER BY id LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(oldest, format!("{:040x}", 1));
+    // 全体の上限: 12 リポジトリ × 200 件を入れても 2,000 件で止まる。
+    for repo in 1..12 {
+        for i in 0..200 {
+            scriptura::runlog::record(&db, &run(&format!("r{repo}"), i)).unwrap();
+        }
+    }
+    assert_eq!(count(None), 2000);
+    assert_eq!(count(Some("r11")), 200);
+    // 失敗系だけが直前と同じ条件でまとまる（成功は同じでもまとめない）。メッセージは最新に更新する。
+    let mut failed = run("r11", 7);
+    failed.outcome = "failed".into();
+    failed.message = Some("first".into());
+    scriptura::runlog::record(&db, &failed).unwrap();
+    failed.message = Some("second".into());
+    scriptura::runlog::record(&db, &failed).unwrap();
+    let rows = scriptura::runlog::load_from(&db, Some("r11"), None, 2)
+        .unwrap()
+        .rows;
+    assert_eq!(
+        (rows[0].run.outcome.as_str(), rows[0].attempts),
+        ("failed", 2)
+    );
+    assert_eq!(rows[0].run.message.as_deref(), Some("second"));
+    assert_eq!(rows[1].run.outcome, "unchanged");
+    // 理由は 2,000 文字で切る。
+    let mut long = run("r11", 8);
+    long.outcome = "rejected".into();
+    long.message = Some("あ".repeat(3000));
+    scriptura::runlog::record(&db, &long).unwrap();
+    let top = scriptura::runlog::load_from(&db, Some("r11"), None, 1)
+        .unwrap()
+        .rows;
+    assert_eq!(top[0].run.message.as_ref().unwrap().chars().count(), 2000);
+}
+
+#[test]
+fn run_now_is_recorded_with_the_run_now_origin() {
+    let f = Fixture::new();
+    f.hook("UserPromptSubmit");
+    f.push_change("recorded");
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.runs().len(), 1);
+    f.writes(json!({f.root.join("DESIGN.md").to_str().unwrap(): "forced"}));
+    assert_eq!(
+        run_now(&f.root, MaintenanceOptions::default()).unwrap(),
+        None
+    );
+    let runs = f.runs();
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(runs[0].run.origin, "hook");
+    assert_eq!(runs[1].run.origin, "run_now");
+    assert_eq!(runs[1].run.outcome, "committed");
 }

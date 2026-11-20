@@ -1,0 +1,30 @@
+{% extends "ui/base.html" %}
+{% block content %}
+<div class="heading"><h1>{{ crate::locale::tr("ui.title.runs") }}</h1></div>
+<section class="panel">
+  <form method="get" action="/history" class="inline">
+    <label>{{ crate::locale::tr("ui.runs.filter") }} <select name="repo" aria-label="{{ crate::locale::tr("ui.runs.filter") }}">{% for c in repos %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+    <button class="small" type="submit">{{ crate::locale::tr("ui.runs.filter_apply") }}</button>
+  </form>
+  {% if rows.is_empty() %}<p class="note">{{ crate::locale::tr("ui.runs.none") }}</p>{% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>{{ crate::locale::tr("ui.runs.time") }}</th><th>{{ crate::locale::tr("ui.common.repository") }}</th><th>{{ crate::locale::tr("ui.runs.origin") }}</th><th>{{ crate::locale::tr("ui.runs.kinds") }}</th><th>{{ crate::locale::tr("ui.runs.outcome") }}</th><th>{{ crate::locale::tr("ui.runs.documents") }}</th><th>{{ crate::locale::tr("ui.runs.range") }}</th><th>{{ crate::locale::tr("ui.runs.result") }}</th><th>{{ crate::locale::tr("ui.runs.reason") }}</th></tr></thead>
+    <tbody>
+    {% for r in rows %}<tr>
+      <td>{% let t = r.time %}{% include "ui/time_secs.html" %}{% if r.attempts > 1 %} <span class="badge">&times;{{ r.attempts }}</span>{% endif %}</td>
+      <td>{% if let Some(i) = r.repo_index %}<a href="/repos/{{ i }}"><code>{{ r.repo_label }}</code></a>{% else %}<code>{{ r.repo_label }}</code>{% endif %}</td>
+      <td>{{ r.origin }}</td>
+      <td>{{ r.kinds }}</td>
+      <td><span class="badge{% if !r.outcome_class.is_empty() %} {{ r.outcome_class }}{% endif %}">{{ r.outcome }}</span></td>
+      <td>{% for d in r.documents %}<div class="path">{{ d }}</div>{% endfor %}</td>
+      <td>{% if !r.range.is_empty() %}<code>{{ r.range }}</code>{% endif %}</td>
+      <td>{% if !r.result_short.is_empty() %}<code>{{ r.result_short }}</code>{% endif %}</td>
+      <td>{% if !r.message.is_empty() %}<span class="error-text">{{ r.message }}</span>{% endif %}</td>
+    </tr>{% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+  {% if let Some(href) = next_href %}<p><a href="{{ href }}">{{ crate::locale::tr("ui.runs.older") }}</a></p>{% endif %}
+  <p class="note">{{ crate::locale::tr("ui.runs.note") }}</p>
+</section>
+{% endblock %}

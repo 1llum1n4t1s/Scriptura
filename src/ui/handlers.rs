@@ -6,7 +6,7 @@
 //   ③ 変更を設定の写しに当てて検証（通らなければ 400 と理由）
 //   ④ `confirm::dangers(before, after)` ＋固定の危険操作があれば二段階確認（1 回目は書き込まない）
 //   ⑤ ops の関数を spawn_blocking で呼ぶ（ロック・版の照合・変更履歴・アトミック保存は ops／config 側）
-// 閲覧（GET）は副作用なし: 設定・状態 DB・更新案は読むだけで、無いものを作らない。
+// 閲覧（GET）は副作用なし: 設定・状態 DB は読むだけで、無いものを作らない（旧形式の設定も保存し直さない）。
 use std::{collections::BTreeMap, path::Path as FsPath};
 
 use askama::Template;
@@ -28,32 +28,17 @@ use super::{
 use crate::{
     app,
     config::{
-        self, Backfill, CURRENT_CONSENT_VERSION, ChangelogFormat, ChangelogSettings, Config,
-        ConsentSource, Document, KindSettings, Loaded, Mode, OnRelease, Permission, Policy,
-        Repository, Revision, Store, TIMEOUT_RANGE, Timing, UpdateError, When, normalize_remote,
+        self, Backfill, ChangelogFormat, ChangelogSettings, Config, Document, KindSettings,
+        LegacyNotice, Loaded, OnRelease, Permission, Policy, Repository, Revision, Store,
+        TIMEOUT_RANGE, Timing, UpdateError, When, normalize_remote,
     },
     doctor, kinds,
     ops::{self, RunNow},
-    proposal,
 };
 
 // ---------------------------------------------------------------------------
 // 共通
 // ---------------------------------------------------------------------------
-
-/// 同意文（CLI の同意の説明と同じ内容。送信データと費用を明示する）。
-pub(crate) fn consent_text() -> String {
-    crate::t!("ui.consent.text").to_string()
-}
-
-/// 同意の出所の表示名。
-fn consent_source(source: ConsentSource) -> &'static str {
-    match source {
-        ConsentSource::Cli => "CLI",
-        ConsentSource::Ui => crate::t!("ui.consent.source_ui"),
-        ConsentSource::LegacyMigration => crate::t!("ui.consent.source_legacy"),
-    }
-}
 
 /// 表示言語を引き継いで spawn_blocking する（task-local の言語はブロッキングスレッドへ渡らないため、
 /// 呼び出し時点の言語を `locale::scoped` で明示する）。ops・エンジン由来の文言も画面と同じ言語になる。
@@ -77,6 +62,8 @@ struct Current {
     config: Config,
     broken: Option<String>,
     missing: bool,
+    /// 旧形式から変換して読んだときの要約（ファイルは保存し直されるまで旧形式のまま）。
+    legacy: Option<LegacyNotice>,
 }
 
 fn first_line(text: &str) -> String {
@@ -100,6 +87,7 @@ fn current(state: &AppState) -> Current {
         config,
         broken,
         missing,
+        legacy: snap.legacy,
     }
 }
 
@@ -177,23 +165,6 @@ fn internal(state: &AppState, back: &str) -> Response {
     )
 }
 
-fn mode_label(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Off => crate::t!("ui.mode.off"),
-        Mode::Propose => crate::t!("ui.mode.propose"),
-        Mode::Push => crate::t!("ui.mode.push"),
-    }
-}
-
-fn parse_mode(text: Option<&str>) -> Option<Mode> {
-    match text? {
-        "off" => Some(Mode::Off),
-        "propose" => Some(Mode::Propose),
-        "push" => Some(Mode::Push),
-        _ => None,
-    }
-}
-
 /// 改行区切りの一覧（空行を除き、前後の空白を除く）。
 fn lines_of(text: Option<&str>) -> Vec<String> {
     text.unwrap_or("")
@@ -260,31 +231,12 @@ fn names(docs: &[Document]) -> String {
 }
 
 /// 登録 1 件の要約。remote は正規化した host/owner/repo だけを出す（資格情報入りの URL を写さない）。
-fn repo_row(config: &Config, index: usize, repo: &Repository, with_proposals: bool) -> RepoRow {
-    let mode = repo.mode.unwrap_or(config.defaults.mode);
-    let (pending, applied) = if with_proposals {
-        let list = proposal::list(FsPath::new(&repo.root));
-        (
-            list.iter().filter(|p| !p.applied).count(),
-            list.iter().filter(|p| p.applied).count(),
-        )
-    } else {
-        (0, 0)
-    };
+fn repo_row(config: &Config, index: usize, repo: &Repository) -> RepoRow {
     RepoRow {
         index,
         root: repo.root.clone(),
-        mode: format!(
-            "{}{}",
-            mode_label(mode),
-            if repo.mode.is_none() {
-                crate::t!("ui.mode.follows_default_suffix")
-            } else {
-                ""
-            }
-        ),
-        push: mode == Mode::Push,
         paused: repo.paused,
+        migrated: repo.migrated_from.is_some(),
         documents: names(
             repo.documents
                 .as_deref()
@@ -300,8 +252,6 @@ fn repo_row(config: &Config, index: usize, repo: &Repository, with_proposals: bo
             .as_deref()
             .and_then(normalize_remote)
             .unwrap_or_default(),
-        pending,
-        applied,
     }
 }
 
@@ -513,26 +463,26 @@ pub async fn shutdown(State(state): State<AppState>) -> Response {
 // 概要
 // ---------------------------------------------------------------------------
 
-/// 注意すべき設定（概要に出す）。
-fn warnings(c: &Config) -> Vec<String> {
+/// 注意すべき設定（概要に出す）。旧形式・移行由来の停止は、設定を保存し直したあとも残る停止だけを示す。
+fn warnings(c: &Config, legacy: Option<&LegacyNotice>) -> Vec<String> {
     let mut out = Vec::new();
-    match &c.consent {
-        Some(x) if x.version >= CURRENT_CONSENT_VERSION => {}
-        _ => out.push(crate::t!("ui.warn.no_consent").into()),
+    if let Some(l) = legacy {
+        out.push(crate::t!("ui.warn.legacy", stopped = l.stopped));
+    }
+    let migrated = c
+        .repository
+        .iter()
+        .filter(|r| r.migrated_from.is_some())
+        .count();
+    if migrated > 0 {
+        out.push(crate::t!("ui.warn.migrated", count = migrated));
     }
     if c.worker.permission == Permission::Bypass {
         out.push(crate::t!("ui.warn.bypass").into());
     }
-    let push = c
-        .repository
-        .iter()
-        .filter(|r| r.mode.unwrap_or(c.defaults.mode) == Mode::Push)
-        .count();
-    if push > 0 {
-        out.push(crate::t!("ui.warn.push_count", count = push));
-    }
-    if c.defaults.mode == Mode::Push {
-        out.push(crate::t!("ui.warn.default_push").into());
+    let active = c.repository.iter().filter(|r| r.is_active()).count();
+    if active > 0 {
+        out.push(crate::t!("ui.warn.push_count", count = active));
     }
     match c.enrollment.policy {
         Policy::All => out.push(crate::t!("ui.warn.policy_all").into()),
@@ -552,31 +502,17 @@ pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Re
             .repository
             .iter()
             .enumerate()
-            .map(|(i, r)| repo_row(&cur.config, i, r, true))
+            .map(|(i, r)| repo_row(&cur.config, i, r))
             .collect();
-        let pending = repos.iter().map(|r| r.pending).sum();
         let config_state = match (&cur.broken, cur.missing) {
             (Some(reason), _) => crate::t!("ui.overview.config_broken", reason = reason),
             (None, true) => crate::t!("ui.overview.config_missing").into(),
             (None, false) => crate::t!("ui.overview.config_ok").into(),
         };
-        let consent = cur.config.consent.as_ref().map(|c| {
-            crate::t!(
-                "ui.overview.consent",
-                version = c.version,
-                at = views::local_time(&c.accepted_at),
-                source = consent_source(c.source)
-            )
-        });
-        let consent_current = cur
-            .config
-            .consent
-            .as_ref()
-            .is_some_and(|c| c.version >= CURRENT_CONSENT_VERSION);
         let warnings = if cur.broken.is_some() {
             Vec::new()
         } else {
-            warnings(&cur.config)
+            warnings(&cur.config, cur.legacy.as_ref())
         };
         let updates = UpdatePanel {
             managed: status["installForm"].as_str() == Some("setup"),
@@ -596,10 +532,7 @@ pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Re
                 install_hint: status["installForm"].as_str() == Some("other"),
                 config_path: s.store.config_file.display().to_string(),
                 config_state,
-                consent,
-                consent_current,
                 repos,
-                pending,
                 warnings,
                 updates,
             },
@@ -622,10 +555,7 @@ pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Re
         install_hint: d.install_hint,
         config_path: d.config_path,
         config_state: d.config_state,
-        consent: d.consent,
-        consent_current: d.consent_current,
         repos: d.repos,
-        pending: d.pending,
         warnings: d.warnings,
         updates: d.updates,
     })
@@ -637,10 +567,7 @@ struct OverviewPageData {
     install_hint: bool,
     config_path: String,
     config_state: String,
-    consent: Option<String>,
-    consent_current: bool,
     repos: Vec<RepoRow>,
-    pending: usize,
     warnings: Vec<String>,
     updates: UpdatePanel,
 }
@@ -826,7 +753,7 @@ pub async fn repos(State(state): State<AppState>, Query(q): Query<Msg>) -> Respo
             .repository
             .iter()
             .enumerate()
-            .map(|(i, r)| repo_row(&cur.config, i, r, true))
+            .map(|(i, r)| repo_row(&cur.config, i, r))
             .collect();
         (cur, rows)
     })
@@ -845,9 +772,6 @@ pub async fn repos(State(state): State<AppState>, Query(q): Query<Msg>) -> Respo
         revision: cur.revision.to_string(),
         repos: rows,
         documents: document_choices(&cur.config, &[]),
-        needs_consent: !ops::keeps_consent(cur.config.consent.as_ref()),
-        consent_text: consent_text(),
-        consent_version: CURRENT_CONSENT_VERSION,
     })
 }
 
@@ -860,7 +784,7 @@ pub async fn repo_detail(
     let Ok(built) = blocking(move || {
         let cur = current(&s);
         let repo = cur.config.repository.get(n)?.clone();
-        let row = repo_row(&cur.config, n, &repo, true);
+        let row = repo_row(&cur.config, n, &repo);
         let root = FsPath::new(&repo.root);
         let (kinds, kinds_error) = match ops::docs_overview(&s.store, root) {
             Ok(o) => (
@@ -942,24 +866,7 @@ pub async fn repo_detail(
         Some((
             cur.revision.to_string(),
             cur.broken.clone(),
-            !ops::keeps_consent(cur.config.consent.as_ref()),
             RepoPageData {
-                mode_choices: vec![
-                    Choice::new(
-                        "default",
-                        crate::t!(
-                            "ui.mode.follows_default",
-                            mode = mode_label(cur.config.defaults.mode)
-                        ),
-                        repo.mode.is_none(),
-                    ),
-                    Choice::new(
-                        "propose",
-                        mode_label(Mode::Propose),
-                        repo.mode == Some(Mode::Propose),
-                    ),
-                    Choice::new("off", mode_label(Mode::Off), repo.mode == Some(Mode::Off)),
-                ],
                 uses_default_documents: docs.is_none(),
                 documents: document_choices(
                     &cur.config,
@@ -971,6 +878,14 @@ pub async fn repo_detail(
                 cursors,
                 publication,
                 events,
+                recent_runs: run_views(
+                    &cur.config,
+                    &crate::runlog::load(
+                        crate::timing::repo_key(root).as_deref().or(Some("\0")),
+                        None,
+                        5,
+                    ),
+                ),
             },
         ))
     })
@@ -978,7 +893,7 @@ pub async fn repo_detail(
     else {
         return internal(&state, "/repos");
     };
-    let Some((revision, broken, needs_consent, d)) = built else {
+    let Some((revision, broken, d)) = built else {
         return error_page(
             &state,
             StatusCode::NOT_FOUND,
@@ -996,22 +911,20 @@ pub async fn repo_detail(
         ),
         revision,
         repo: d.row,
-        mode_choices: d.mode_choices,
         uses_default_documents: d.uses_default_documents,
         documents: d.documents,
-        needs_consent,
-        consent_text: consent_text(),
-        consent_version: CURRENT_CONSENT_VERSION,
         kinds: d.kinds,
         kinds_error: d.kinds_error,
         cursors: d.cursors,
         publication: d.publication,
         events: d.events,
+        recent_runs: d.recent_runs,
+        runs_href: format!("/history?repo={n}"),
     })
 }
 
 struct RepoPageData {
-    mode_choices: Vec<Choice>,
+    recent_runs: Vec<RunView>,
     uses_default_documents: bool,
     documents: Vec<Choice>,
     row: RepoRow,
@@ -1022,7 +935,7 @@ struct RepoPageData {
     events: Vec<EventRow>,
 }
 
-/// 有効化（新規登録・登録し直し）。push モードはここだけが経路（remote・upstream を確認する ops::enable）。
+/// 有効化（新規登録・登録し直し・移行で止めた登録の再有効化）。remote・ブランチ・upstream を確認する ops::enable が唯一の経路。
 pub async fn repo_enable(
     State(state): State<AppState>,
     Extension(form): Extension<FormData>,
@@ -1036,50 +949,18 @@ pub async fn repo_enable(
             back,
         );
     };
-    let Some(mode) = parse_mode(form.get("mode")) else {
-        return error_page(
-            &state,
-            StatusCode::BAD_REQUEST,
-            crate::t!("ui.error.mode"),
-            back,
-        );
-    };
     let branches = Some(comma_list(form.get("branches"))).filter(|b| !b.is_empty());
     let documents = match parse_documents(form.all("documents")) {
         Ok(d) if d.is_empty() => None,
         Ok(d) => Some(d),
         Err(e) => return error_page(&state, StatusCode::BAD_REQUEST, e, back),
     };
-    let cur = current(&state);
-    let needs_consent = !ops::keeps_consent(cur.config.consent.as_ref());
-    if needs_consent {
-        let version_ok = form
-            .get("consent_version")
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            == Some(CURRENT_CONSENT_VERSION);
-        if !form.checked("consent") || !version_ok {
-            return error_page(
-                &state,
-                StatusCode::BAD_REQUEST,
-                crate::t!("ui.error.enable_consent"),
-                back,
-            );
-        }
-    }
-    let mut extra = Vec::new();
-    if mode == Mode::Push {
-        extra.push(crate::t!("ui.danger.enable_push", repo = repo));
-    }
-    if needs_consent {
-        extra.push(crate::t!("ui.danger.consent").into());
-    }
+    // 有効化すると push のたびに worker が動き、commit と push が自動で行われるので、常に確認を挟む。
+    let extra = vec![crate::t!("ui.danger.enable_push", repo = repo)];
     let request = ops::EnableRequest {
         repo,
-        mode,
         branches,
         documents,
-        consent_version: CURRENT_CONSENT_VERSION,
-        consent_source: ConsentSource::Ui,
     };
     // 有効化は Git の状態から登録内容を決めるので、事前の写しへの適用はしない（検証は ops::enable が行う）。
     apply_change(
@@ -1158,52 +1039,6 @@ pub async fn repo_resume(
     Extension(form): Extension<FormData>,
 ) -> Response {
     pause_or_resume(state, form, false).await
-}
-
-/// モードの変更（既定に従う／propose／off）。push へはここからは変えない（有効化から登録し直す）。
-pub async fn repo_mode(
-    State(state): State<AppState>,
-    Extension(form): Extension<FormData>,
-) -> Response {
-    let (index, root) = match require_repo(&state, &form) {
-        Ok(x) => x,
-        Err(r) => return r,
-    };
-    let back = format!("/repos/{index}");
-    let mode = match form.get("mode") {
-        Some("default") => None,
-        Some("off") => Some(Mode::Off),
-        Some("propose") => Some(Mode::Propose),
-        _ => {
-            return error_page(
-                &state,
-                StatusCode::BAD_REQUEST,
-                crate::t!("ui.error.push_here"),
-                back,
-            );
-        }
-    };
-    let target = root.clone();
-    apply_change(
-        &state,
-        "/repos/mode",
-        &form,
-        &back,
-        Vec::new(),
-        |c| {
-            let i = ops::find_repo(c, &target).ok_or(crate::t!("ui.error.not_registered_short"))?;
-            c.repository[i].mode = mode;
-            Ok(())
-        },
-        move |s, rev| {
-            let done = ops::set_repository_mode(&s.store, &root, mode, Some(rev))?;
-            Ok(format!(
-                "/repos/{index}?msg={}",
-                if done.saved { "saved" } else { "unchanged" }
-            ))
-        },
-    )
-    .await
 }
 
 /// リポジトリごとの対象文書（既定に従う、または選んだ種類）。
@@ -1301,7 +1136,6 @@ pub struct Job {
 struct JobResult {
     ok: bool,
     message: String,
-    proposal: Option<String>,
 }
 
 /// run-now のジョブ一覧（新しい 20 件だけ保つ）。
@@ -1318,41 +1152,20 @@ impl Jobs {
     }
 }
 
-fn run_now_result(index: usize, result: Result<RunNow, String>) -> JobResult {
+fn run_now_result(result: Result<RunNow, String>) -> JobResult {
     match result {
-        Ok(RunNow::Created(x)) => JobResult {
-            ok: true,
-            message: crate::t!(
-                "ui.job.created",
-                sha = &x.sha[..x.sha.len().min(12)],
-                documents = x.documents.join(crate::t!("list.separator"))
-            ),
-            proposal: Some(format!("/proposals/{index}/{}", x.sha)),
-        },
-        Ok(RunNow::Unchanged) => JobResult {
-            ok: true,
-            message: crate::t!("ui.job.unchanged").into(),
-            proposal: None,
-        },
         Ok(RunNow::Completed) => JobResult {
             ok: true,
             message: crate::t!("ui.job.completed").into(),
-            proposal: None,
-        },
-        Ok(RunNow::Rejected { reason }) => JobResult {
-            ok: true,
-            message: crate::t!("ui.job.rejected", reason = views::redact(&reason)),
-            proposal: None,
         },
         Err(e) => JobResult {
             ok: false,
             message: views::redact(&e),
-            proposal: None,
         },
     }
 }
 
-/// run-now を始める。push モードは二段階確認を挟む（文書を実際に commit・push するため）。
+/// run-now を始める。文書を実際に commit・push するので、常に二段階確認を挟む。
 pub async fn repo_run_now(
     State(state): State<AppState>,
     Extension(form): Extension<FormData>,
@@ -1362,17 +1175,7 @@ pub async fn repo_run_now(
         Err(r) => return r,
     };
     let back = format!("/repos/{index}");
-    let cur = current(&state);
-    let push = ops::find_repo(&cur.config, &root).map(|i| {
-        cur.config.repository[i]
-            .mode
-            .unwrap_or(cur.config.defaults.mode)
-    }) == Some(Mode::Push);
-    let extra = if push {
-        vec![crate::t!("ui.danger.run_now_push", repo = root)]
-    } else {
-        Vec::new()
-    };
+    let extra = vec![crate::t!("ui.danger.run_now_push", repo = root)];
     apply_change(
         &state,
         "/repos/run-now",
@@ -1428,7 +1231,7 @@ pub async fn repo_run_now(
             tokio::runtime::Handle::current().spawn_blocking(move || {
                 crate::locale::scoped(language, || {
                     let result = ops::run_now_for(&worker.store, FsPath::new(&root), None);
-                    let done = run_now_result(index, result);
+                    let done = run_now_result(result);
                     let mut jobs = worker.jobs.lock().unwrap_or_else(|p| p.into_inner());
                     if let Some(job) = jobs.list.get_mut(&id) {
                         job.result = Some(done);
@@ -1457,7 +1260,6 @@ pub async fn job(State(state): State<AppState>, Path(id): Path<u64>) -> Response
                 .as_ref()
                 .map(|r| r.message.clone())
                 .unwrap_or_default(),
-            proposal: j.result.as_ref().and_then(|r| r.proposal.clone()),
         })
     };
     match page {
@@ -1472,7 +1274,7 @@ pub async fn job(State(state): State<AppState>, Path(id): Path<u64>) -> Response
 }
 
 // ---------------------------------------------------------------------------
-// 文書の種類
+// 設定 › 文書（既定の対象の文書と、文書の種類）
 // ---------------------------------------------------------------------------
 
 fn when_label(when: When) -> &'static str {
@@ -1506,7 +1308,8 @@ fn limits_text(k: &kinds::ResolvedKind) -> String {
     }
 }
 
-pub async fn kinds(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
+/// 設定 › 文書。上段は既定の対象の文書、下段は種類の一覧（追加・編集への入口）。
+pub async fn documents(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
     let cur = current(&state);
     let rows = all_documents(&cur.config)
         .iter()
@@ -1515,23 +1318,65 @@ pub async fn kinds(State(state): State<AppState>, Query(q): Query<Msg>) -> Respo
             id: k.id().to_string(),
             name: k.document.name().to_string(),
             builtin: k.document.is_builtin(),
-            default_enabled: cur.config.defaults.documents.contains(&k.document),
             limits: limits_text(&k),
             when: when_label(k.timing.when).to_string(),
             template: template_text(&k.template),
             customized: cur.config.kinds.contains_key(k.id()),
         })
         .collect();
-    html(KindsPage {
+    html(DocumentsPage {
         layout: layout(
             &state,
-            crate::t!("ui.nav.kinds"),
-            "kinds",
+            crate::t!("ui.nav.documents"),
+            "documents",
             q.msg.as_deref(),
             cur.broken,
         ),
+        revision: cur.revision.to_string(),
+        documents: document_choices(&cur.config, &cur.config.defaults.documents),
         kinds: rows,
     })
+}
+
+/// 既定の対象の文書の保存（版の照合・変更履歴・危険確認は他の設定と同じ `apply_change` を通る）。
+pub async fn documents_save(
+    State(state): State<AppState>,
+    Extension(form): Extension<FormData>,
+) -> Response {
+    let back = "/settings/documents";
+    let documents = match parse_documents(form.all("documents")) {
+        Ok(d) if d.is_empty() => {
+            return error_page(
+                &state,
+                StatusCode::BAD_REQUEST,
+                crate::t!("ui.error.default_documents"),
+                back,
+            );
+        }
+        Ok(d) => d,
+        Err(e) => return error_page(&state, StatusCode::BAD_REQUEST, e, back),
+    };
+    let change = |c: &mut Config, docs: Vec<Document>| {
+        c.defaults.documents = docs;
+        Ok::<(), String>(())
+    };
+    let preview_docs = documents.clone();
+    apply_change(
+        &state,
+        "/settings/documents",
+        &form,
+        back,
+        Vec::new(),
+        |c| change(c, preview_docs),
+        move |s, rev| {
+            let done = ops::edit(&s.store, Some(rev), |c| change(c, documents))?;
+            Ok(format!(
+                "/settings/documents?msg={}",
+                if done.saved { "saved" } else { "unchanged" }
+            ))
+        },
+    )
+    .await
 }
 
 fn opt_choices(
@@ -1659,6 +1504,23 @@ fn kind_form(id: &str, s: &KindSettings, is_new: bool) -> KindForm {
         ),
         cl_backfill_max_releases: num_text(cl.backfill_max_releases),
         cl_backfill_max_commits: num_text(cl.backfill_max_commits),
+        ph_none: crate::t!("ui.kind.ph.none").to_string(),
+        ph_max_chars: crate::t!("ui.kind.ph.no_limit").to_string(),
+        // AGENTS.md の 30,000 bytes 未満の検査（agents_size_error）は組み込みの agents だけに効く。
+        ph_max_bytes: if id == "agents" {
+            crate::t!(
+                "ui.kind.ph.max_bytes_agents",
+                value = kinds::AGENTS_MAX_BYTES
+            )
+        } else {
+            crate::t!("ui.kind.ph.no_limit").to_string()
+        },
+        ph_language: crate::t!("ui.kind.ph.language").to_string(),
+        ph_min_interval: crate::t!(
+            "ui.kind.ph.interval",
+            value = kinds::ResolvedTiming::default().min_interval_hours
+        ),
+        ph_template_file: crate::t!("ui.kind.ph.template_example").to_string(),
     }
 }
 
@@ -1881,7 +1743,7 @@ fn kind_page(state: &AppState, cur: Current, form: KindForm, msg: Option<&str>) 
             } else {
                 crate::t!("ui.title.kind", name = form.name)
             },
-            "kinds",
+            "documents",
             msg,
             cur.broken,
         ),
@@ -1911,7 +1773,7 @@ pub async fn kind_detail(
             &state,
             StatusCode::NOT_FOUND,
             crate::t!("ui.error.kind_missing"),
-            "/kinds",
+            "/settings/documents",
         );
     }
     let settings = cur.config.kinds.get(&id).cloned().unwrap_or_default();
@@ -1931,13 +1793,13 @@ pub async fn kind_save(
     Path(id): Path<String>,
     Extension(form): Extension<FormData>,
 ) -> Response {
-    let back = format!("/kinds/{id}");
+    let back = format!("/settings/documents/{id}");
     if !config::is_valid_kind_id(&id) {
         return error_page(
             &state,
             StatusCode::NOT_FOUND,
             crate::t!("ui.error.kind_missing"),
-            "/kinds",
+            "/settings/documents",
         );
     }
     let builtin = kinds::is_builtin_id(&id);
@@ -1953,7 +1815,7 @@ pub async fn kind_save(
     let (pid, pvalue) = (id.clone(), value.clone());
     apply_change(
         &state,
-        &format!("/kinds/{id}"),
+        &format!("/settings/documents/{id}"),
         &form,
         &back,
         Vec::new(),
@@ -1974,7 +1836,7 @@ pub async fn kind_save(
         move |s, rev| {
             let done = ops::set_kind(&s.store, &id, value, Some(rev))?;
             Ok(format!(
-                "/kinds/{id}?msg={}",
+                "/settings/documents/{id}?msg={}",
                 if done.saved { "saved" } else { "unchanged" }
             ))
         },
@@ -1987,7 +1849,7 @@ pub async fn kind_create(
     State(state): State<AppState>,
     Extension(form): Extension<FormData>,
 ) -> Response {
-    let back = "/kinds/new";
+    let back = "/settings/documents/new";
     let Some(id) = form.text("id") else {
         return error_page(
             &state,
@@ -2011,7 +1873,7 @@ pub async fn kind_create(
     let (pid, psettings) = (id.clone(), settings.clone());
     apply_change(
         &state,
-        "/kinds/new",
+        "/settings/documents/new",
         &form,
         back,
         Vec::new(),
@@ -2024,7 +1886,7 @@ pub async fn kind_create(
         },
         move |s, rev| {
             ops::set_kind(&s.store, &id, Some(settings), Some(rev))?;
-            Ok(format!("/kinds/{id}?msg=created"))
+            Ok(format!("/settings/documents/{id}?msg=created"))
         },
     )
     .await
@@ -2036,7 +1898,7 @@ pub async fn kind_delete(
     Path(id): Path<String>,
     Extension(form): Extension<FormData>,
 ) -> Response {
-    let back = format!("/kinds/{id}");
+    let back = format!("/settings/documents/{id}");
     if !config::is_valid_kind_id(&id) || kinds::is_builtin_id(&id) {
         return error_page(
             &state,
@@ -2048,7 +1910,7 @@ pub async fn kind_delete(
     let pid = id.clone();
     apply_change(
         &state,
-        &format!("/kinds/{id}/delete"),
+        &format!("/settings/documents/{id}/delete"),
         &form,
         &back,
         Vec::new(),
@@ -2060,7 +1922,7 @@ pub async fn kind_delete(
         },
         move |s, rev| {
             ops::set_kind(&s.store, &id, None, Some(rev))?;
-            Ok("/kinds?msg=deleted".into())
+            Ok("/settings/documents?msg=deleted".into())
         },
     )
     .await
@@ -2117,10 +1979,10 @@ pub async fn template_save(
             &state,
             StatusCode::BAD_REQUEST,
             crate::t!("ui.error.kind_invalid"),
-            "/kinds",
+            "/settings/documents",
         );
     }
-    let back = format!("/kinds/{kind}");
+    let back = format!("/settings/documents/{kind}");
     let name = form.text("name").unwrap_or_default();
     if !template_name_ok(&name) {
         return error_page(
@@ -2141,219 +2003,6 @@ pub async fn template_save(
         Err(_) => internal(&state, &back),
     }
 }
-
-// ---------------------------------------------------------------------------
-// 更新案
-// ---------------------------------------------------------------------------
-
-fn is_full_sha(sha: &str) -> bool {
-    matches!(sha.len(), 40 | 64) && sha.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn proposal_row(index: usize, root: &str, p: &proposal::ProposalInfo) -> ProposalRow {
-    ProposalRow {
-        index,
-        root: root.to_string(),
-        sha: p.sha.clone(),
-        short: p.sha[..p.sha.len().min(12)].to_string(),
-        created_at: p.created_at.clone(),
-        diffstat: p.diffstat.clone(),
-        documents: p.documents.join(crate::t!("list.separator")),
-        applied: p.applied,
-    }
-}
-
-pub async fn proposals(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
-    let s = state.clone();
-    let Ok((broken, rows)) = blocking(move || {
-        let cur = current(&s);
-        let rows: Vec<ProposalRow> = cur
-            .config
-            .repository
-            .iter()
-            .enumerate()
-            .flat_map(|(i, r)| {
-                proposal::list(FsPath::new(&r.root))
-                    .iter()
-                    .map(|p| proposal_row(i, &r.root, p))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        (cur.broken, rows)
-    })
-    .await
-    else {
-        return internal(&state, "/");
-    };
-    html(ProposalsPage {
-        layout: layout(
-            &state,
-            crate::t!("ui.nav.proposals"),
-            "proposals",
-            q.msg.as_deref(),
-            broken,
-        ),
-        rows,
-    })
-}
-
-/// パッチ表示の上限（これを超えた分は省略して示す）。
-const PATCH_VIEW_LIMIT: usize = 1024 * 1024;
-
-fn diff_class(line: &str) -> &'static str {
-    if line.starts_with("+++")
-        || line.starts_with("---")
-        || line.starts_with("diff ")
-        || line.starts_with("index ")
-        || line.starts_with("new file")
-        || line.starts_with("deleted file")
-    {
-        "meta"
-    } else if line.starts_with("@@") {
-        "hunk"
-    } else if line.starts_with('+') {
-        "add"
-    } else if line.starts_with('-') {
-        "del"
-    } else {
-        "same"
-    }
-}
-
-pub async fn proposal_detail(
-    State(state): State<AppState>,
-    Path((n, sha)): Path<(usize, String)>,
-) -> Response {
-    if !is_full_sha(&sha) {
-        return error_page(
-            &state,
-            StatusCode::NOT_FOUND,
-            crate::t!("ui.error.proposal_missing"),
-            "/proposals",
-        );
-    }
-    let s = state.clone();
-    let Ok(built) = blocking(move || {
-        let cur = current(&s);
-        let repo = cur.config.repository.get(n)?.clone();
-        let root = FsPath::new(&repo.root);
-        let info = proposal::list(root).into_iter().find(|p| p.sha == sha)?;
-        let bytes = std::fs::read(&info.patch_path).ok()?;
-        let truncated = bytes.len() > PATCH_VIEW_LIMIT;
-        let text =
-            String::from_utf8_lossy(&bytes[..bytes.len().min(PATCH_VIEW_LIMIT)]).into_owned();
-        let lines = text
-            .lines()
-            .map(|l| DiffLine {
-                class: diff_class(l),
-                text: l.to_string(),
-            })
-            .collect();
-        Some((
-            cur.revision.to_string(),
-            cur.broken,
-            proposal_row(n, &repo.root, &info),
-            lines,
-            truncated,
-        ))
-    })
-    .await
-    else {
-        return internal(&state, "/proposals");
-    };
-    let Some((revision, broken, row, lines, truncated)) = built else {
-        return error_page(
-            &state,
-            StatusCode::NOT_FOUND,
-            crate::t!("ui.error.proposal_missing"),
-            "/proposals",
-        );
-    };
-    html(ProposalPage {
-        layout: layout(
-            &state,
-            crate::t!("ui.title.proposal"),
-            "proposals",
-            None,
-            broken,
-        ),
-        revision,
-        row,
-        lines,
-        truncated,
-    })
-}
-
-/// 更新案の対象（登録済みのリポジトリと完全な sha）をフォームから決める。
-fn proposal_target(state: &AppState, form: &FormData) -> Result<(usize, String, String), Response> {
-    let (index, root) = require_repo(state, form)?;
-    let sha = form.text("sha").unwrap_or_default().to_ascii_lowercase();
-    if !is_full_sha(&sha) {
-        return Err(error_page(
-            state,
-            StatusCode::BAD_REQUEST,
-            crate::t!("ui.error.proposal_invalid"),
-            "/proposals",
-        ));
-    }
-    Ok((index, root, sha))
-}
-
-/// 更新案の適用（作業ツリーを変えるので常に二段階確認）。
-pub async fn proposal_apply(
-    State(state): State<AppState>,
-    Extension(form): Extension<FormData>,
-) -> Response {
-    let (index, root, sha) = match proposal_target(&state, &form) {
-        Ok(x) => x,
-        Err(r) => return r,
-    };
-    let back = format!("/proposals/{index}/{sha}");
-    let extra = vec![crate::t!("ui.danger.apply", sha = &sha[..12], repo = root)];
-    apply_change(
-        &state,
-        "/proposals/apply",
-        &form,
-        &back,
-        extra,
-        |_| Ok(()),
-        move |_, _| {
-            proposal::apply(FsPath::new(&root), &sha)
-                .map(|_| "/proposals?msg=applied".to_string())
-                .map_err(|e| UpdateError::Rejected(views::redact(&e)))
-        },
-    )
-    .await
-}
-
-pub async fn proposal_discard(
-    State(state): State<AppState>,
-    Extension(form): Extension<FormData>,
-) -> Response {
-    let (index, root, sha) = match proposal_target(&state, &form) {
-        Ok(x) => x,
-        Err(r) => return r,
-    };
-    let back = format!("/proposals/{index}/{sha}");
-    apply_change(
-        &state,
-        "/proposals/discard",
-        &form,
-        &back,
-        Vec::new(),
-        |_| Ok(()),
-        move |_, _| {
-            proposal::discard(FsPath::new(&root), &sha)
-                .map(|_| "/proposals?msg=discarded".to_string())
-                .map_err(|e| UpdateError::Rejected(views::redact(&e)))
-        },
-    )
-    .await
-}
-
-// ---------------------------------------------------------------------------
-// worker 設定・全般設定・同意
-// ---------------------------------------------------------------------------
 
 pub async fn worker(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
     let cur = current(&state);
@@ -2522,27 +2171,9 @@ pub async fn worker_save(
 pub async fn general(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
     let cur = current(&state);
     let d = &cur.config.defaults;
-    let mut modes = vec![
-        Choice::new(
-            "propose",
-            mode_label(Mode::Propose),
-            d.mode == Mode::Propose,
-        ),
-        Choice::new("off", mode_label(Mode::Off), d.mode == Mode::Off),
-    ];
-    // 既定の push は新たには選べない（push はリポジトリごとの明示の有効化だけ）。今の値が push なら保つ選択肢を出す。
-    if d.mode == Mode::Push {
-        modes.push(Choice::new(
-            "push",
-            crate::t!("ui.general.push_current"),
-            true,
-        ));
-    }
     let e = &cur.config.enrollment;
     let page = GeneralPage {
         revision: cur.revision.to_string(),
-        modes,
-        documents: document_choices(&cur.config, &d.documents),
         exclude: d.exclude.join("\n"),
         instructions: d.instructions.clone(),
         instructions_max: kinds::INSTRUCTIONS_MAX_CHARS,
@@ -2575,11 +2206,9 @@ pub async fn general(State(state): State<AppState>, Query(q): Query<Msg>) -> Res
     html(page)
 }
 
-/// 全般設定の値（既定の対象・除外・共通の追加指示・自動登録）。
+/// 全般設定の値（除外・共通の追加指示・自動登録）。既定の対象の文書は「文書」タブで扱う。
 #[derive(Clone)]
 struct GeneralValues {
-    mode: Mode,
-    documents: Vec<Document>,
     exclude: Vec<String>,
     instructions: String,
     policy: Policy,
@@ -2587,11 +2216,6 @@ struct GeneralValues {
 }
 
 fn apply_general(c: &mut Config, v: GeneralValues) -> Result<(), String> {
-    if v.mode == Mode::Push && c.defaults.mode != Mode::Push {
-        return Err(crate::t!("ui.error.default_push").into());
-    }
-    c.defaults.mode = v.mode;
-    c.defaults.documents = v.documents;
     c.defaults.exclude = v.exclude;
     c.defaults.instructions = v.instructions;
     c.enrollment.policy = v.policy;
@@ -2604,18 +2228,6 @@ pub async fn general_save(
     Extension(form): Extension<FormData>,
 ) -> Response {
     let back = "/settings/general";
-    let Some(mode) = parse_mode(form.get("mode")) else {
-        return error_page(
-            &state,
-            StatusCode::BAD_REQUEST,
-            crate::t!("ui.error.default_mode"),
-            back,
-        );
-    };
-    let documents = match parse_documents(form.all("documents")) {
-        Ok(d) => d,
-        Err(e) => return error_page(&state, StatusCode::BAD_REQUEST, e, back),
-    };
     let policy = match form.get("policy") {
         Some("explicit") => Policy::Explicit,
         Some("remote-owner") => Policy::RemoteOwner,
@@ -2630,8 +2242,6 @@ pub async fn general_save(
         }
     };
     let values = GeneralValues {
-        mode,
-        documents,
         exclude: lines_of(form.get("exclude")),
         instructions: normalized(&form, "instructions").unwrap_or_default(),
         policy,
@@ -2650,80 +2260,6 @@ pub async fn general_save(
             Ok(format!(
                 "/settings/general?msg={}",
                 if done.saved { "saved" } else { "unchanged" }
-            ))
-        },
-    )
-    .await
-}
-
-pub async fn consent(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
-    let cur = current(&state);
-    let current_text = cur.config.consent.as_ref().map(|c| {
-        crate::t!(
-            "ui.consent.current",
-            version = c.version,
-            at = views::local_time(&c.accepted_at),
-            source = consent_source(c.source)
-        )
-    });
-    html(ConsentPage {
-        revision: cur.revision.to_string(),
-        text: consent_text(),
-        version: CURRENT_CONSENT_VERSION,
-        current: current_text,
-        kept: ops::keeps_consent(cur.config.consent.as_ref()),
-        layout: layout(
-            &state,
-            crate::t!("ui.nav.consent"),
-            "consent",
-            q.msg.as_deref(),
-            cur.broken,
-        ),
-    })
-}
-
-pub async fn consent_save(
-    State(state): State<AppState>,
-    Extension(form): Extension<FormData>,
-) -> Response {
-    let back = "/consent";
-    let version = form
-        .get("version")
-        .and_then(|v| v.trim().parse::<u32>().ok());
-    if !form.checked("agree") || version != Some(CURRENT_CONSENT_VERSION) {
-        return error_page(
-            &state,
-            StatusCode::BAD_REQUEST,
-            crate::t!("ui.error.consent_check"),
-            back,
-        );
-    }
-    apply_change(
-        &state,
-        back,
-        &form,
-        back,
-        Vec::new(),
-        |c| {
-            if !ops::keeps_consent(c.consent.as_ref()) {
-                c.consent = Some(config::Consent {
-                    version: CURRENT_CONSENT_VERSION,
-                    accepted_at: chrono::Utc::now().to_rfc3339(),
-                    source: ConsentSource::Ui,
-                });
-            }
-            Ok(())
-        },
-        move |s, rev| {
-            let done = ops::record_consent(
-                &s.store,
-                CURRENT_CONSENT_VERSION,
-                ConsentSource::Ui,
-                Some(rev),
-            )?;
-            Ok(format!(
-                "/consent?msg={}",
-                if done.saved { "consent" } else { "unchanged" }
             ))
         },
     )
@@ -2762,6 +2298,160 @@ pub async fn doctor(State(state): State<AppState>) -> Response {
     })
 }
 
+/// 保守履歴の表示用の行。登録中のリポジトリは状態 DB のキー（`crate::timing::repo_key`）で突き合わせる。
+fn run_views(config: &Config, page: &crate::runlog::Page) -> Vec<RunView> {
+    let keys: Vec<Option<String>> = config
+        .repository
+        .iter()
+        .map(|r| crate::timing::repo_key(FsPath::new(&r.root)))
+        .collect();
+    let short = views::short_sha;
+    page.rows
+        .iter()
+        .map(|row| {
+            let run = &row.run;
+            let index = keys
+                .iter()
+                .position(|k| k.as_deref() == Some(run.repo_root.as_str()));
+            // 旧版が残した行（proposed）も表示する。未知の結果は失敗扱いにせず、元の文字列を中立色で示す。
+            let (outcome, outcome_class): (String, &'static str) = match run.outcome.as_str() {
+                "committed" => (crate::t!("ui.runs.outcome.committed").into(), "published"),
+                "proposed" => (crate::t!("ui.runs.outcome.proposed").into(), "published"),
+                "unchanged" => (crate::t!("ui.runs.outcome.unchanged").into(), ""),
+                "rejected" => (crate::t!("ui.runs.outcome.rejected").into(), "warning"),
+                "held" => (crate::t!("ui.runs.outcome.held").into(), "warning"),
+                "unknown" => (crate::t!("ui.runs.outcome.unknown").into(), "status-fail"),
+                "failed" => (crate::t!("ui.runs.outcome.failed").into(), "status-fail"),
+                other => (views::redact(other), ""),
+            };
+            let range = match (run.base_commit.is_empty(), run.target_commit.is_empty()) {
+                (_, true) => String::new(),
+                (true, false) => short(&run.target_commit),
+                (false, false) => {
+                    format!("{}..{}", short(&run.base_commit), short(&run.target_commit))
+                }
+            };
+            RunView {
+                time: read::unix_text(if row.attempts > 1 {
+                    run.finished_at
+                } else {
+                    run.started_at
+                }),
+                attempts: row.attempts,
+                repo_label: run.repo_root.clone(),
+                repo_index: index,
+                origin: if run.origin == "run_now" {
+                    crate::t!("ui.runs.origin.run_now").to_string()
+                } else {
+                    crate::t!("ui.runs.origin.hook").to_string()
+                },
+                kinds: run.detail.kinds.join(crate::t!("list.separator")),
+                outcome,
+                outcome_class,
+                documents: run
+                    .detail
+                    .documents
+                    .iter()
+                    .map(|d| format!("{} +{} \u{2212}{}", d.path, d.added, d.removed))
+                    .collect(),
+                range,
+                result_short: short(&run.result_commit),
+                message: run
+                    .message
+                    .as_deref()
+                    .map(views::redact)
+                    .unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+const RUNS_PAGE_SIZE: usize = 50;
+
+#[derive(Deserialize, Default)]
+pub struct RunsQuery {
+    repo: Option<String>,
+    before: Option<String>,
+}
+
+/// 保守履歴（worker を起動した保守と失敗した回の記録）。閲覧だけで状態フォルダー・DB・ロックを作らない。
+pub async fn runs(State(state): State<AppState>, Query(q): Query<RunsQuery>) -> Response {
+    let invalid = || {
+        error_page(
+            &state,
+            StatusCode::BAD_REQUEST,
+            crate::t!("ui.error.runs_invalid"),
+            "/history",
+        )
+    };
+    let repo_filter = match q.repo.as_deref().filter(|v| !v.is_empty()) {
+        None => None,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) => Some(n),
+            Err(_) => return invalid(),
+        },
+    };
+    let before = match q.before.as_deref().filter(|v| !v.is_empty()) {
+        None => None,
+        Some(v) => match v.parse::<i64>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => return invalid(),
+        },
+    };
+    let s = state.clone();
+    let Ok(built) =
+        blocking(move || {
+            let cur = current(&s);
+            if repo_filter.is_some_and(|n| n >= cur.config.repository.len()) {
+                return None;
+            }
+            let page = match repo_filter {
+                // 解決できない（消えた）リポジトリは該当なし（絞り込まない全件を出さない）。
+                Some(n) => crate::runlog::load(
+                    crate::timing::repo_key(FsPath::new(&cur.config.repository[n].root))
+                        .as_deref()
+                        .or(Some("\0")),
+                    before,
+                    RUNS_PAGE_SIZE,
+                ),
+                None => crate::runlog::load(None, before, RUNS_PAGE_SIZE),
+            };
+            let repos =
+                std::iter::once(Choice::new(
+                    "",
+                    crate::t!("ui.runs.all_repos"),
+                    repo_filter.is_none(),
+                ))
+                .chain(cur.config.repository.iter().enumerate().map(|(i, r)| {
+                    Choice::new(i.to_string(), r.root.clone(), repo_filter == Some(i))
+                }))
+                .collect();
+            let next_href = page.next_before.map(|id| match repo_filter {
+                Some(n) => format!("/history?repo={n}&before={id}"),
+                None => format!("/history?before={id}"),
+            });
+            Some((
+                cur.broken.clone(),
+                run_views(&cur.config, &page),
+                repos,
+                next_href,
+            ))
+        })
+        .await
+    else {
+        return internal(&state, "/");
+    };
+    let Some((broken, rows, repos, next_href)) = built else {
+        return invalid();
+    };
+    html(RunsPage {
+        layout: layout(&state, crate::t!("ui.title.runs"), "history", None, broken),
+        rows,
+        repos,
+        next_href,
+    })
+}
+
 pub async fn history(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
     let cur = current(&state);
     let (rows, error) = match ops::history(&state.store) {
@@ -2782,7 +2472,7 @@ pub async fn history(State(state): State<AppState>, Query(q): Query<Msg>) -> Res
         layout: layout(
             &state,
             crate::t!("ui.title.history"),
-            "history",
+            "settings_history",
             q.msg.as_deref(),
             cur.broken,
         ),
@@ -2797,7 +2487,7 @@ pub async fn history_detail(State(state): State<AppState>, Path(id): Path<String
             &state,
             StatusCode::NOT_FOUND,
             crate::t!("ui.error.history_missing"),
-            "/history",
+            "/settings/history",
         );
     }
     let (bytes, loaded) = match ops::read_history(&state.store, &id) {
@@ -2807,7 +2497,7 @@ pub async fn history_detail(State(state): State<AppState>, Path(id): Path<String
                 &state,
                 StatusCode::NOT_FOUND,
                 crate::t!("ui.error.history_missing"),
-                "/history",
+                "/settings/history",
             );
         }
     };
@@ -2844,7 +2534,7 @@ pub async fn history_detail(State(state): State<AppState>, Path(id): Path<String
         layout: layout(
             &state,
             crate::t!("ui.title.history_entry"),
-            "history",
+            "settings_history",
             None,
             cur.broken,
         ),
@@ -2868,10 +2558,10 @@ pub async fn history_restore(
             &state,
             StatusCode::BAD_REQUEST,
             crate::t!("ui.error.history_invalid"),
-            "/history",
+            "/settings/history",
         );
     }
-    let back = format!("/history/{id}");
+    let back = format!("/settings/history/{id}");
     let restored = match ops::read_history(&state.store, &id) {
         Ok((_, Loaded::Ok(c))) => c,
         Ok(_) => {
@@ -2886,7 +2576,7 @@ pub async fn history_restore(
     };
     apply_change(
         &state,
-        "/history/restore",
+        "/settings/history/restore",
         &form,
         &back,
         Vec::new(),
@@ -2902,7 +2592,7 @@ pub async fn history_restore(
         move |s, rev| {
             let done = ops::restore(&s.store, &id, Some(rev))?;
             Ok(format!(
-                "/history?msg={}",
+                "/settings/history?msg={}",
                 if done.saved { "restored" } else { "unchanged" }
             ))
         },

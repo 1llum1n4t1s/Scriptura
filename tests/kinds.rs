@@ -470,16 +470,10 @@ template = "builtin"
 
     // Decision.kinds は documents と同じ順序で解決される（リポジトリ別の documents が優先）。
     let mut c = ok(text);
-    c.consent = Some(Consent {
-        version: CURRENT_CONSENT_VERSION,
-        accepted_at: "2026-01-01T00:00:00Z".into(),
-        source: ConsentSource::Cli,
-    });
     c.enrollment.policy = Policy::All;
     c.repository.push(Repository {
         root: "/r".into(),
         remote: None,
-        mode: Some(Mode::Propose),
         branches: vec![],
         documents: Some(vec![
             Document::Readme,
@@ -487,6 +481,7 @@ template = "builtin"
         ]),
         exclude: vec![],
         paused: false,
+        migrated_from: None,
     });
     let d = resolve_for_os(&c, std::path::Path::new("/r"), &[], "main", false);
     assert_eq!(

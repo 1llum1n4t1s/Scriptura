@@ -6,7 +6,7 @@
 //! 環境変数は各子プロセスにだけ渡すので、テスト同士は干渉しない（プロセス全体の環境は変えない）。
 //! fixture の置き場は `SCRIPTURA_TEST_BASE`（未指定なら既存テストと同じ `validation/`）。
 #![cfg(feature = "test-support")]
-use scriptura::config::{self, CURRENT_CONSENT_VERSION, Config, ConsentSource, Loaded, Mode};
+use scriptura::config::{self, Config, Loaded, MigratedFrom};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -97,6 +97,15 @@ impl Fx {
         fs::write(path.join("README.md"), "readme").unwrap();
         g(&["add", "."]);
         g(&["commit", "-m", "initial"]);
+    }
+
+    /// 専用の bare remote を持ち、main が upstream を持つ Git リポジトリ（enable できる状態）を作る。
+    fn make_pushed_repo(&self, path: &Path) {
+        self.make_repo(path);
+        let bare = path.with_extension("remote.git");
+        git_global(&["init", "--bare", "-b", "main", bare.to_str().unwrap()]);
+        git_in(path, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git_in(path, &["push", "-u", "origin", "main"]);
     }
 
     fn git(&self, args: &[&str]) -> String {
@@ -192,21 +201,13 @@ impl Fx {
         self.exec(args, &[], None, None)
     }
 
-    /// 既定のリポジトリで enable を実行する（同意つき・JSON 出力）。
+    /// 既定のリポジトリで enable を実行する（JSON 出力）。
     fn enable(&self, extra: &[&str]) -> Out {
         self.enable_repo(&self.repo, extra)
     }
 
     fn enable_repo(&self, repo: &Path, extra: &[&str]) -> Out {
-        let version = CURRENT_CONSENT_VERSION.to_string();
-        let mut args = vec![
-            "enable",
-            "--repo",
-            repo.to_str().unwrap(),
-            "--accept-consent",
-            &version,
-            "--json",
-        ];
+        let mut args = vec!["enable", "--repo", repo.to_str().unwrap(), "--json"];
         args.extend_from_slice(extra);
         self.run(&args)
     }
@@ -278,47 +279,77 @@ fn item<'a>(report: &'a Value, id: &str) -> &'a Value {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn enable_without_matching_consent_is_refused_and_writes_nothing() {
+fn removed_enable_options_and_commands_are_refused_with_a_dedicated_error() {
     let fx = Fx::new();
-    // 同意なし。
-    let out = fx.run(&["enable", "--repo", fx.repo.to_str().unwrap(), "--json"]);
-    assert_eq!(out.code, 1);
-    let v = out.json();
-    assert_eq!(v["ok"], false);
-    let message = v["error"].as_str().unwrap();
-    assert!(message.contains("--accept-consent"), "{message}");
-    assert!(
-        message.contains("Anthropic") && message.contains("料金"),
-        "{message}"
-    );
-    // 版が違う同意。
-    let out = fx.run(&[
-        "enable",
-        "--repo",
-        fx.repo.to_str().unwrap(),
-        "--accept-consent",
-        "999",
-        "--json",
-    ]);
-    assert_eq!(out.code, 1);
+    let repo = fx.repo.to_str().unwrap();
+    // 廃止した --mode と --accept-consent は、値の有無に関わらず専用のエラーで拒否し、何も書かない。
+    for extra in [
+        vec!["--mode", "push"],
+        vec!["--mode=propose"],
+        vec!["--accept-consent", "1"],
+        vec!["--accept-consent=1"],
+    ] {
+        let mut args = vec!["enable", "--repo", repo, "--json"];
+        args.extend(extra.iter());
+        let out = fx.run(&args);
+        assert_eq!(out.code, 1, "{extra:?}");
+        let message = out.json()["error"].as_str().unwrap().to_string();
+        assert!(
+            message.contains("廃止")
+                && message.contains(extra[0].trim_start_matches("--").split('=').next().unwrap()),
+            "{message}"
+        );
+        assert!(!message.contains("不明なオプション"), "{message}");
+    }
     assert!(!fx.config_path().exists());
     assert!(!fx.state_db().exists());
-    // --json なしは標準エラーへ日本語で出す。
-    let out = fx.run(&["enable", "--repo", fx.repo.to_str().unwrap()]);
+    // --json なしは標準エラーへ出す。
+    let out = fx.run(&["enable", "--repo", repo, "--mode", "push"]);
     assert_eq!(out.code, 1);
-    assert!(out.stdout.is_empty() && out.stderr.contains("--accept-consent"));
+    assert!(out.stdout.is_empty() && out.stderr.contains("廃止"));
+    // review / apply / discard は専用のエラー（引数があっても同じ）。残ったパッチは git apply へ案内する。
+    for command in ["review", "apply", "discard"] {
+        for extra in [vec![], vec!["--repo", repo], vec!["latest", "x"]] {
+            let mut args = vec![command, "--json"];
+            args.extend(extra.iter());
+            let out = fx.run(&args);
+            assert_eq!(out.code, 1, "{command} {extra:?}");
+            let message = out.json()["error"].as_str().unwrap().to_string();
+            assert!(
+                message.contains("廃止")
+                    && message.contains("git apply")
+                    && message.contains(command),
+                "{message}"
+            );
+        }
+    }
+    assert!(!fx.config_path().exists());
+    // 通常の未知のオプションは従来どおりのエラー。
+    let out = fx.run(&["enable", "--repo", repo, "--bogus", "x", "--json"]);
+    assert!(
+        out.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("不明なオプション")
+    );
 }
 
 #[test]
-fn enable_defaults_to_propose_and_creates_a_safe_config() {
+fn enable_registers_push_on_the_current_branch_and_creates_a_safe_config() {
     let fx = Fx::new();
     let out = fx.enable(&[]);
     assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
     let v = out.json();
     assert_eq!(v["ok"], true);
-    assert_eq!(v["mode"], "propose");
+    // mode・同意は出力に無い。
+    assert!(
+        v.get("mode").is_none() && v.get("consentVersion").is_none(),
+        "{v}"
+    );
     assert_eq!(v["paused"], false);
-    assert_eq!(v["branches"], json!([]));
+    assert_eq!(v["migratedFrom"], Value::Null);
+    // 既定のブランチは現在のブランチだけ。
+    assert_eq!(v["branches"], json!(["main"]));
     assert_eq!(
         v["documents"],
         json!(["AGENTS.md", "DESIGN.md", "README.md"])
@@ -331,11 +362,26 @@ fn enable_defaults_to_propose_and_creates_a_safe_config() {
     ));
     let config = fx.config();
     assert_eq!(config.enrollment.policy, config::Policy::Explicit);
-    let consent = config.consent.clone().unwrap();
-    assert_eq!(consent.version, CURRENT_CONSENT_VERSION);
-    assert_eq!(consent.source, ConsentSource::Cli);
+    assert_eq!(config.schema, 3);
+    assert!(
+        fs::read_to_string(fx.config_path())
+            .unwrap()
+            .contains("schema = 3")
+    );
     assert_eq!(config.repository.len(), 1);
-    assert_eq!(config.repository[0].mode, Some(Mode::Propose));
+    assert_eq!(config.repository[0].branches, vec!["main".to_string()]);
+    // 人が読む形式にも mode は出ない。
+    let human = fx.run(&["enable", "--repo", fx.repo.to_str().unwrap()]);
+    assert_eq!(human.code, 0, "{}", human.stderr);
+    assert!(
+        human.stdout.contains("ブランチ") && !human.stdout.contains("モード"),
+        "{}",
+        human.stdout
+    );
+    // 明示したブランチはそのまま使う。
+    let v = fx.enable(&["--branches", "main, release/1"]).json();
+    assert_eq!(v["branches"], json!(["main", "release/1"]));
+    assert_eq!(fx.enable(&["--branches", ","]).code, 1);
     // サブフォルダーを指定しても Git ルートへ正規化される。
     fs::create_dir_all(fx.repo.join("sub")).unwrap();
     let out = fx.enable_repo(&fx.repo.join("sub"), &[]);
@@ -348,21 +394,16 @@ fn enable_keeps_other_registrations_and_settings_and_leaves_no_temp_files() {
     let fx = Fx::new();
     let other = fx.base.join("other-repo");
     let mut seed = Config::default();
-    seed.consent = Some(config::Consent {
-        version: CURRENT_CONSENT_VERSION,
-        accepted_at: "2026-01-01T00:00:00Z".into(),
-        source: ConsentSource::Cli,
-    });
     seed.worker.timeout_secs = 300;
     seed.defaults.exclude = vec!["private/**".into()];
     seed.repository.push(config::Repository {
         root: other.to_string_lossy().into_owned(),
         remote: None,
-        mode: Some(Mode::Push),
         branches: vec!["release".into()],
         documents: None,
         exclude: vec![],
         paused: true,
+        migrated_from: None,
     });
     config::save_to(&fx.config_path(), &seed).unwrap();
     let out = fx.enable(&["--documents", "README.md,agents.md"]);
@@ -370,8 +411,6 @@ fn enable_keeps_other_registrations_and_settings_and_leaves_no_temp_files() {
     let config = fx.config();
     assert_eq!(config.worker.timeout_secs, 300);
     assert_eq!(config.defaults.exclude, vec!["private/**".to_string()]);
-    // 既存の同意（accepted_at）は上書きしない。
-    assert_eq!(config.consent.unwrap().accepted_at, "2026-01-01T00:00:00Z");
     assert_eq!(config.repository.len(), 2);
     assert_eq!(config.repository[0].root, other.to_string_lossy());
     assert!(config.repository[0].paused);
@@ -381,10 +420,10 @@ fn enable_keeps_other_registrations_and_settings_and_leaves_no_temp_files() {
         Some(vec![config::Document::Readme, config::Document::Agents])
     );
     // 再実行は同じ登録を更新する（重複しない）。一時ファイルも残らない。
-    assert_eq!(fx.enable(&["--mode", "off"]).code, 0);
+    assert_eq!(fx.enable(&["--branches", "release"]).code, 0);
     let config = fx.config();
     assert_eq!(config.repository.len(), 2);
-    assert_eq!(config.repository[1].mode, Some(Mode::Off));
+    assert_eq!(config.repository[1].branches, vec!["release".to_string()]);
     let leftovers: Vec<_> = fs::read_dir(&fx.base)
         .unwrap()
         .flatten()
@@ -402,7 +441,7 @@ fn enable_keeps_other_registrations_and_settings_and_leaves_no_temp_files() {
         );
     }
     assert_eq!(fs::read_to_string(&fx.config_path()).unwrap(), before);
-    // CHANGELOG.md は組み込みの種類として受け付ける（大文字小文字は区別しない）。使うと schema 2 で保存される。
+    // CHANGELOG.md は組み込みの種類として受け付ける（大文字小文字は区別しない）。
     let out = fx.enable(&["--documents", "readme.md,Changelog.md"]);
     assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
     assert_eq!(
@@ -416,28 +455,26 @@ fn enable_keeps_other_registrations_and_settings_and_leaves_no_temp_files() {
     assert!(
         fs::read_to_string(&fx.config_path())
             .unwrap()
-            .contains("schema = 2")
+            .contains("schema = 3")
     );
 }
 
 #[test]
-fn enable_keeps_a_consent_recorded_in_the_ui_and_records_history() {
-    // 管理画面（ui）で記録した同意は、CLI の enable で上書きしない（出所・時刻とも保つ）。
+fn enable_records_history_and_restarts_a_registration_stopped_by_the_migration() {
+    // 旧形式（同意なし・propose）の設定は、enable で読まれるときに変換され、止めた登録は enable が解除する。
     let fx = Fx::new();
-    let mut seed = Config::default();
-    seed.consent = Some(config::Consent {
-        version: CURRENT_CONSENT_VERSION,
-        accepted_at: "2026-02-02T00:00:00Z".into(),
-        source: ConsentSource::Ui,
-    });
-    config::save_to(&fx.config_path(), &seed).unwrap();
-    let before = fs::read(fx.config_path()).unwrap();
+    let repo = fx.repo.to_string_lossy().replace('\\', "/");
+    let old = format!("[defaults]\nmode = \"propose\"\n[[repository]]\nroot = \"{repo}\"\n");
+    fs::write(fx.config_path(), &old).unwrap();
     let out = fx.enable(&[]);
     assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
     assert_eq!(out.json()["created"], false);
-    let consent = fx.config().consent.unwrap();
-    assert_eq!(consent.source, ConsentSource::Ui);
-    assert_eq!(consent.accepted_at, "2026-02-02T00:00:00Z");
+    assert_eq!(out.json()["migratedFrom"], Value::Null);
+    let config = fx.config();
+    assert_eq!(config.repository.len(), 1);
+    assert!(!config.repository[0].paused);
+    assert_eq!(config.repository[0].migrated_from, None);
+    assert_eq!(config.schema, 3);
     // CLI の変更も設定ロックと変更履歴を通る（状態フォルダーに直前の内容が退避される）。
     let history = fx.base.join("state").join("config-history");
     let saved: Vec<_> = fs::read_dir(&history)
@@ -445,37 +482,16 @@ fn enable_keeps_a_consent_recorded_in_the_ui_and_records_history() {
         .flatten()
         .map(|e| fs::read(e.path()).unwrap())
         .collect();
-    assert_eq!(saved, vec![before]);
+    assert_eq!(saved, vec![old.into_bytes()]);
 }
 
 #[test]
-fn push_mode_is_explicit_and_defaults_to_the_current_branch() {
-    let fx = Fx::new();
-    assert_eq!(fx.enable(&[]).json()["mode"], "propose");
-    let out = fx.enable(&["--mode", "push"]);
-    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
-    let v = out.json();
-    assert_eq!(v["mode"], "push");
-    assert_eq!(v["branches"], json!(["main"]));
-    let repo = &fx.config().repository[0];
-    assert_eq!(repo.mode, Some(Mode::Push));
-    assert_eq!(repo.branches, vec!["main".to_string()]);
-    // 明示したブランチはそのまま使う。
-    let v = fx
-        .enable(&["--mode", "push", "--branches", "main, release/1"])
-        .json();
-    assert_eq!(v["branches"], json!(["main", "release/1"]));
-    // 不正なモードは拒否。
-    assert_eq!(fx.enable(&["--mode", "force"]).code, 1);
-}
-
-#[test]
-fn push_mode_without_remote_or_upstream_is_refused() {
+fn enable_without_remote_or_upstream_is_refused() {
     let fx = Fx::new();
     // remote が無い。
     let bare_less = fx.base.join("no-remote");
     fx.make_repo(&bare_less);
-    let out = fx.enable_repo(&bare_less, &["--mode", "push"]);
+    let out = fx.enable_repo(&bare_less, &[]);
     assert_eq!(out.code, 1);
     assert!(out.json()["error"].as_str().unwrap().contains("remote"));
     // remote はあるが現在のブランチに upstream が無い。
@@ -490,18 +506,19 @@ fn push_mode_without_remote_or_upstream_is_refused() {
             fx.base.join("remote.git").to_str().unwrap(),
         ],
     );
-    let out = fx.enable_repo(&no_upstream, &["--mode", "push"]);
+    let out = fx.enable_repo(&no_upstream, &[]);
     assert_eq!(out.code, 1);
     assert!(out.json()["error"].as_str().unwrap().contains("upstream"));
     // --branches を明示しても upstream は必須。
-    let out = fx.enable_repo(&no_upstream, &["--mode", "push", "--branches", "main"]);
+    let out = fx.enable_repo(&no_upstream, &["--branches", "main"]);
     assert_eq!(out.code, 1);
     assert!(out.json()["error"].as_str().unwrap().contains("upstream"));
+    // detached HEAD も受け付けない。
+    git_in(&no_upstream, &["checkout", "--detach"]);
+    let out = fx.enable_repo(&no_upstream, &[]);
+    assert_eq!(out.code, 1);
+    assert!(out.json()["error"].as_str().unwrap().contains("HEAD"));
     assert!(!fx.config_path().exists(), "拒否したときは設定を作らない");
-    // propose なら remote が無くても登録できる（remote は記録しない）。
-    let out = fx.enable_repo(&bare_less, &[]);
-    assert_eq!(out.code, 0, "{}", out.stderr);
-    assert!(fx.config().repository[0].remote.is_none());
 }
 
 #[test]
@@ -613,8 +630,47 @@ fn disable_pause_and_resume_update_the_registration() {
     assert_eq!(out.json()["removed"], true);
     assert!(fx.config().repository.is_empty());
     assert_eq!(fx.run(&["disable", "--repo", repo, "--json"]).code, 1);
-    // 同意は残る（登録だけ消える）。
-    assert!(fx.config().consent.is_some());
+    // 登録だけが消え、設定は schema 3 のまま残る。
+    assert_eq!(fx.config().schema, 3);
+}
+
+#[test]
+fn migrated_registrations_cannot_be_resumed_from_the_cli() {
+    // 旧形式からの移行で止めた登録は resume では再開できず、enable で有効化し直す。
+    let fx = Fx::new();
+    let repo = fx.repo.to_str().unwrap();
+    let root = fx.repo.to_string_lossy().replace('\\', "/");
+    fs::write(
+        fx.config_path(),
+        format!("[[repository]]\nroot = \"{root}\"\n"),
+    )
+    .unwrap();
+    // 読み取り（status）は変換した結果を示し、ファイルは書き換えない。
+    let before = fs::read(fx.config_path()).unwrap();
+    let v = fx.run(&["status", "--json"]).json();
+    assert_eq!(v["legacy"]["fromSchema"], 1);
+    assert_eq!(v["legacy"]["stopped"], 1);
+    assert_eq!(v["repositories"][0]["paused"], true);
+    assert_eq!(v["repositories"][0]["migratedFrom"], "unconsented");
+    let human = fx.run(&["status"]).stdout;
+    assert!(
+        human.contains("unconsented") && human.contains("旧形式"),
+        "{human}"
+    );
+    assert_eq!(fs::read(fx.config_path()).unwrap(), before);
+    let out = fx.run(&["resume", "--repo", repo, "--json"]);
+    assert_eq!(out.code, 1);
+    assert!(out.json()["error"].as_str().unwrap().contains("enable"));
+    // 拒否では変換結果を保存しない。enable で解除すると新形式で保存される。
+    assert_eq!(fs::read(fx.config_path()).unwrap(), before);
+    assert_eq!(fx.enable(&[]).code, 0);
+    let config = fx.config();
+    assert_eq!(config.repository[0].migrated_from, None);
+    assert!(!config.repository[0].paused);
+    let v = fx.run(&["status", "--json"]).json();
+    assert_eq!(v["legacy"], Value::Null);
+    assert_eq!(v["repositories"][0]["migratedFrom"], Value::Null);
+    let _ = MigratedFrom::Off;
 }
 
 // ---------------------------------------------------------------------------
@@ -628,8 +684,11 @@ fn status_json_reports_config_repositories_and_worker_without_secrets() {
     assert_eq!(v["ok"], true);
     assert_eq!(v["config"]["state"], "missing");
     assert_eq!(v["repositories"], json!([]));
-    assert_eq!(v["consent"], Value::Null);
-    assert_eq!(v["proposals"], json!({"pending": 0, "applied": 0}));
+    assert!(
+        v.get("consent").is_none() && v.get("proposals").is_none(),
+        "{v}"
+    );
+    assert_eq!(v["legacy"], Value::Null);
     assert!(v["version"].is_string() && v["installed"].is_boolean());
     // 導入の形（既存の installed は単独 install の有無のまま。新しいキー installForm が実行中の形を表す）。
     // テストのビルドは Velopack 管理下でも単独導入でもないので other。
@@ -650,16 +709,16 @@ fn status_json_reports_config_repositories_and_worker_without_secrets() {
         v["config"]["path"].as_str().unwrap(),
         fx.config_path()
     ));
-    assert_eq!(v["consent"]["version"], CURRENT_CONSENT_VERSION);
-    assert_eq!(v["consent"]["source"], "cli");
-    assert_eq!(v["consent"]["current"], true);
     assert_eq!(v["policy"], "explicit");
-    assert_eq!(v["defaults"]["mode"], "propose");
+    assert!(v["defaults"].get("mode").is_none(), "{v}");
     let repo = &v["repositories"][0];
-    assert_eq!(repo["mode"], "propose");
+    assert!(
+        repo.get("mode").is_none() && repo.get("proposals").is_none(),
+        "{repo}"
+    );
     assert_eq!(repo["paused"], false);
+    assert_eq!(repo["migratedFrom"], Value::Null);
     assert_eq!(repo["branches"], json!(["main"]));
-    assert_eq!(repo["proposals"], json!({"pending": 0, "applied": 0}));
     for key in ["model", "effort", "timeoutSecs", "permission", "claudePath"] {
         assert!(v["worker"].get(key).is_some(), "worker.{key}");
     }
@@ -765,7 +824,20 @@ fn doctor_detects_not_logged_in_and_missing_claude() {
     assert_eq!(item(&v, "claudeAuth")["status"], "ok");
     assert_eq!(item(&v, "claude")["status"], "ok");
     assert_eq!(item(&v, "config")["status"], "ok");
-    assert_eq!(item(&v, "consent")["status"], "ok");
+    assert!(
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["id"] != "consent")
+    );
+    assert!(
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["id"] != "configLegacy")
+    );
     assert_eq!(item(&v, "stateDir")["status"], "ok");
 
     // claude が見つからない（設定の claude_path が存在しない）。認証確認は行わない。
@@ -810,16 +882,64 @@ fn doctor_reports_config_problems_and_does_not_create_the_state_dir() {
     let out = fx.run(&["doctor", "--json"]);
     assert_eq!(out.code, 1);
     assert_eq!(item(&out.json(), "config")["status"], "fail");
-    // 同意の版が古い。
-    let mut config = Config::default();
-    config.consent = Some(config::Consent {
-        version: 0,
-        accepted_at: "2026-01-01T00:00:00Z".into(),
-        source: ConsentSource::Cli,
-    });
-    config::save_to(&fx.config_path(), &config).unwrap();
+    // 旧形式（同意なし）の設定: 変換して読めるので config は ok、旧形式と移行で止めた登録の警告が出る。
+    // doctor は設定を書き換えない。
+    let root = fx.repo.to_string_lossy().replace('\\', "/");
+    let old = format!("[defaults]\nmode = \"propose\"\n[[repository]]\nroot = \"{root}\"\n");
+    fs::write(fx.config_path(), &old).unwrap();
     let v = fx.run(&["doctor", "--json"]).json();
-    assert_eq!(item(&v, "consent")["status"], "warn");
+    assert_eq!(item(&v, "config")["status"], "ok");
+    assert_eq!(item(&v, "configLegacy")["status"], "warn");
+    assert_eq!(item(&v, "migratedStopped")["status"], "warn");
+    assert!(
+        item(&v, "migratedStopped")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("enable")
+    );
+    assert_eq!(fs::read_to_string(fx.config_path()).unwrap(), old);
+    // 新形式に保存し直されても、移行で止めた登録は警告し続ける（旧形式の警告は消える）。
+    assert_eq!(
+        fx.run(&["pause", "--repo", fx.repo.to_str().unwrap()]).code,
+        0
+    );
+    let v = fx.run(&["doctor", "--json"]).json();
+    assert!(
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["id"] != "configLegacy")
+    );
+    assert_eq!(item(&v, "migratedStopped")["status"], "warn");
+}
+
+#[test]
+fn doctor_reports_leftover_proposal_patches_without_touching_them() {
+    let fx = Fx::new();
+    // 廃止した更新案が残した <state>/proposals/<リポジトリ>/*.patch。読みも消しもせず、件数だけを知らせる。
+    let v = fx.run(&["doctor", "--json"]).json();
+    assert!(
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["id"] != "legacyProposals")
+    );
+    let dir = fx.base.join("state").join("proposals").join("abcd");
+    fs::create_dir_all(&dir).unwrap();
+    for name in ["a.patch", "b.patch", "a.json"] {
+        fs::write(dir.join(name), "x").unwrap();
+    }
+    let v = fx.run(&["doctor", "--json"]).json();
+    let leftover = item(&v, "legacyProposals");
+    assert_eq!(leftover["status"], "info");
+    let detail = leftover["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("2") && detail.contains("git apply") && detail.contains("proposals"),
+        "{detail}"
+    );
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 3);
 }
 
 #[test]
@@ -1040,7 +1160,7 @@ fn connect_remove_does_not_rewrite_broken_settings_or_create_files_when_absent()
 }
 
 // ---------------------------------------------------------------------------
-// run-now / review / apply
+// run-now
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1052,7 +1172,7 @@ fn run_now_refuses_unregistered_repositories_and_missing_config() {
     assert_eq!(out.json()["ok"], false);
     // 別のリポジトリだけ登録 → こちらは未登録で拒否（worker は呼ばれない）。
     let other = fx.base.join("other");
-    fx.make_repo(&other);
+    fx.make_pushed_repo(&other);
     assert_eq!(fx.enable_repo(&other, &[]).code, 0);
     let out = fx.exec(&["run-now", "--json"], &[], None, Some(&fx.repo));
     assert_eq!(out.code, 1);
@@ -1067,33 +1187,29 @@ fn run_now_refuses_unregistered_repositories_and_missing_config() {
     let out = fx.exec(&["run-now", "--json"], &[], None, Some(&fx.repo));
     assert_eq!(out.code, 1);
     assert!(out.json()["error"].as_str().unwrap().contains("一時停止"));
-    // 同意が古い設定も拒否（enable では版を満たすので、設定を直接書き換える）。
+    // 旧形式からの移行で止めた登録も拒否し、enable での有効化し直しを案内する（worker は呼ばれない）。
     assert_eq!(
         fx.run(&["resume", "--repo", fx.repo.to_str().unwrap()])
             .code,
         0
     );
     let mut config = fx.config();
-    config.consent.as_mut().unwrap().version = 0;
+    let mine = config.repository.last_mut().unwrap();
+    mine.paused = true;
+    mine.migrated_from = Some(MigratedFrom::Propose);
     config::save_to(&fx.config_path(), &config).unwrap();
     let out = fx.exec(&["run-now", "--json"], &[], None, Some(&fx.repo));
     assert_eq!(out.code, 1);
-    assert!(out.json()["error"].as_str().unwrap().contains("同意"));
+    assert!(out.json()["error"].as_str().unwrap().contains("enable"));
+    assert!(!fx.base.join("prompt.json").exists());
 }
 
 #[test]
-fn run_now_creates_a_proposal_that_review_and_apply_delegate_to() {
+fn run_now_commits_and_pushes_the_documents() {
     let fx = Fx::new();
     assert_eq!(fx.enable(&[]).code, 0);
     fx.push_change("a change worth documenting");
-    let readme = fx.repo.join("README.md");
     let writes = json!({"README.md": "updated readme\n"}).to_string();
-
-    // review: 更新案が無い間は空の一覧（失敗ではない）。
-    let out = fx.exec(&["review", "--json"], &[], None, Some(&fx.repo));
-    assert_eq!(out.code, 0);
-    assert_eq!(out.json()["proposals"], json!([]));
-
     let out = fx.exec(
         &["run-now", "--json"],
         &[("HOOK_STUB_WRITES", &writes)],
@@ -1102,100 +1218,45 @@ fn run_now_creates_a_proposal_that_review_and_apply_delegate_to() {
     );
     assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
     let v = out.json();
-    assert_eq!(v["outcome"], "created");
-    let sha = v["sha"].as_str().unwrap().to_string();
-    assert!(Path::new(v["patchPath"].as_str().unwrap()).is_file());
-    assert_eq!(
-        fs::read_to_string(&readme).unwrap(),
-        "readme",
-        "propose は作業ツリーを変えない"
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["outcome"], "completed");
+    assert!(
+        v.get("mode").is_none() && v.get("sha").is_none() && v.get("patchPath").is_none(),
+        "{v}"
     );
-
-    // review は diffstat・パッチのパス・対象文書を返す。
-    let v = fx
-        .exec(&["review", "--json"], &[], None, Some(&fx.repo))
-        .json();
-    assert_eq!(v["sha"], sha);
-    assert_eq!(v["documents"], json!(["README.md"]));
-    assert!(v["diffstat"].as_str().unwrap().contains("README.md"));
-    assert!(Path::new(v["patchPath"].as_str().unwrap()).is_file());
-    assert_eq!(v["proposals"].as_array().unwrap().len(), 1);
-    // sha の前方指定でも選べる。
-    let v = fx
-        .exec(&["review", &sha[..8], "--json"], &[], None, Some(&fx.repo))
-        .json();
-    assert_eq!(v["sha"], sha);
-    // status の件数にも反映される。
+    // 文書は commit され、remote へ push 済み（更新案は作られない）。
     assert_eq!(
-        fx.run(&["status", "--json"]).json()["proposals"]["pending"],
-        1
-    );
-
-    // 対象文書に未コミットの変更があれば apply は拒否し、理由をそのまま出す。
-    fs::write(&readme, "local edit").unwrap();
-    let out = fx.exec(&["apply", "--json"], &[], None, Some(&fx.repo));
-    assert_eq!(out.code, 1);
-    assert!(out.json()["error"].as_str().unwrap().contains("未コミット"));
-    assert_eq!(fs::read_to_string(&readme).unwrap(), "local edit");
-    fx.git(&["checkout", "--", "README.md"]);
-
-    // 適用。stage はしない。
-    let out = fx.exec(&["apply", "--json"], &[], None, Some(&fx.repo));
-    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
-    let v = out.json();
-    assert_eq!(v["files"], json!(["README.md"]));
-    assert_eq!(v["staged"], false);
-    assert_eq!(
-        fs::read_to_string(&readme).unwrap().replace("\r\n", "\n"),
+        fs::read_to_string(fx.repo.join("README.md"))
+            .unwrap()
+            .replace("\r\n", "\n"),
         "updated readme\n"
     );
-    assert!(
-        fx.git(&["diff", "--cached", "--name-only"])
-            .trim()
-            .is_empty()
-    );
-    // 適用済みを再適用しようとすると拒否。
-    assert_eq!(
-        fx.exec(&["apply", "--json"], &[], None, Some(&fx.repo))
-            .code,
-        1
-    );
-    assert_eq!(
-        fx.run(&["status", "--json"]).json()["proposals"],
-        json!({"pending": 0, "applied": 1})
-    );
-}
-
-#[test]
-fn discard_removes_a_proposal_and_unknown_selectors_are_refused() {
-    let fx = Fx::new();
-    assert_eq!(fx.enable(&[]).code, 0);
-    fx.push_change("another change");
-    let writes = json!({"README.md": "discard me\n"}).to_string();
+    let head = fx.git(&["rev-parse", "HEAD"]).trim().to_string();
+    assert_eq!(fx.git(&["rev-parse", "origin/main"]).trim(), head);
+    assert!(fx.git(&["status", "--porcelain"]).trim().is_empty());
+    assert!(!fx.base.join("state").join("proposals").exists());
+    // 保守履歴: run-now は契機 run_now の committed として 1 行残る。
+    {
+        let db = rusqlite::Connection::open(fx.state_db()).unwrap();
+        let rows = scriptura::runlog::load_from(&db, None, None, 10)
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].run.origin, "run_now");
+        assert_eq!(rows[0].run.outcome, "committed");
+        assert_eq!(rows[0].run.result_commit, head);
+    }
+    // 人が読む形式。
+    fx.push_change("one more change");
+    let writes = json!({"README.md": "updated readme again\n"}).to_string();
     let out = fx.exec(
-        &["run-now", "--json"],
+        &["run-now"],
         &[("HOOK_STUB_WRITES", &writes)],
         None,
         Some(&fx.repo),
     );
     assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
-    assert_eq!(
-        fx.exec(&["review", "zzzz", "--json"], &[], None, Some(&fx.repo))
-            .code,
-        1
-    );
-    let out = fx.exec(&["discard", "--json"], &[], None, Some(&fx.repo));
-    assert_eq!(out.code, 0, "{}", out.stderr);
-    assert_eq!(out.json()["discarded"], true);
-    assert_eq!(
-        fx.run(&["status", "--json"]).json()["proposals"]["pending"],
-        0
-    );
-    // 余分な引数・不明なオプションは JSON のエラーで返る。
-    let out = fx.run(&["review", "a", "b", "--json"]);
-    assert_eq!(out.code, 1);
-    assert_eq!(out.json()["ok"], false);
-    assert_eq!(fx.run(&["status", "--bogus"]).code, 1);
+    assert!(out.stdout.contains("push"), "{}", out.stdout);
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,7 +1336,7 @@ fn docs_list_and_show_report_resolved_kinds_read_only() {
     let v = out.json();
     assert_eq!(v["ok"], true);
     assert_eq!(v["registered"], true);
-    assert_eq!(v["mode"], "propose");
+    assert!(v.get("mode").is_none(), "{v}");
     let ids: Vec<&str> = v["kinds"]
         .as_array()
         .unwrap()
@@ -1457,8 +1518,7 @@ fn run_now_documents_narrows_the_kinds_and_refuses_unknown_or_disabled_ones() {
     );
     assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
     let v = out.json();
-    assert_eq!(v["outcome"], "created");
-    assert_eq!(v["documents"], json!(["README.md"]));
+    assert_eq!(v["outcome"], "completed");
     let sent = fs::read_to_string(&prompt).unwrap();
     assert!(sent.contains("README.md"));
     assert!(
@@ -1495,7 +1555,7 @@ fn run_now_documents_narrows_the_kinds_and_refuses_unknown_or_disabled_ones() {
 }
 
 #[test]
-fn run_now_reports_a_rejected_proposal_as_its_own_outcome() {
+fn run_now_fails_without_committing_when_the_post_maintenance_checks_are_violated() {
     let fx = Fx::new();
     // README の上限を 5 文字にする。worker が長い README を書くと保守後の検査に違反する。
     define_kinds(&fx, |c| {
@@ -1509,6 +1569,7 @@ fn run_now_reports_a_rejected_proposal_as_its_own_outcome() {
     });
     assert_eq!(fx.enable(&["--documents", "README.md"]).code, 0);
     fx.push_change("rejected change");
+    let head = fx.git(&["rev-parse", "HEAD"]).trim().to_string();
     let writes = json!({"README.md": "this readme is far too long\n"}).to_string();
     let out = fx.exec(
         &["run-now", "--json"],
@@ -1516,32 +1577,15 @@ fn run_now_reports_a_rejected_proposal_as_its_own_outcome() {
         None,
         Some(&fx.repo),
     );
-    // 失敗ではない（終了コード 0）。専用の outcome と理由を返し、更新案は作られない。
-    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
+    // 検査に違反した結果は commit せず、失敗として理由を返す（更新案という結果は無い）。
+    assert_eq!(out.code, 1, "{}{}", out.stdout, out.stderr);
     let v = out.json();
-    assert_eq!(v["ok"], true);
-    assert_eq!(v["outcome"], "rejected");
-    assert!(v["reason"].as_str().unwrap().contains("README.md"), "{v}");
-    assert!(v["reason"].as_str().unwrap().contains("上限"), "{v}");
-    assert!(v.get("error").is_none() && v.get("patchPath").is_none());
-    assert_eq!(
-        fx.run(&["status", "--json"]).json()["proposals"]["pending"],
-        0
-    );
-    // 人が読む形式でも理由が出る。同じ push の run-now は棄却を無視して作り直すので、もう一度棄却される。
-    let out = fx.exec(
-        &["run-now"],
-        &[("HOOK_STUB_WRITES", &writes)],
-        None,
-        Some(&fx.repo),
-    );
-    assert_eq!(out.code, 0, "{}{}", out.stdout, out.stderr);
-    assert!(
-        out.stdout.contains("更新案を作成しませんでした"),
-        "{}",
-        out.stdout
-    );
-    assert!(out.stdout.contains("上限"), "{}", out.stdout);
+    assert_eq!(v["ok"], false);
+    let error = v["error"].as_str().unwrap();
+    assert!(error.contains("README.md") && error.contains("上限"), "{v}");
+    assert_eq!(fx.git(&["rev-parse", "HEAD"]).trim(), head, "commit しない");
+    assert_eq!(fx.git(&["rev-parse", "origin/main"]).trim(), head);
+    assert!(!fx.base.join("state").join("proposals").exists());
 }
 
 #[test]
@@ -1597,14 +1641,8 @@ fn doctor_reports_kinds_templates_limits_and_changelog_notes() {
             .unwrap()
             .contains("README.md")
     );
-    // propose モードなので CHANGELOG の競合注意は出ない。
-    assert!(
-        v["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|i| i["id"] != "kindsChangelog")
-    );
+    // CHANGELOG を保守する有効な登録があるので、リリース作業との競合の注意（info）が出る。
+    assert_eq!(item(&v, "kindsChangelog")["status"], "info");
 
     // テンプレートが無い種類が有効なら fail（保守が見送られ続ける）。
     fs::remove_file(fx.base.join("templates").join("architecture.md")).unwrap();
@@ -1619,10 +1657,9 @@ fn doctor_reports_kinds_templates_limits_and_changelog_notes() {
             .contains("architecture")
     );
 
-    // どの登録でも有効でなければ warn。push モードで CHANGELOG を保守する登録があれば注意（info）。
+    // どの登録でも有効でなければ warn。CHANGELOG を保守する有効な登録があれば注意（info）。
     define_kinds(&fx, |c| {
         c.repository[0].documents = Some(vec![config::Document::Changelog]);
-        c.repository[0].mode = Some(Mode::Push);
     });
     let out = fx.run(&["doctor", "--json"]);
     let v = out.json();

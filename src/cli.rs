@@ -1,6 +1,7 @@
 // 利用者向けの CLI コマンド（enable / disable / pause / resume / status / doctor / run-now /
-// review / apply / discard / docs / update / uninstall-setup）。プラグインのスキルは `scriptura <cmd> --json` でこれらを呼ぶ薄い層で、
-// 判断はすべてここ（と config / proposal / maintenance）に置く。
+// docs / update / uninstall-setup。廃止した review / apply / discard は専用のエラーを返す）。
+// プラグインのスキルは `scriptura <cmd> --json` でこれらを呼ぶ薄い層で、
+// 判断はすべてここ（と config / maintenance）に置く。
 //
 // 設計上の要点:
 // - すべてのコマンドで `--json`。JSON は常に 1 つのオブジェクトで、成功は `{"ok":true,...}`、
@@ -9,17 +10,16 @@
 // - 設定の変更は `ops` 経由で `config::update_in`（設定ロック・変更履歴・アトミック保存）だけを通り、
 //   壊れた設定（Invalid）は書き換えずに失敗する。CLI は期待する版を渡さない（None）。
 //   リポジトリ内のファイルから有効化・設定を読むことはしない（config.rs の契約）。
-// - 既定は安全側: mode は propose、push は `--mode push` を明示したときだけ。同意は
-//   `--accept-consent <現行の版>` が無ければ拒否し、送信データと費用の説明を出して再実行を案内する。
+// - 有効化は常に push（文書を commit して push する）。remote・upstream が無いリポジトリは登録できない。
+//   廃止した `--mode` と `--accept-consent` は専用のエラーで拒否する。
 // - enable は有効化前の push を処理しないよう、登録を保存する前に `maintenance::baseline` で起点を記録する
 //   （`ops::enable`）。
 // - 出力に秘密値を入れない（パス・設定の要約・件数だけ）。
 use crate::{
     app, app_update,
-    config::{self, CURRENT_CONSENT_VERSION, Config, ConsentSource, Document, Loaded, Mode, Store},
+    config::{self, Config, Document, Loaded, Store},
     doctor,
     ops::{self, EnableRequest, RunNow},
-    proposal,
 };
 use serde_json::{Value, json};
 use std::{
@@ -36,6 +36,7 @@ pub const COMMANDS: &[&str] = &[
     "status",
     "doctor",
     "run-now",
+    // 廃止（更新案の廃止）。専用のエラーを返す。
     "review",
     "apply",
     "discard",
@@ -57,11 +58,6 @@ pub struct Reply {
 
 type R = Result<Value, String>;
 
-/// 同意の説明（1 行）。送信データと費用を明示し、再実行の方法を案内する。
-fn consent_notice() -> String {
-    crate::t!("cli.consent.notice", version = CURRENT_CONSENT_VERSION)
-}
-
 // ---------------------------------------------------------------------------
 // 引数の解析
 // ---------------------------------------------------------------------------
@@ -76,17 +72,12 @@ struct Parsed {
 /// コマンドごとの (値を取るオプション, 値を取らないオプション, 位置引数の最大数)。
 fn spec(command: &str) -> (&'static [&'static str], &'static [&'static str], usize) {
     match command {
-        "enable" => (
-            &["repo", "mode", "branches", "documents", "accept-consent"],
-            &[],
-            0,
-        ),
+        "enable" => (&["repo", "branches", "documents"], &[], 0),
         "disable" | "pause" | "resume" => (&["repo"], &[], 0),
         "run-now" => (&["repo", "documents"], &[], 0),
         // docs <list|show> [<id>]
         "docs" => (&["repo"], &[], 2),
         "doctor" => (&[], &["verify"], 0),
-        "review" | "apply" | "discard" => (&["repo"], &[], 1),
         // update [--check] [--auto on|off]（Setup 版の自動更新の表示・確認・設定）
         "update" => (&["auto"], &["check"], 0),
         // uninstall-setup [--apply]（Setup 版の登録の解除。macOS・Linux のアンインストール手順）
@@ -113,6 +104,8 @@ fn parse(command: &str, args: &[String]) -> Result<Parsed, String> {
             };
             if name == "json" && inline.is_none() {
                 parsed.json = true;
+            } else if command == "enable" && ["mode", "accept-consent"].contains(&name) {
+                return Err(crate::t!("cli.option_removed", name = name));
             } else if bool_flags.contains(&name) && inline.is_none() {
                 parsed.flags.insert(name.to_string());
             } else if value_flags.contains(&name) {
@@ -149,25 +142,26 @@ fn parse(command: &str, args: &[String]) -> Result<Parsed, String> {
 pub fn run(command: &str, args: &[String]) -> Reply {
     // 引数が壊れていても `--json` が指定されていれば JSON で返せるよう、先に見つけておく。
     let wants_json = args.iter().any(|a| a == "--json");
-    let result = parse(command, args).and_then(|p| {
-        let value = match command {
-            "enable" => enable(&p),
-            "disable" => disable(&p),
-            "pause" => set_paused(&p, true),
-            "resume" => set_paused(&p, false),
-            "status" => Ok(status()),
-            "doctor" => Ok(doctor::run(p.flags.contains("verify"))),
-            "run-now" => run_now(&p),
-            "review" => review(&p),
-            "apply" => apply(&p),
-            "discard" => discard(&p),
-            "docs" => docs(&p),
-            "update" => update(&p),
-            "uninstall-setup" => Ok(app_update::uninstall_setup(p.flags.contains("apply"))),
-            other => Err(crate::t!("cli.arg.unknown_command", command = other)),
-        }?;
-        Ok((p.json, value))
-    });
+    let result = if matches!(command, "review" | "apply" | "discard") {
+        Err(crate::t!("cli.command_removed", command = command))
+    } else {
+        parse(command, args).and_then(|p| {
+            let value = match command {
+                "enable" => enable(&p),
+                "disable" => disable(&p),
+                "pause" => set_paused(&p, true),
+                "resume" => set_paused(&p, false),
+                "status" => Ok(status()),
+                "doctor" => Ok(doctor::run(p.flags.contains("verify"))),
+                "run-now" => run_now(&p),
+                "docs" => docs(&p),
+                "update" => update(&p),
+                "uninstall-setup" => Ok(app_update::uninstall_setup(p.flags.contains("apply"))),
+                other => Err(crate::t!("cli.arg.unknown_command", command = other)),
+            }?;
+            Ok((p.json, value))
+        })
+    };
     match result {
         Ok((json, value)) => {
             let code = if value["ok"] == json!(false) { 1 } else { 0 };
@@ -303,14 +297,6 @@ fn store() -> Store {
     Store::current()
 }
 
-fn mode_str(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Off => "off",
-        Mode::Propose => "propose",
-        Mode::Push => "push",
-    }
-}
-
 fn documents_json(docs: &[Document]) -> Value {
     json!(docs.iter().map(|d| d.file_name()).collect::<Vec<_>>())
 }
@@ -319,8 +305,9 @@ fn documents_json(docs: &[Document]) -> Value {
 fn repo_json(config: &Config, repo: &config::Repository) -> Value {
     json!({
         "root": repo.root,
-        "mode": mode_str(repo.mode.unwrap_or(config.defaults.mode)),
         "paused": repo.paused,
+        // 旧形式からの移行で止めた登録の由来（propose / off / unconsented）。止めていなければ null。
+        "migratedFrom": repo.migrated_from.map(config::MigratedFrom::as_str),
         "branches": repo.branches,
         "documents": documents_json(repo.documents.as_deref().unwrap_or(&config.defaults.documents)),
         "remote": repo.remote,
@@ -362,24 +349,8 @@ fn parse_documents(raw: &str) -> Result<Vec<Document>, String> {
 // ---------------------------------------------------------------------------
 
 fn enable(p: &Parsed) -> R {
-    // 1. 同意。何よりも先に確認し、無ければ何も読まず何も書かない。
-    let accepted = p
-        .values
-        .get("accept-consent")
-        .and_then(|v| v.trim().parse::<u32>().ok());
-    if accepted != Some(CURRENT_CONSENT_VERSION) {
-        return Err(consent_notice());
-    }
     let raw = p.values.get("repo").ok_or(crate::t!("cli.repo.required"))?;
     let root = git_root(raw)?;
-    let mode = match p.values.get("mode").map(String::as_str) {
-        None | Some("propose") => Mode::Propose,
-        Some("push") => Mode::Push,
-        Some("off") => Mode::Off,
-        Some(other) => {
-            return Err(crate::t!("cli.mode.invalid", value = other));
-        }
-    };
     let branches_arg = match p.values.get("branches") {
         Some(raw) => {
             let list = split_list(raw);
@@ -396,15 +367,11 @@ fn enable(p: &Parsed) -> R {
         .map(|raw| parse_documents(raw))
         .transpose()?;
 
-    // 2. 本体（Git の状態の確認 → 設定の事前確認 → 起点の記録 → 設定ロック内で保存）は ops に任せる。
-    //    CLI での同意は出所 cli で記録する。既存の明示の同意（cli・ui）は上書きしない。
+    // 本体（Git の状態の確認 → 設定の事前確認 → 起点の記録 → 設定ロック内で保存）は ops に任せる。
     let request = EnableRequest {
         repo: root.to_string_lossy().into_owned(),
-        mode,
         branches: branches_arg,
         documents: documents_arg,
-        consent_version: CURRENT_CONSENT_VERSION,
-        consent_source: ConsentSource::Cli,
     };
     let enabled = ops::enable(&store(), &request, None).map_err(|e| e.to_string())?;
 
@@ -413,7 +380,6 @@ fn enable(p: &Parsed) -> R {
     out["created"] = json!(enabled.created);
     out["baseline"] = json!(true);
     out["configPath"] = json!(config::config_path());
-    out["consentVersion"] = json!(CURRENT_CONSENT_VERSION);
     Ok(out)
 }
 
@@ -460,8 +426,8 @@ fn target_root(p: &Parsed) -> Result<String, String> {
 
 fn status() -> Value {
     let mut out = app::status();
-    let loaded = config::load();
-    let (state, error, cfg) = match &loaded {
+    let snapshot = config::read();
+    let (state, error, cfg) = match &snapshot.loaded {
         Loaded::Missing => ("missing", None, None),
         Loaded::Invalid(reason) => ("invalid", Some(one_line(reason)), None),
         Loaded::Ok(c) => ("ok", None, Some(c)),
@@ -471,6 +437,16 @@ fn status() -> Value {
     out["policy"] = Value::Null;
     out["defaults"] = Value::Null;
     out["config"] = json!({"path": config::config_path(), "state": state, "error": error});
+    // 旧形式（同意と mode を持つ設定）のまま。読み込み時に変換して扱っており、次の hook か設定の変更で
+    // schema 3 として保存される。
+    out["legacy"] = match &snapshot.legacy {
+        Some(l) => json!({
+            "fromSchema": l.from_schema,
+            "stopped": l.stopped,
+            "policyReset": l.policy_reset,
+        }),
+        None => Value::Null,
+    };
     let default_worker = config::Worker::default();
     let worker = cfg.map(|c| &c.worker).unwrap_or(&default_worker);
     out["worker"] = json!({
@@ -484,41 +460,17 @@ fn status() -> Value {
         // パスだけ。認証情報は持たない。
         "claudePath": worker.claude_path,
     });
-    let mut pending = 0;
-    let mut applied = 0;
     let mut repos = Vec::new();
     if let Some(c) = cfg {
-        out["consent"] = match &c.consent {
-            Some(x) => json!({
-                "version": x.version,
-                "acceptedAt": x.accepted_at,
-                "source": x.source,
-                "current": x.version >= CURRENT_CONSENT_VERSION,
-            }),
-            None => Value::Null,
-        };
         out["policy"] = json!(c.enrollment.policy);
         out["defaults"] = json!({
-            "mode": mode_str(c.defaults.mode),
             "documents": documents_json(&c.defaults.documents),
         });
         for repo in &c.repository {
-            let list = proposal::list(std::path::Path::new(&repo.root));
-            let (p, a) = (
-                list.iter().filter(|x| !x.applied).count(),
-                list.iter().filter(|x| x.applied).count(),
-            );
-            pending += p;
-            applied += a;
-            let mut entry = repo_json(c, repo);
-            entry["proposals"] = json!({"pending": p, "applied": a});
-            repos.push(entry);
+            repos.push(repo_json(c, repo));
         }
-    } else {
-        out["consent"] = Value::Null;
     }
     out["repositories"] = json!(repos);
-    out["proposals"] = json!({"pending": pending, "applied": applied});
     out
 }
 
@@ -537,23 +489,8 @@ fn run_now(p: &Parsed) -> R {
         .transpose()?;
     // 本体（設定の読み込み・判定・poll ロック・保守）は ops。ここは結果を従来の JSON にするだけ。
     match ops::run_now_for(&store(), &root, documents.as_deref())? {
-        // 保守後の検査に違反して更新案を作らなかった。失敗ではないので ok:true で、理由を別に返す。
-        RunNow::Rejected { reason } => Ok(json!({
-            "ok": true, "repo": repo, "mode": "propose", "outcome": "rejected",
-            "reason": reason,
-            "message": crate::t!("cli.run_now.rejected"),
-        })),
-        RunNow::Created(x) => Ok(json!({
-            "ok": true, "repo": repo, "mode": "propose", "outcome": "created",
-            "sha": x.sha, "patchPath": x.patch_path,
-            "diffstat": x.diffstat, "documents": x.documents,
-        })),
-        RunNow::Unchanged => Ok(json!({
-            "ok": true, "repo": repo, "mode": "propose", "outcome": "unchanged",
-            "message": crate::t!("cli.run_now.unchanged"),
-        })),
         RunNow::Completed => Ok(json!({
-            "ok": true, "repo": repo, "mode": "push", "outcome": "completed",
+            "ok": true, "repo": repo, "outcome": "completed",
             "message": crate::t!("cli.run_now.completed"),
         })),
     }
@@ -671,7 +608,6 @@ fn docs(p: &Parsed) -> R {
     let mut out = json!({
         "ok": true, "repo": repo,
         "registered": overview.registered,
-        "mode": overview.mode.map(mode_str),
         "configPresent": overview.config_present,
     });
     match view {
@@ -698,54 +634,6 @@ fn docs(p: &Parsed) -> R {
         }
     }
     Ok(out)
-}
-
-// ---------------------------------------------------------------------------
-// review / apply / discard
-// ---------------------------------------------------------------------------
-
-fn selector(p: &Parsed) -> &str {
-    p.positional.first().map(String::as_str).unwrap_or("latest")
-}
-
-fn proposal_json(x: &proposal::ProposalInfo) -> Value {
-    json!({
-        "sha": x.sha, "createdAt": x.created_at, "patchPath": x.patch_path,
-        "diffstat": x.diffstat, "documents": x.documents, "applied": x.applied,
-    })
-}
-
-fn review(p: &Parsed) -> R {
-    let root = repo_root(p)?;
-    let repo = root.to_string_lossy().into_owned();
-    let all: Vec<Value> = proposal::list(&root).iter().map(proposal_json).collect();
-    if p.positional.is_empty() && all.is_empty() {
-        return Ok(
-            json!({"ok": true, "repo": repo, "proposals": [], "message": crate::t!("cli.review.none")}),
-        );
-    }
-    let info = proposal::review(&root, selector(p))?;
-    Ok(json!({
-        "ok": true, "repo": repo,
-        "sha": info.sha, "patchPath": info.patch_path,
-        "diffstat": info.diffstat, "documents": info.documents,
-        "proposals": all,
-    }))
-}
-
-fn apply(p: &Parsed) -> R {
-    let root = repo_root(p)?;
-    let outcome = proposal::apply(&root, selector(p))?;
-    Ok(json!({
-        "ok": true, "repo": root.to_string_lossy(), "sha": outcome.sha,
-        "files": outcome.files, "staged": false,
-    }))
-}
-
-fn discard(p: &Parsed) -> R {
-    let root = repo_root(p)?;
-    let sha = proposal::discard(&root, selector(p))?;
-    Ok(json!({"ok": true, "repo": root.to_string_lossy(), "sha": sha, "discarded": true}))
 }
 
 // ---------------------------------------------------------------------------
@@ -848,7 +736,7 @@ fn render_docs(v: &Value) -> String {
         "cli.docs.repo_line",
         repo = text(v, "repo"),
         state = if v["registered"] == json!(true) {
-            crate::t!("cli.docs.registered", mode = text(v, "mode"))
+            crate::t!("cli.docs.registered").to_string()
         } else {
             crate::t!("cli.docs.unregistered").to_string()
         }
@@ -942,7 +830,6 @@ fn render(command: &str, v: &Value) -> String {
         "enable" => crate::t!(
             "cli.enable.done",
             root = text(v, "root"),
-            mode = text(v, "mode"),
             branches = if v["branches"].as_array().is_some_and(|b| b.is_empty()) {
                 crate::t!("cli.branches.any").into()
             } else {
@@ -990,23 +877,27 @@ fn render(command: &str, v: &Value) -> String {
             if let Some(e) = v["config"]["error"].as_str() {
                 lines.push(crate::t!("cli.status.config_error", error = e));
             }
+            if v["legacy"].is_object() {
+                lines.push(crate::t!(
+                    "cli.status.legacy",
+                    stopped = v["legacy"]["stopped"]
+                ));
+            }
             lines.push(crate::t!("cli.status.state_db", path = text(v, "stateDb")));
             for r in v["repositories"].as_array().into_iter().flatten() {
                 lines.push(crate::t!(
                     "cli.status.repo_line",
                     root = text(r, "root"),
-                    mode = text(r, "mode"),
-                    paused = if r["paused"] == json!(true) {
-                        crate::t!("cli.status.paused")
-                    } else {
-                        ""
+                    state = match r["migratedFrom"].as_str() {
+                        Some(from) => crate::t!("cli.status.migrated", from = from),
+                        None if r["paused"] == json!(true) => crate::t!("cli.status.paused").into(),
+                        None => String::new(),
                     },
                     branches = if r["branches"].as_array().is_some_and(|b| b.is_empty()) {
                         crate::t!("cli.branches.any").into()
                     } else {
                         list(&r["branches"])
                     },
-                    pending = r["proposals"]["pending"],
                 ));
             }
             if v["repositories"].as_array().is_some_and(|a| a.is_empty()) {
@@ -1080,41 +971,9 @@ fn render(command: &str, v: &Value) -> String {
             lines.join("\n")
         }
         "run-now" => match text(v, "outcome") {
-            "created" => crate::t!(
-                "cli.run_now.created",
-                sha = short(text(v, "sha")),
-                patch = text(v, "patchPath")
-            ),
-            "rejected" => crate::t!(
-                "cli.run_now.rejected_line",
-                reason = text(v, "reason"),
-                message = text(v, "message")
-            ),
             _ => text(v, "message").to_string(),
         },
         "docs" => render_docs(v),
-        "review" => {
-            if v.get("sha").is_none() {
-                return text(v, "message").to_string();
-            }
-            let mut lines = vec![
-                crate::t!("cli.review.title", sha = short(text(v, "sha"))),
-                crate::t!("cli.review.patch", path = text(v, "patchPath")),
-                crate::t!("cli.review.targets", documents = list(&v["documents"])),
-                text(v, "diffstat").to_string(),
-            ];
-            let others = v["proposals"].as_array().map_or(0, Vec::len);
-            if others > 1 {
-                lines.push(crate::t!("cli.review.others", count = others));
-            }
-            lines.join("\n")
-        }
-        "apply" => crate::t!(
-            "cli.apply.done",
-            sha = short(text(v, "sha")),
-            files = list(&v["files"])
-        ),
-        "discard" => crate::t!("cli.discard.done", sha = short(text(v, "sha"))),
         _ => pretty(v),
     }
 }

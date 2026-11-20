@@ -4,8 +4,7 @@
 
 自分のリポジトリへ push したあとに、`AGENTS.md` / `DESIGN.md` / `README.md`（と、オプトインで `CHANGELOG.md` や利用者が定義したカスタムの文書）をバックグラウンドで保守するツールです。Claude Code の Stop hook から起動し、保守の worker には Claude Code CLI（既定は `claude -p --model claude-sonnet-5-5 --effort high`）を使います。Codex には依存しません。
 
-- **既定は安全側**です。有効化は利用者本人の明示的な同意とリポジトリ登録が必要で、既定のモードは文書の「更新案（パッチ）」を作るだけの `propose` です。作業ツリー・`.git`・remote は変えません。
-- 文書を自動で commit・push する `push` モードは、`--mode push` を明示したときだけ使えます。
+- **既定は安全側**です。`scriptura enable`（または管理画面）でリポジトリを登録するまで何も動かず、有効化には remote と upstream が必要です。確認の手順はなく、push のたびに worker が対象の文書を更新し、Scriptura が自動で commit と push をします。保守後の検査で、対象の文書以外が変わっていれば commit しません。同意の記録と、以前の `propose` モード（更新案）は廃止しました（「旧設定の移行」を参照）。
 - 設定は利用者のホーム配下の 1 ファイル（`config.toml`）と、同じフォルダーの `templates/` だけから読みます。リポジトリ内のファイルからの有効化・設定は読みません（他人のリポジトリを clone しただけで自動動作が始まる経路を作らないため）。
 - 設定は `scriptura ui`（ブラウザーの管理画面）でも編集できます（後述）。
 
@@ -62,22 +61,14 @@ worker はデスクトップセッションの中継設定を引き継がない�
 
 保守したいリポジトリで次のどちらかを行います。
 
-- プラグインを入れている場合: Claude Code で `/scriptura:setup`（同意の確認のあと `scriptura enable` を実行します）。
+- プラグインを導入している場合: Claude Code で `/scriptura:setup` を実行します（文書が自動で commit・push されることをチャットで確認してから `scriptura enable` を実行します）。
 - コマンドで直接:
 
 ```powershell
-scriptura enable --repo D:\Dev\MyRepo --accept-consent 1
+scriptura enable --repo D:\Dev\MyRepo
 ```
 
-`--accept-consent` は同意文書の現行の版（現在は `1`）です。省略したり版が違うと、送信データと費用の説明を出して拒否します。`enable` は登録の前に「現在の push 状態」を処理済みとして記録するので、有効化より前の push は後から処理されません。
-
-## モード
-
-| モード | 動作 |
-| --- | --- |
-| `propose`（既定） | push のたびに worker が使い捨てクローンで文書を更新し、差分を**パッチとして保存**する。作業ツリー・`.git`・remote は変えない。`review` で確認し、`apply` で作業ツリーへ適用する（stage はしない）。 |
-| `push` | worker が文書を更新し、commit と push まで自動で行う。`--mode push` を明示したときだけ。remote と upstream が必要で、`--branches` 省略時は現在のブランチだけが対象。 |
-| `off` | 何もしない（登録は残る）。 |
+`enable` には remote・ブランチ（detached HEAD ではないこと）・upstream が必要で、`--branches` を省略すると現在のブランチだけが対象です。以後は push のたびに文書が自動で commit・push されます（「費用とデータ送信」を参照）。`enable` は登録する前に「現在の push の状態」を処理済みとして記録するので、有効化より前の push はあとから処理されません。以前の `--mode` と `--accept-consent` は廃止し、指定するとエラーで拒否します。
 
 ## 設定ファイル
 
@@ -89,18 +80,12 @@ scriptura enable --repo D:\Dev\MyRepo --accept-consent 1
 
 `SCRIPTURA_CONFIG`（絶対パスのファイル）または `SCRIPTURA_HOME`（`<SCRIPTURA_HOME>/config.toml`）で上書きできます。通常は `enable` / `disable` / `pause` / `resume` と管理画面が書き換えるので、手で編集する必要はありません。壊れた設定・未知のキー・新しすぎる `schema` は「何もしない」に倒れ、`enable` なども書き換えずに失敗します。
 
-`schema` は 1 と 2 を読めます。保存は「必要な最小の版」で行い、文書の種類ごとの設定（`[kinds.*]`）・`[defaults] instructions`・`CHANGELOG.md` かカスタム種類を対象に挙げた設定・管理画面での同意を使っていなければ `schema = 1` のまま書きます（旧版の Scriptura でも読めます）。使うと `schema = 2` になり、旧版はそれを読むと「何もしない」に倒れます。
+保存は常に `schema = 3` です。`schema` が 1・2・省略（以前の Scriptura が書いたもの）の設定は旧形式として読み込み時に変換します（「旧設定の移行」を参照）。3 より新しい schema は「何もしない」に倒します。旧版の Scriptura も schema 3 の設定を読むと何もしないので、プラグイン版と Setup 版を併用している場合は両方を更新してください。
 
 ```toml
-schema = 1
-
-[consent]
-version = 1
-accepted_at = "2026-11-14T00:00:00+00:00"
-source = "cli"
+schema = 3
 
 [defaults]
-mode = "propose"                                # propose / push / off
 documents = ["AGENTS.md", "DESIGN.md", "README.md"]
 exclude = ["private/**"]                        # 既定の機密パターンに「加算」される（`)`・空白・制御文字を含むパターンは不可）
 
@@ -118,7 +103,6 @@ owners = []                                     # remote-owner のとき "github
 [[repository]]
 root = "D:/Dev/MyRepo"
 remote = "github.com/me/myrepo"                 # 期待する push 先（一致しなければ見送る）
-mode = "propose"
 branches = ["main"]                             # 空なら制限なし
 documents = ["README.md"]
 paused = false
@@ -127,6 +111,8 @@ paused = false
 ## 文書の種類
 
 保守する文書は「種類」で管理します。
+
+管理画面では、同じ設定を「設定」の「文書」タブで編集できます（既定の対象の文書 `defaults.documents` もここで決めます）。
 
 | 種類 | 対象 | 既定 |
 | --- | --- | --- |
@@ -158,7 +144,7 @@ paused = false
 
 ### 保守後の検査
 
-上限（`max_chars` / `max_bytes`）・`required_headings`・AGENTS の 30,000 バイト未満・CHANGELOG のリリース済みエントリの不変は、worker の権限モード（`restricted` / `bypass`）に関係なく Rust が検査します。違反したとき、`push` モードは commit せず（変更は作業ツリーに残り、次の hook でも同じ検査を通ります）、`propose` モードは更新案を作らずに棄却（`rejected`）して処理済み位置を進めます。同じ push では worker を再実行しません。`propose` の棄却は `run-now` のときだけ作り直せます。
+上限（`max_chars` / `max_bytes`）・`required_headings`・AGENTS が 30,000 バイト未満であること・リリース済みの CHANGELOG エントリの不変は、worker の権限モード（`restricted` / `bypass`）に関係なく Rust が検査します。違反したときは commit しません（変更は作業ツリーに残り、次の hook が同じ検査を通ります）。同じ push で worker は再実行しません。
 
 ### タイミング（`[kinds.<id>.timing]`）
 
@@ -176,18 +162,18 @@ paused = false
 
 ### CHANGELOG の保守（`[kinds.changelog.changelog]`）
 
-- 既存の形式を踏襲します（新規作成のときだけ Keep a Changelog の組み込みテンプレート）。1 回の push ごとの更新は `Unreleased` 節だけで、worker はリリース済みの節を変更できません。Rust が保守の前後を比べ、リリース済みの節が 1 バイトでも変わっている・消えている・順序が入れ替わっている、リンク参照定義が失われている場合は上の検査に違反として扱います（push モードは commit しない／propose は棄却）。
+- 既存の形式を踏襲します（新規作成のときだけ Keep a Changelog の組み込みテンプレート）。1 回の push ごとの更新は `Unreleased` 節だけで、worker はリリース済みの節を変更できません。Rust が保守の前後を比べ、リリース済みの節が 1 バイトでも変わっている・消えている・順序が入れ替わっている、リンク参照定義が失われている場合は上の検査に違反として扱います（commit しません）。
 - 履歴は `CHANGELOG.md` を最後に変更したコミットから今回の push までを、Rust が集めて**信頼できないデータ**としてプロンプトに渡します（コミット件名・変更パス・範囲内のタグ。全体 48 KiB まで）。restricted の worker は `git log` を実行できないためです。Scriptura 自身の保守コミットは除きます。
 - `on_release = "promote"`（既定）: 範囲内のタグに対応する版の節がまだ無ければ、`Unreleased` の内容をその版の節へ移します。節が既にあれば何もしません（リリース手順が先に書いていても同じ結果になります）。`ignore` は版の節を作りません。
 - `backfill = "tags"`（既定）: `CHANGELOG.md` が無いとき、到達できるタグを新しい順に `backfill_max_releases`（1〜50、既定 20）件まで、隣り合うタグ間のコミットを合計 `backfill_max_commits`（1〜1000、既定 300）件まで遡って版ごとの節を作ります。`none` は遡りません。`format`（`existing` / `keep-a-changelog`）、`release_tag`（既定 `v*`）も指定できます。
-- ファイル名は Git 上の綴りを大文字小文字を区別せずに解決します（`Changelog.md` なども対象）。綴りを 1 つに決められないとき、編集前の内容を Git から読めないときは、検査不能として違反扱いにします。push モードで `CHANGELOG.md` が Git に無視（ignore）されている場合は、worker を起動せずに新しい保守を見送ります。
+- ファイル名は Git 上の綴りを大文字小文字を区別せずに解決します（`Changelog.md` なども対象）。綴りを 1 つに決められないとき、編集前の内容を Git から読めないときは、検査不能として違反扱いにします。`CHANGELOG.md` が Git に無視（ignore）されている場合は、worker を起動せずに新しい保守を見送ります。
 - 版とタグの照合は、`release_tag` の固定接頭辞（`v*` の `v`、`release-*` の `release-` など）を除いた版名（`## [1.2.0]`）でも一致とみなします。違反の理由は見出しの文字列を出さず、「n 番目の版の節」のように番号で示します。リリース済みの節のリンク参照定義は、内容と順序が保たれ、既存のラベルが再定義されていないことも検査します。
-- 限界: タグだけの push（`git push --tags`）は検知できません。次のブランチの push か `--follow-tags` で反映されます。push モードで `CHANGELOG.md` を保守する場合、リリース手順が同じファイルを更新すると競合することがあります（`doctor` が注意を出します）。
+- 限界: タグだけの push（`git push --tags`）は検知できません。次のブランチの push か `--follow-tags` で反映されます。`CHANGELOG.md` を保守する場合、リリース手順が同じファイルを更新すると競合することがあります（`doctor` が注意を出します）。
 
-### 設定例（schema 2）
+### 設定例（schema 3）
 
 ```toml
-schema = 2
+schema = 3
 
 [defaults]
 documents = ["AGENTS.md", "DESIGN.md", "README.md", "CHANGELOG.md", "architecture"]
@@ -223,7 +209,7 @@ documents = ["README.md", "CHANGELOG.md"]
 
 ## 設定の書き込みと変更履歴
 
-設定の書き込みは、CLI・管理画面・旧利用者の自動移行のどれも同じ経路（`src/ops.rs` と `config::update_in`）を通ります。状態フォルダーの `config-lock.sqlite3` で書き手を直列化し、管理画面は表示時の版（ファイルの SHA-256。ファイルが無ければ `missing`）を照合して、他で変更されていれば保存せずに再読み込みを案内します（CLI は版を照合しません）。保存の直前に、変更前の内容を状態フォルダーの `config-history/` へ退避し（50 件保持）、保存はアトミックです。壊れた設定は書き換えません。内容が変わらない操作は保存も退避もしません。履歴は管理画面の「履歴」から差分の確認と復元ができ、復元前の内容も履歴に残ります。復元で登録が増える場合は、確認画面を挟み、その登録の起点（有効化前の push を処理しないための位置）を記録してから保存します。復元で push モードの登録が増える・push に変わる場合は拒否し、`enable --mode push`（remote と upstream を確認する）へ案内します。
+設定の書き込みは、CLI・管理画面・旧利用者の自動移行のどれも同じ経路（`src/ops.rs` と `config::update_in`）を通ります。状態フォルダーの `config-lock.sqlite3` で書き手を直列化し、管理画面は表示時の版（ファイルの SHA-256。ファイルが無ければ `missing`）を照合して、他で変更されていれば保存せずに再読み込みを案内します（CLI は版を照合しません）。保存の直前に、変更前の内容を状態フォルダーの `config-history/` へ退避し（50 件保持）、保存はアトミックです。壊れた設定は書き換えません。内容が変わらない操作は保存も退避もしません。履歴は管理画面の「設定の変更履歴」から差分の確認と復元ができ、復元前の内容も履歴に残ります。復元で登録が増える場合（停止中のものを含む）は、その登録の起点（有効化前の push を処理しないための位置）を記録してから保存します。復元で有効な登録（停止中でも移行で止めたものでもない）が増える・有効に変わる場合は拒否し、`enable`（remote と upstream を確認する）へ案内します。移行で止めた登録は、復元でも再開できません。
 
 ## 管理画面（`scriptura ui`）
 
@@ -232,7 +218,7 @@ scriptura ui [--port <n>] [--no-open] [--tray]
 scriptura ui --autostart on|off
 ```
 
-設定・更新案・診断をブラウザーで扱う画面です（9 言語。画面上部の言語の選択欄（Cookie に保存）→ ブラウザーの `Accept-Language` → 英語の順で表示言語が決まります）。既定では常駐せず、起動したコマンドが画面の「終了」・Ctrl+C・60 分の無操作のいずれかで終わります（`--tray` を付けると常駐します。下記）。hook は画面の有無を見ません。cargo feature `ui`（既定で有効）で、`--no-default-features` でビルドすると含まれません（`scriptura ui` は拒否して終了します）。
+リポジトリ・履歴・設定（文書を含む）・診断をブラウザーで扱う画面です（9 言語。画面上部の言語の選択欄（Cookie に保存）→ ブラウザーの `Accept-Language` → 英語の順で表示言語が決まります）。既定では常駐せず、起動したコマンドが画面の「終了」・Ctrl+C・60 分の無操作のいずれかで終わります（`--tray` を付けると常駐します。下記）。hook は画面の有無を見ません。cargo feature `ui`（既定で有効）で、`--no-default-features` でビルドすると含まれません（`scriptura ui` は拒否して終了します）。
 
 - **待ち受け**: `127.0.0.1` だけ（既定のポートは 7468、`--port 0` で空きポート）。ポートが使用中なら終了します。
 - **常駐（`--tray`）**: Windows はタスクトレイ、macOS はメニューバーにアイコンを置いて常駐します（Linux は未対応で、`--tray` は拒否して終了します）。アイコンのクリックで管理画面を開き、右クリックのメニューから「管理画面を開く」「更新を確認」（Setup 版のみ。概要画面の「アプリの更新」パネルを開きます）「終了」を選べます。常駐中は無操作でも終了しません。代わりに 60 分の無操作でセッションを失効させ（開いたままのタブは 401 になります）、アイコンから開くたびに使い捨て鍵を発行し直します（発行し直した鍵は 5 分で失効し、使われなかった前の鍵は無効になります）。Windows では、既定のポートで常駐中にもう一度 `scriptura ui --tray` を実行すると、2 つ目は起動せず、常駐中の側がブラウザーを開きます。端末以外（スタートメニューなど）から起動されたときは、コンソール窓を持たないプロセスとして起動し直します。
@@ -240,8 +226,9 @@ scriptura ui --autostart on|off
 - **「アプリの更新」パネル（Setup 版のみ）**: 概要画面の「アプリの更新」パネル（`#updates`）に、現在の版、自動更新とログオン時の常駐のチェックボックス、「更新を確認」ボタン、「更新をインストール」ボタン（新しい版があるときに表示）があります。確認は 24 時間の間引きを無視し、取得はしません。インストールは取得と署名者の検証をしたうえで、導入先から他の Scriptura のプロセス（hook・worker・別の管理画面）が動いておらず、run-now の実行中でもなければ、更新器に適用を依頼して管理画面を終えます（そうでなければ何もせず、あとでもう一度試すよう案内します。強制終了はしません）。常駐しているときは更新器が新しい版を起動しますが、セッションは新しくなるため、開いているタブには「トレイ（メニューバー）のアイコンから開き直してください」と表示されます。端末から起動した管理画面は終了するだけです。トレイのメニューの「更新を確認」はこのパネルを開き、自動で確認を始めます。JavaScript が無くても同じボタンで操作でき、結果は別の画面に表示されます。Setup 版以外では、パネルは「Setup 版でのみ使えます」と表示するだけです。
 - **保護**: 起動ごとの使い捨て鍵の URL（`/auth?key=…`）を一度だけ使えるセッション Cookie（`HttpOnly; SameSite=Strict`）へ交換します（Cookie が無ければ 401）。Host は `127.0.0.1:<port>` か `localhost:<port>` だけ、Origin があれば同一オリジンだけ、POST は同一オリジン（`Origin` か `Sec-Fetch-Site`）に加えて CSRF トークンが必須です。CSP・`nosniff`・`no-store` などの応答ヘッダーを付け、秘密値は表示しません。Cookie はブラウザーの仕様上ポートで分離されないため、同じ PC の 127.0.0.1 の別ポートで動くサービスにも送られます（同じ利用者のプロセスは元々設定ファイルを触れるので、問題になるのは権限の違うローカルサービスだけです）。
 - **競合**: 保存は表示時の版を照合し、他で変更されていれば再読み込みを案内します。
-- **確認画面**: push モード化、権限 `bypass` 化、自動登録の方針を `all` / `remote-owner` にする変更、カスタム種類の対象パスの追加、同意の記録、登録の解除、更新案の適用、push モードの `run-now`（と、これらを含む版への履歴の復元）は、1 回目の送信では書き込まず、変更点の一覧を見せて 1 回限りの確認（10 分で失効）を求めます。
-- **画面**: ヘッダーは 5 項目です。概要 / リポジトリ（登録・有効化・一時停止・再開・解除・モードと対象の文書・`run-now`）/ 文書の種類（種類の追加・編集・削除、`templates/` のテンプレート編集）/ 更新案（差分の確認・適用・破棄）/ 設定。設定はタブで、全般 / worker / 同意 / 履歴（変更履歴・差分・復元）/ 診断に分かれます。worker 画面のモデルと effort は入力ではなく一覧から選びます。モデルの一覧は固定の一覧で、環境変数 `ANTHROPIC_API_KEY` が既にあるときは「モデル一覧を更新」ボタンで Anthropic API から最新のモデルをメモリへ取得します（キーは保存も表示もせず、画面を開いただけでは通信せず、一覧にない保存済みの値は「一覧にない値」として残します）。時刻は画面を動かす PC のローカルタイムゾーン（`YYYY-MM-DD HH:MM`）で表示し、保存形式と CLI の JSON は変えません。`run-now` は時間がかかるためバックグラウンドで実行し、画面で状態を確認できます。
+- **確認画面**: リポジトリの有効化（文書が自動で commit・push されます）、権限の `bypass` への変更、自動登録の方針の `all` / `remote-owner` への変更（push するすべてのリポジトリ、または指定した所有者のすべてのリポジトリが保守対象になります）、カスタム種類の対象パスの追加、登録の解除、`run-now`（およびこれらを含む版への履歴の復元）は、最初の送信では書き込まず、変更点の一覧を示して 1 回限りの確認（10 分間有効）を求めます。
+- **画面**: ヘッダーは 4 項目です。概要 / リポジトリ（登録・有効化・一時停止・再開・解除・対象の文書・`run-now`。設定の移行で止めた登録は「再開」ボタンの代わりに案内を表示し、「有効化」で有効にし直します）/ 履歴（保守の履歴: 結果・コミット・理由）/ 設定。設定はタブで、全般（除外・共通の追加指示・自動登録の方針）/ 文書（既定の対象の文書、文書の種類の追加・編集・削除、`templates/` のテンプレート編集。`/settings/documents`）/ worker / 設定の変更履歴（変更履歴・差分・復元）/ 診断に分かれます。以前の「文書の種類」「更新案」「同意」の画面は廃止しました（古い URL は 404 を返します）。worker 画面のモデルと effort は入力ではなく一覧から選びます。モデルの一覧は固定の一覧で、環境変数 `ANTHROPIC_API_KEY` が既にあるときは「モデル一覧を更新」ボタンで Anthropic API から最新のモデルをメモリへ取得します（キーは保存も表示もせず、画面を開いただけでは通信せず、一覧にない保存済みの値は「一覧にない値」として残します）。時刻は画面を動かす PC のローカルタイムゾーン（`YYYY-MM-DD HH:MM`）で表示し、保存形式と CLI の JSON は変えません。`run-now` は時間がかかるためバックグラウンドで実行し、画面で状態を確認できます。
+- **保守履歴**: worker を起動した保守と、保守を試みて失敗した回（hook と `run-now`）を 1 回ずつ状態 DB（`maintenance_runs`）に記録し、「履歴」に表示します（リポジトリで絞り込み、50 件ずつ）。契機・種類・結果（反映済み / 変更なし / 棄却 / 保留 / 失敗 / 結果不明）・文書の追加・削除行数・範囲と結果のコミット・理由を載せます。文書の本文や差分は保存しません。リポジトリごとに新しい順で最大 200 件、全体で 2,000 件を残し、同じ失敗の繰り返しは 1 行にまとめて「×回数」で示します。worker を起動せず失敗もしなかった回（期限が来た種類が無いときなど）は記録しません。
 
 ## 出力の言語
 
@@ -253,17 +240,14 @@ CLI・hook・インストーラー案内の出力は 9 言語（ja・en・zh-CN�
 
 | コマンド | 内容 |
 | --- | --- |
-| `enable --repo <path> --accept-consent <版> [--mode propose\|push\|off] [--branches a,b] [--documents AGENTS.md,README.md]` | リポジトリを登録して有効化する。`--documents` には組み込み 4 種（`CHANGELOG.md` を含む。大文字小文字は問わない）と、設定に定義したカスタム種類の id を挙げられる。 |
+| `enable --repo <path> [--branches a,b] [--documents AGENTS.md,README.md]` | リポジトリを登録して有効化する（以後、文書は自動で commit・push される）。設定の移行で止めた登録も、これで有効にし直す。remote・ブランチ・upstream が必要で、`--branches` を省略すると現在のブランチが対象。`--documents` には組み込み 4 種（`CHANGELOG.md` を含む。大文字小文字は問わない）と、設定に定義したカスタム種類の id を挙げられる。廃止した `--mode` / `--accept-consent` と、廃止した `review` / `apply` / `discard` コマンドはエラーで拒否する（`<state>/proposals/` に残ったパッチは `git apply` で当てられる）。 |
 | `disable --repo <path>` | 登録を削除する。 |
 | `pause [--repo <path>]` / `resume [--repo <path>]` | 一時停止 / 再開（`--repo` 省略時は cwd のリポジトリ）。 |
-| `status` | 導入状態・設定・同意・登録・worker 設定・更新案の件数と、Setup 版の情報（`setup`: 管理下か・packId・版・実行ファイル・自動更新・ログオン時の管理画面の常駐（`trayAutostart`）・前回の確認／失敗時刻・取得済みの版・登録の結果・旧単独導入の残存）を表示する。`installedVersion` は単独 `install` の記録（`install.json`、無ければ以前の版の `current.json`）。 `installForm` は実行中のバイナリの導入の形（`setup` = Setup 版、`standalone` = 単独 `install`、`other` = プラグイン同梱・開発ビルド）で、`installed` は単独 `install` の導入先に実行ファイルがあるかだけを表します。 |
+| `status` | 導入状態・設定・登録（それぞれの `paused` と `migratedFrom`）・worker 設定・設定ファイルが旧形式のままか（`legacy`）と、Setup 版の情報（`setup`: 管理下か・packId・版・実行ファイル・自動更新・ログオン時の管理画面の常駐（`trayAutostart`）・前回の確認／失敗時刻・取得済みの版・登録の結果・旧単独導入の残存）を表示する。`installedVersion` は単独 `install` の記録（`install.json`、無ければ以前の版の `current.json`）。 `installForm` は実行中のバイナリの導入の形（`setup` = Setup 版、`standalone` = 単独 `install`、`other` = プラグイン同梱・開発ビルド）で、`installed` は単独 `install` の導入先に実行ファイルがあるかだけを表します。 |
 | `doctor [--verify]` | 環境と設定を診断する（後述）。 |
-| `run-now [--repo <path>] [--documents <id,...>]` | push を待たず、いま 1 回保守を実行する（登録済み・同意済みのリポジトリだけ。タイミングは無視して有効な種類をすべて処理する）。`--documents` で処理する種類を絞れる（未定義・このリポジトリで無効な種類は worker を起動せず拒否）。**注意**: 絞った `run-now` も処理済み位置を進め、更新案はコミットごとに 1 つなので、絞り込みの外の種類はその push について保守されない。保守後の検査に違反した propose は `outcome` が `rejected`（`reason` つき。失敗ではなく、その push は処理済みになる）で返る。 |
+| `run-now [--repo <path>] [--documents <id,...>]` | push を待たず、いま 1 回保守を実行する（登録済みで一時停止中でないリポジトリだけ。タイミングは無視して有効な種類をすべて処理する）。文書は通常の実行と同じく commit・push される。`--documents` で処理する種類を絞れる（未定義・このリポジトリで無効な種類は worker を起動せず拒否）。**注意**: 絞った `run-now` も処理済み位置を進めるので、絞り込みの外の種類はその push について保守されない。成功すると `outcome` は `completed`。 |
 | `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | 文書の種類（組み込み・カスタム）の一覧と 1 件の詳細を表示する（有効・無効、対象パスと存在、上限、タイミング、テンプレートの状態、最終完了時刻。`show` は設定した指針・追加指示の本文も出す。読み取り専用で、文書の内容は出さない）。 |
 | `ui [--port <n>] [--no-open] [--tray]` / `ui --autostart on\|off` | 管理画面を起動する（前述。`--tray` で常駐）/ Setup 版のログオン時の常駐を切り替える。`--json` は使えない。 |
-| `review [sha\|latest] [--repo <path>]` | 更新案の diffstat・パッチのパス・対象文書を確認する。 |
-| `apply [sha\|latest] [--repo <path>]` | 更新案を作業ツリーへ適用する。対象文書に未コミットの変更があれば拒否する。 |
-| `discard [sha\|latest] [--repo <path>]` | 更新案を破棄する。 |
 | `connect claude-code [--apply] [--executable <絶対パス>]` / `--remove [--apply]` | settings.json の Stop hook を登録（旧保守 hook は hook 単位で置換）/ Scriptura の hook だけ解除する。`--apply` を付けるまでプレビュー。 |
 | `update [--check] [--auto on\|off]` | Setup 版の自動更新の状態を表示する / 今すぐ確認・取得する（適用はしない）/ 自動更新を切り替える。 |
 | `update-apply` | 取得済みの更新を、Scriptura の他のプロセスが動いていないときだけ署名者を確かめて適用する（ログオン時に自動で起動。結果は JSON 1 行で `status` は `unmanaged` / `disabled` / `nothingPending` / `busy` / `untrusted`（終了コード 2）/ `applied`）。 |
@@ -272,10 +256,10 @@ CLI・hook・インストーラー案内の出力は 9 言語（ja・en・zh-CN�
 
 ## 安全性
 
-- **オプトイン**: 同意（版つき）とリポジトリの登録がなければ何も動かず、状態フォルダーも作りません。登録は利用者本人の設定ファイルにだけ置きます。
-- **作業ツリーを変えない（propose）**: push されたコミットを状態フォルダー配下の使い捨てクローンへ展開し、そこだけで worker を動かします。クローンは push されたコミットから作るので、利用者の未追跡・無視ファイル（`.env` など）はクローンに存在しません。ただしこれは「クローンにファイルが無い」という事実で、`restricted` の許可規則（`Read(./**)` と機密パターンの拒否）がクローンの外の読み取りを禁じる保証ではありません（規則がクローンの外を拒否するかは未確認です）。クローンの `origin` は外すので、worker が push しても利用者のリポジトリへ届きません。
+- **オプトイン**: リポジトリを登録（`enable` か管理画面）するまで何も動かず、状態フォルダーも作りません。登録は利用者本人の設定ファイルにだけ保存します。
+- **自動の commit と push**: worker は利用者の実作業ツリーで動き、Scriptura は対象の文書を確認なしに commit・push します。そのため `enable` は remote・ブランチ・upstream を必須とし、下の保守後の検査で問題が見つかれば commit しません。それが許容できるリポジトリにだけ有効化してください。以前の propose モード（更新案）はもうありません。
 - **機密パターン**: `.env*` / `*.pem` / `*.key` / `*.p12` / `*.pfx` / `id_rsa*` / `id_ed25519*` / `**/secrets/**` / `.git/config` を、`restricted` のときの worker の Read / Edit 拒否規則（`--disallowedTools`）として適用します。`exclude` で加算はできますが、置き換えて外すことはできません。`bypass`（旧動作互換。権限確認を全て省略）ではこの規則は適用されません。
-- **事後検査**: worker が対象文書（と `.gitignore`）以外を変更した場合は成果を採用しません。propose は使い捨てクローンの全体（無視ファイルの増加を含む）を比べます。push モードは利用者の実作業ツリーで動くため、`restricted` のときだけ作業ツリーの追跡・未追跡ファイルを worker の前後で比べ（`target/` など無視ファイルの変化は並行する利用者の作業と区別できないので対象外）、`bypass` は従来どおり commit 対象文書のハッシュ検査だけです。push モードでは commit と push の不確実な状態を再実行せず、状態 DB で整合を取ります。上限・必須見出し・CHANGELOG のリリース済みエントリの不変は、権限モードに関係なく検査します（前述）。
+- **事後検査**: worker が対象の文書（と `.gitignore`）以外を変えた場合、その結果は採用しません。worker は利用者の実作業ツリーで動くため、`restricted` のときだけ、worker の前後で作業ツリーの追跡ファイルと未追跡ファイルを比べます（`target/` のような無視ファイルは利用者の並行作業と区別できないため対象外）。`bypass` は従来どおり commit 対象の文書のハッシュ検査だけです。commit と push の結果が不確実なときは再実行せず、状態 DB で整合させます。上限・必須見出し・リリース済みの CHANGELOG エントリの不変は、権限モードに関係なく検査します（上記）。
 - **環境の衛生**: worker に渡す環境変数から、親セッション（デスクトップ等）由来の中継設定を取り除きます。
 
 ## 費用とデータ送信
@@ -286,20 +270,29 @@ CLI・hook・インストーラー案内の出力は 9 言語（ja・en・zh-CN�
 
 `scriptura doctor [--verify] [--json]` は項目ごとに `{id, status, detail}`（status は `ok` / `warn` / `fail` / `info`）を返します。`fail` があると終了コードは 1 です。
 
-対応プラットフォーム、`git`、`claude`（実行ファイルの解決）、`claude auth status`（worker と同じ環境で実行し、終了コードと `authMethod` だけを見ます）、`gh`（push モードの GitHub リポジトリがあるときだけ）、設定と同意、状態フォルダーへの書き込み可否、hook の二重登録、`allowManagedHooksOnly` / `disableAllHooks`、旧 `agents-maintenance` の残存登録を確認します。Setup 版では、プラグインと Setup 版の登録の重複（`setupPlugin`）、Setup 版の hook の有無（`setupHook`）、旧単独導入の残存（`legacyInstall`）、自動更新の状態（`autoUpdate`）も出します（Setup 版でなければ `setup` の `info` 1 項目だけ）。`kinds` 項目は、文書の種類のテンプレートが読めるか（場所とサイズ）を確認し、上限が既存の文書の現在の大きさより小さいとき（次の保守が棄却されうる）と、push モードで `CHANGELOG.md` を保守するリポジトリがあるとき（リリース手順との競合）に `info` を出します。`--verify` はプラグイン同梱の `SHA256SUMS` に載る本体（`bin/scriptura.exe`・`libexec/scriptura-*`）の SHA-256 だけを照合します（ランチャー・hooks・skills は対象外。プラグイン外の実行ファイルも対象外）。
+対応プラットフォーム、`git`、`claude`（実行ファイルの解決）、`claude auth status`（worker と同じ環境で実行し、終了コードと `authMethod` だけを見ます）、`gh`（有効な登録の GitHub リポジトリがあるときだけ）、設定（旧形式の設定の `configLegacy`、移行で止めた登録の `migratedStopped`、廃止した更新案のパッチが残っているときの `legacyProposals` を含む）、状態フォルダーへの書き込み可否、hook の二重登録、`allowManagedHooksOnly` / `disableAllHooks`、旧 `agents-maintenance` の残存登録を確認します。Setup 版では、プラグインと Setup 版の登録の重複（`setupPlugin`）、Setup 版の hook の有無（`setupHook`）、旧単独導入の残存（`legacyInstall`）、自動更新の状態（`autoUpdate`）も出します（Setup 版でなければ `setup` の `info` 1 項目だけ）。`kinds` 項目は、文書の種類のテンプレートが読めるか（場所とサイズ）を確認し、上限が既存の文書の現在の大きさより小さいとき（次の保守が棄却されうる）と、`CHANGELOG.md` を保守するリポジトリがあるとき（リリース手順との競合）に `info` を出します。`--verify` はプラグイン同梱の `SHA256SUMS` に載る本体（`bin/scriptura.exe`・`libexec/scriptura-*`）の SHA-256 だけを照合します（ランチャー・hooks・skills は対象外。プラグイン外の実行ファイルも対象外）。
 
 ## 状態と保存場所
 
 | 場所 | Windows | macOS | Linux |
 | --- | --- | --- | --- |
 | 導入先（固定の実行ファイル `bin\scriptura(.exe)`） | `%LOCALAPPDATA%\Programs\Scriptura` | `~/Library/Application Support/Scriptura/app` | `$XDG_DATA_HOME/scriptura`（既定 `~/.local/share/scriptura`） |
-| 状態（DB・ロック・publications・更新案・設定の変更履歴 `config-history/`） | `%LOCALAPPDATA%\Scriptura\state` | `~/Library/Application Support/Scriptura/state` | `$XDG_STATE_HOME/scriptura`（既定 `~/.local/state/scriptura`） |
+| 状態（DB・ロック・publications・保守履歴（DB 内）・設定の変更履歴 `config-history/`） | `%LOCALAPPDATA%\Scriptura\state` | `~/Library/Application Support/Scriptura/state` | `$XDG_STATE_HOME/scriptura`（既定 `~/.local/state/scriptura`） |
 
 `SCRIPTURA_HOME` を絶対パスで設定すると、状態は `<SCRIPTURA_HOME>/state`、導入先は `<SCRIPTURA_HOME>/app`、設定は `<SCRIPTURA_HOME>/config.toml` になります。`SCRIPTURA_DB` で状態 DB だけを別の場所にもできます。テンプレートは設定ファイルと同じフォルダーの `templates/` に置きます。Codex や Claude Code のホームには書き込みません（`connect claude-code --apply` / `--remove` と、Setup 版の自動登録・`uninstall-setup --apply` が `settings.json` を書き換える場合を除く）。Setup 版の導入先（Windows `%LOCALAPPDATA%\ScripturaApp`）は Velopack が管理し、更新で入れ替わるため、状態や設定は置きません。
 
 ## 旧利用者の自動移行
 
-旧版の Scriptura（設定ファイルを持たなかった版）で動かしていて状態 DB が残っている利用者が、設定ファイル無しで hook を実行すると、従来と同じ動作（全リポジトリ・`push` モード・権限バイパス）の設定を一度だけ自動で作り、その旨を通知します。同意の出所は `legacy-migration` として記録されます。新規の利用者には何も作りません。対象を絞りたいときは `enable` で登録し直し、`policy = "explicit"` にしてください。旧 `agents-maintenance`（`~/.codex/hooks/state`）の状態は引き継がず、空の状態から始めます。
+旧版の Scriptura（設定ファイルを持たなかった版）で動かしていて状態 DB が残っている利用者が、設定ファイル無しで hook を実行すると、従来と同じ動作（全リポジトリ・`push` モード・権限バイパス）の設定を一度だけ自動で作り、その旨を通知します。新規の利用者には何も作りません。対象を絞りたいときは `enable` で登録し直し、`policy = "explicit"` にしてください。旧 `agents-maintenance`（`~/.codex/hooks/state`）の状態は引き継がず、空の状態から始めます。
+
+## 旧設定の移行（同意と propose の廃止）
+
+- 設定ファイルは常に `schema = 3` で保存します。`schema` が 1・2・省略の設定は旧形式として読み込み時に変換し、次の hook（または設定の変更）が一度だけ schema 3 で保存して、前の内容を `config-history/` へ退避し、止めた登録の件数を一度だけ通知します。
+- 同意があり、実効のモードが `push` だった登録は、そのまま動き続けます。ほかの登録（`propose`・`off`・同意なし）は、由来を記録して（`migrated_from`）一時停止し、`scriptura enable --repo <path>` か管理画面で有効にし直すまで何もしません（`enable` が remote と upstream を確認するため、`resume` と履歴の復元では再開できません）。`status` は `migratedFrom` を表示し、`doctor` もこれらの登録を知らせます。
+- `enrollment.policy` が `all` / `remote-owner` のときは、同意があり `defaults.mode = "push"` だった場合を除き、`explicit` に戻します（owners は残します）。
+- `consent` と `mode` のキーは削除します。これらを持つ schema 3 の設定は不正で、何も動きません。
+- `<state>/proposals/` に残ったパッチは読みも消しもしません。不要なら手で削除してください。未適用のパッチは `git apply` で当てられます。使い捨てクローン（`work-*`）の自動掃除もなくなりました。
+- 旧版の Scriptura は schema 3 の設定を読むと何もしないので、プラグイン版と Setup 版を併用している場合は両方を更新してください。
 
 ## 未対応・未検証
 

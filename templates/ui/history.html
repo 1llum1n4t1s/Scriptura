@@ -6,7 +6,7 @@
   {% if rows.is_empty() %}<p class="note">{{ crate::locale::tr("ui.history.none") }}</p>{% else %}
   <div class="table-wrap"><table>
     <thead><tr><th>{{ crate::locale::tr("ui.history.saved_at") }}</th><th>{{ crate::locale::tr("ui.history.revision") }}</th><th>{{ crate::locale::tr("ui.history.size") }}</th></tr></thead>
-    <tbody>{% for r in rows %}<tr><td><a href="/history/{{ r.id }}">{% let t = r.saved_at %}{% include "ui/time_secs.html" %}</a></td><td><code>{{ r.revision }}</code></td><td>{{ crate::locale::tr1("cli.docs.bytes", "n", r.size) }}</td></tr>{% endfor %}</tbody>
+    <tbody>{% for r in rows %}<tr><td><a href="/settings/history/{{ r.id }}">{% let t = r.saved_at %}{% include "ui/time_secs.html" %}</a></td><td><code>{{ r.revision }}</code></td><td>{{ crate::locale::tr1("cli.docs.bytes", "n", r.size) }}</td></tr>{% endfor %}</tbody>
   </table></div>
   {% endif %}
   <p class="note">{{ crate::locale::tr("ui.history.note") }}</p>

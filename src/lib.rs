@@ -13,7 +13,8 @@ pub mod maintenance;
 pub mod ops;
 pub mod paths;
 pub mod process;
-pub mod proposal;
+// 保守履歴（状態 DB の `maintenance_runs`）。
+pub mod runlog;
 pub mod timing;
 // 管理画面（`scriptura ui`）。feature "ui"（既定で有効）のときだけ含める。
 #[cfg(feature = "ui")]

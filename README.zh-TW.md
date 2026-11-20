@@ -4,8 +4,7 @@
 
 Scriptura 會在你 push 到自己的儲存庫之後，於背景維護 `AGENTS.md` / `DESIGN.md` / `README.md`（以及可選擇啟用的 `CHANGELOG.md` 和使用者自訂文件）。它由 Claude Code 的 Stop hook 啟動，負責維護的 worker 是 Claude Code CLI（預設為 `claude -p --model claude-sonnet-5-5 --effort high`）。它不依賴 Codex。
 
-- **預設即安全。** 啟用時需要你明確同意並註冊儲存庫，預設模式為 `propose`，只會產生文件的更新提案（patch）。它不會更動你的工作樹、`.git` 或 remote。
-- 會自動 commit 並 push 文件的 `push` 模式，只有在你明確傳入 `--mode push` 時才能使用。
+- **預設即安全。** 在你用 `scriptura enable`（或在管理介面）註冊儲存庫之前，什麼都不會執行，而啟用需要 remote 與 upstream。沒有審核步驟：每次 push 之後，worker 會更新目標文件，Scriptura 會自動 commit 並 push；維護後檢查發現目標文件以外有變更時，不會 commit。同意紀錄與先前的 `propose` 模式（更新提案）已被移除（請見「舊設定的遷移」）。
 - 設定只會從使用者家目錄下的單一檔案（`config.toml`）及其旁邊的 `templates/` 資料夾讀取。儲存庫內的檔案一律不會被當作啟用或設定的來源（因此只是 clone 他人的儲存庫，也絕不會觸發自動行為）。
 - 設定也可以在 `scriptura ui`（以瀏覽器操作的管理介面，詳見後文）中編輯。
 
@@ -62,22 +61,14 @@ worker 不會繼承桌面工作階段的中繼設定，因此請事先在單機�
 
 在你想要維護的儲存庫中，執行下列其中一種做法。
 
-- 若已安裝外掛程式：在 Claude Code 中執行 `/scriptura:setup`（確認同意之後，會執行 `scriptura enable`）。
+- 若已安裝外掛程式：在 Claude Code 中執行 `/scriptura:setup`（它會先在對話中確認文件將被自動 commit 並 push，再執行 `scriptura enable`）。
 - 直接從命令列執行：
 
 ```powershell
-scriptura enable --repo D:\Dev\MyRepo --accept-consent 1
+scriptura enable --repo D:\Dev\MyRepo
 ```
 
-`--accept-consent` 是同意文件的目前版本（目前為 `1`）。若省略或版本錯誤，指令會印出關於傳送資料與費用的說明，並拒絕執行。註冊之前，`enable` 會把「目前的 push 狀態」記錄為已處理，因此啟用之前所做的 push 之後絕不會被處理。
-
-## 模式
-
-| 模式 | 行為 |
-| --- | --- |
-| `propose`（預設） | 每次 push 時，worker 會在用完即棄的 clone 中更新文件，並**將差異儲存為 patch**。工作樹、`.git` 與 remote 都不會被更動。以 `review` 檢查，並以 `apply` 套用到工作樹（不會 stage 任何內容）。 |
-| `push` | worker 更新文件，並自動 commit 與 push。僅在明確指定 `--mode push` 時才可使用。需要 remote 與 upstream，且省略 `--branches` 時只會以目前的分支為對象。 |
-| `off` | 什麼都不做（註冊會保留）。 |
+`enable` 需要 remote、分支（不能是 detached HEAD）與 upstream；省略 `--branches` 時只以目前的分支為對象。此後，每次 push 之後文件都會被自動 commit 並 push（請見「費用與資料傳送」）。註冊之前，`enable` 會把「目前的 push 狀態」記錄為已處理，因此啟用之前的 push 之後也不會被處理。先前的 `--mode` 與 `--accept-consent` 選項已被移除，指定它們會報錯並被拒絕。
 
 ## 設定檔
 
@@ -89,18 +80,12 @@ scriptura enable --repo D:\Dev\MyRepo --accept-consent 1
 
 你可以用 `SCRIPTURA_CONFIG`（檔案的絕對路徑）或 `SCRIPTURA_HOME`（`<SCRIPTURA_HOME>/config.toml`）覆寫它。它通常會由 `enable` / `disable` / `pause` / `resume` 以及管理介面改寫，因此不需要手動編輯。設定檔損壞、出現未知的鍵，或 `schema` 過新時，都會退回「什麼都不做」，而 `enable` 等指令會失敗且不會改寫該檔案。
 
-`schema` 可以是 1 或 2。儲存時採用「所需的最低版本」：除非你使用了各種類設定（`[kinds.*]`）、`[defaults] instructions`、將 `CHANGELOG.md` 或自訂種類列為目標的設定，或在管理介面中給予的同意，否則檔案會維持在 `schema = 1`（讓舊版 Scriptura 仍能讀取）。只要使用其中任何一項，就會變成 `schema = 2`，而讀取它的舊版本會退回「什麼都不做」。
+儲存時一律寫入 `schema = 3`。`schema` 為 1、2 或省略（由舊版 Scriptura 寫入）的檔案會被視為舊格式，並在讀取時轉換（請見「舊設定的遷移」）；比 3 更新的 schema 會退回「什麼都不做」。舊版 Scriptura 讀取 schema 3 的檔案時同樣什麼都不做，因此同時使用外掛程式版與 Setup 版時，請兩者都更新。
 
 ```toml
-schema = 1
-
-[consent]
-version = 1
-accepted_at = "2026-11-14T00:00:00+00:00"
-source = "cli"
+schema = 3
 
 [defaults]
-mode = "propose"                                # propose / push / off
 documents = ["AGENTS.md", "DESIGN.md", "README.md"]
 exclude = ["private/**"]                        # 會「追加」到預設的敏感樣式中（不允許含有 `)`、空白或控制字元的樣式）
 
@@ -118,7 +103,6 @@ owners = []                                     # 用於 remote-owner，例如 "
 [[repository]]
 root = "D:/Dev/MyRepo"
 remote = "github.com/me/myrepo"                 # 預期的 push 目的地（不符時會略過）
-mode = "propose"
 branches = ["main"]                             # 空陣列表示不限制
 documents = ["README.md"]
 paused = false
@@ -127,6 +111,8 @@ paused = false
 ## 文件種類
 
 要維護的文件以「種類」來管理。
+
+在管理介面中，同樣的設定可以在「設定」的「文件」分頁中編輯（預設的目標文件 `defaults.documents` 也在這裡設定）。
 
 | 種類 | 對象 | 預設 |
 | --- | --- | --- |
@@ -158,7 +144,7 @@ paused = false
 
 ### 維護後檢查
 
-上限（`max_chars` / `max_bytes`）、`required_headings`、AGENTS 須小於 30,000 位元組，以及已發布的 CHANGELOG 條目不可變更，這些都由 Rust 檢查，與 worker 的權限模式（`restricted` / `bypass`）無關。違反時，`push` 模式不會 commit（變更會留在工作樹中，下一次 hook 會執行相同的檢查），而 `propose` 模式則不會建立更新提案，並予以駁回（`rejected`），同時推進已處理位置。同一次 push 不會重新執行 worker。被 `propose` 駁回的項目只能用 `run-now` 重新建立。
+上限（`max_chars` / `max_bytes`）、`required_headings`、AGENTS 小於 30,000 位元組，以及已發布 CHANGELOG 項目的不變性，無論 worker 的權限模式（`restricted` / `bypass`）為何，都由 Rust 檢查。違規時不會 commit（變更會留在工作樹中，下一次 hook 會執行相同的檢查），也不會針對同一次 push 重新執行 worker。
 
 ### 時機（`[kinds.<id>.timing]`）
 
@@ -176,18 +162,18 @@ paused = false
 
 ### CHANGELOG 維護（`[kinds.changelog.changelog]`）
 
-- 它會沿用既有的格式（Keep a Changelog 的內嵌範本只在建立檔案時使用）。每次 push 只會更新 `Unreleased` 區段，worker 不能更動已發布的區段。Rust 會比較維護前後，若已發布區段有任何一個位元組改變、區段消失或被重新排序，或連結參考定義遺失，就視為違反上述檢查（push 模式不會 commit；propose 會駁回）。
+- 它會沿用既有的格式（Keep a Changelog 的內嵌範本只在建立檔案時使用）。每次 push 只會更新 `Unreleased` 區段，worker 不能更動已發布的區段。Rust 會比較維護前後，若已發布區段有任何一個位元組改變、區段消失或被重新排序，或連結參考定義遺失，就視為違反上述檢查（不會 commit）。
 - 關於歷史，Rust 會蒐集從最後一次變更 `CHANGELOG.md` 的 commit 到本次 push 之間的全部內容，並作為**不受信任的資料**傳入提示詞（範圍內的 commit 主旨、變更的路徑與標籤，合計最多 48 KiB）。這是因為受限的 worker 無法執行 `git log`。Scriptura 自身的維護 commit 會被排除。
 - `on_release = "promote"`（預設）：若範圍內某個標籤所對應的版本尚無區段，會將 `Unreleased` 的內容移入該版本的區段。若區段已存在，則什麼都不做（即使發布流程先行寫入，結果也相同）。`ignore` 不會建立版本區段。
 - `backfill = "tags"`（預設）：當 `CHANGELOG.md` 不存在時，會由新到舊回溯可到達的標籤來建立各版本的區段，最多回溯 `backfill_max_releases`（1 至 50，預設 20）個標籤，且相鄰標籤之間合計最多 `backfill_max_commits`（1 至 1000，預設 300）個 commit。`none` 不回溯。也可以指定 `format`（`existing` / `keep-a-changelog`）與 `release_tag`（預設 `v*`）。
-- 檔名會以不區分大小寫的方式，依其在 Git 中的拼寫來解析（`Changelog.md` 之類也屬於目標）。當拼寫無法確定為單一種，或無法從 Git 讀取編輯前的內容時，會視為無法驗證，並算作違反。在 push 模式下，若 `CHANGELOG.md` 被 Git 忽略，則不會啟動 worker，並略過新的維護。
+- 檔名會以不區分大小寫的方式，依其在 Git 中的拼寫來解析（`Changelog.md` 之類也屬於目標）。當拼寫無法確定為單一種，或無法從 Git 讀取編輯前的內容時，會視為無法驗證，並算作違反。若 `CHANGELOG.md` 被 Git 忽略，則不會啟動 worker，並略過新的維護。
 - 將版本與標籤比對時，去掉 `release_tag` 固定前綴（`v*` 的 `v`、`release-*` 的 `release-` 等）後的版本名稱也視為相符（`## [1.2.0]`）。違反的原因不會印出標題文字，而是以編號表示，例如「第 n 個版本區段」。對於已發布區段的連結參考定義，也會檢查其內容與順序是否保持不變，以及既有的標籤是否未被重新定義。
-- 限制：僅含標籤的 push（`git push --tags`）無法被偵測。它會在下一次分支 push，或使用 `--follow-tags` 時被取得。在 push 模式下維護 `CHANGELOG.md` 時，若發布流程會更新同一個檔案，可能會發生衝突（`doctor` 會指出這一點）。
+- 限制：僅含標籤的 push（`git push --tags`）無法被偵測。它會在下一次分支 push，或使用 `--follow-tags` 時被取得。維護 `CHANGELOG.md` 時，若發布流程會更新同一個檔案，可能會發生衝突（`doctor` 會指出這一點）。
 
-### 設定範例（schema 2）
+### 設定範例（schema 3）
 
 ```toml
-schema = 2
+schema = 3
 
 [defaults]
 documents = ["AGENTS.md", "DESIGN.md", "README.md", "CHANGELOG.md", "architecture"]
@@ -223,7 +209,7 @@ documents = ["README.md", "CHANGELOG.md"]
 
 ## 寫入設定與變更歷史
 
-所有設定的寫入，無論來自 CLI、管理介面，或舊版使用者的自動遷移，都經由同一條路徑（`src/ops.rs` 與 `config::update_in`）。寫入者會透過狀態資料夾中的 `config-lock.sqlite3` 序列化；管理介面會比對它所顯示的版本（檔案的 SHA-256，檔案不存在時為 `missing`），若檔案已在其他地方被變更，就不會儲存，並提示你重新載入（CLI 不會比對版本）。儲存之前，先前的內容會被保存到狀態資料夾的 `config-history/` 中（保留 50 筆），而儲存本身是原子性的。已損壞的設定不會被改寫。沒有任何變更的操作既不會儲存，也不會保存備份。你可以從管理介面的「History」檢視差異並還原；還原前的內容也會保留在歷史中。當還原會新增註冊時，會顯示確認畫面，且每筆註冊的起點（用來避免處理啟用之前的 push 的位置）會在儲存之前記錄下來。若還原會新增 push 模式的註冊，或把註冊變更為 push，則會被拒絕，並導向 `enable --mode push`（它會檢查 remote 與 upstream）。
+所有設定的寫入，無論來自 CLI、管理介面，或舊版使用者的自動遷移，都經由同一條路徑（`src/ops.rs` 與 `config::update_in`）。寫入者會透過狀態資料夾中的 `config-lock.sqlite3` 序列化；管理介面會比對它所顯示的版本（檔案的 SHA-256，檔案不存在時為 `missing`），若檔案已在其他地方被變更，就不會儲存，並提示你重新載入（CLI 不會比對版本）。儲存之前，先前的內容會被保存到狀態資料夾的 `config-history/` 中（保留 50 筆），而儲存本身是原子性的。已損壞的設定不會被改寫。沒有任何變更的操作既不會儲存，也不會保存備份。你可以從管理介面的「設定變更歷程」檢視差異並還原；還原前的內容也會保留在歷史中。當還原會新增註冊（包括已暫停的）時，每筆註冊的起點（用來避免處理啟用之前的 push 的位置）會在儲存之前記錄下來。若還原會新增有效的註冊（既未暫停，也不是被遷移停止的），或把註冊變為有效，則會被拒絕，並導向 `enable`（它會檢查 remote 與 upstream）；被遷移停止的註冊也不能透過還原重新啟用。
 
 ## 管理介面（`scriptura ui`）
 
@@ -232,7 +218,7 @@ scriptura ui [--port <n>] [--no-open] [--tray]
 scriptura ui --autostart on|off
 ```
 
-這是一個以瀏覽器操作的畫面，用來處理設定、更新提案與診斷。提供 9 種語言（ja、en、zh-CN、zh-TW、ko、es、fr、de、pt-BR）。語言依下列順序選擇：畫面頂端的語言選擇器（儲存在 cookie 中）→ 瀏覽器的 `Accept-Language` → 英文。預設不會常駐：當你在畫面上選擇「Quit」、按下 Ctrl+C，或閒置 60 分鐘後，啟動它的指令就會結束（加上 `--tray` 則會常駐，見下文）。hook 不會查看該畫面是否開啟。它由 cargo feature `ui` 控制（預設啟用），以 `--no-default-features` 建置時不會包含（此時 `scriptura ui` 會拒絕並結束）。
+這是一個以瀏覽器操作的畫面，用來處理儲存庫、歷程、設定（包含文件）與診斷。提供 9 種語言（ja、en、zh-CN、zh-TW、ko、es、fr、de、pt-BR）。語言依下列順序選擇：畫面頂端的語言選擇器（儲存在 cookie 中）→ 瀏覽器的 `Accept-Language` → 英文。預設不會常駐：當你在畫面上選擇「Quit」、按下 Ctrl+C，或閒置 60 分鐘後，啟動它的指令就會結束（加上 `--tray` 則會常駐，見下文）。hook 不會查看該畫面是否開啟。它由 cargo feature `ui` 控制（預設啟用），以 `--no-default-features` 建置時不會包含（此時 `scriptura ui` 會拒絕並結束）。
 
 - **監聽**：僅限 `127.0.0.1`（預設連接埠為 7468；`--port 0` 會挑選一個空閒連接埠）。若連接埠已被占用，則結束。
 - **常駐（`--tray`）**：在 Windows 以系統匣圖示、在 macOS 以選單列圖示的形式常駐（不支援 Linux；`--tray` 會拒絕並結束）。點擊圖示會開啟管理介面，右鍵選單提供「開啟管理畫面」「檢查更新」（僅限 Setup 版；開啟總覽畫面的「應用程式更新」面板）與「結束」。常駐期間不會因閒置而結束，而是在閒置 60 分鐘後讓工作階段失效（一直開著的分頁會得到 401），並且每次從圖示開啟畫面時都會重新核發一次性金鑰（重新核發的金鑰 5 分鐘後失效，先前未使用的金鑰會作廢）。在 Windows 上，若已在預設連接埠常駐，再次執行 `scriptura ui --tray` 不會啟動第二個，而是由常駐的那個開啟瀏覽器。若是從終端機以外（例如開始功能表）啟動，它會以沒有主控台視窗的處理程序重新啟動自己。
@@ -240,8 +226,9 @@ scriptura ui --autostart on|off
 - **「應用程式更新」面板（僅限 Setup 版）**：總覽畫面的「應用程式更新」面板（`#updates`）顯示目前版本，提供自動更新與登入時常駐的核取方塊、「檢查更新」按鈕，以及「安裝更新」按鈕（有新版本時顯示）。檢查會忽略 24 小時的間隔，且不會下載。安裝會下載並驗證簽署者；若安裝資料夾中沒有其他 Scriptura 處理程序（hook、worker、另一個管理介面）在執行，也沒有進行中的 run-now，就請求更新程式套用並結束管理介面（否則不做任何事，並提示稍後再試；不會強制終止任何處理程序）。常駐時由更新程式啟動新版本，但工作階段是全新的，已開啟的分頁會提示「請從系統匣（功能表列）圖示重新開啟」。從終端機啟動的管理介面只會結束。系統匣選單中的「檢查更新」會開啟此面板並自動開始檢查。沒有 JavaScript 時，同樣的按鈕仍可使用，結果顯示在另一個畫面。在非 Setup 版中，面板只顯示「僅 Setup 版可用」。
 - **保護**：每次啟動時產生的一次性金鑰 URL（`/auth?key=…`）會被換成一次性的工作階段 cookie（`HttpOnly; SameSite=Strict`）（沒有 cookie 時，回應為 401）。Host 必須只能是 `127.0.0.1:<port>` 或 `localhost:<port>`；若有 Origin，必須為同源；POST 需要同源（`Origin` 或 `Sec-Fetch-Site`）加上 CSRF 權杖。回應標頭如 CSP、`nosniff` 與 `no-store` 都會加上，且絕不顯示祕密值。由於瀏覽器不會依連接埠隔離 cookie，該 cookie 也會被送往同一台 PC 上其他 127.0.0.1 連接埠上執行的服務（同一位使用者的處理程序本來就能存取設定檔，因此唯一的疑慮是權限不同的本機服務）。
 - **衝突**：儲存時會比對其所顯示的版本，若檔案已在其他地方被變更，會提示你重新載入。
-- **確認畫面**：切換到 push 模式、將權限切換為 `bypass`、將註冊政策變更為 `all` / `remote-owner`、新增自訂種類的目標路徑、記錄同意、移除註冊、套用更新提案，以及在 push 模式下的 `run-now`（還有將歷史還原到包含上述任何一項的版本）都不會在第一次送出時寫入；它們會顯示變更清單，並要求一次性的確認（10 分鐘內有效）。
-- **畫面**：頁首有五個項目：Overview / Repositories（註冊、啟用、暫停、恢復、移除、模式與目標文件、`run-now`）/ Document kinds（新增、編輯與刪除種類；編輯 `templates/` 中的範本）/ Update proposals（檢視差異、套用、捨棄）/ Settings。Settings 以分頁呈現：General / Worker / Consent / History（變更歷史、差異、還原）/ Diagnostics。Worker 畫面的模型與 effort 以清單選擇，而非手動輸入：模型清單為內建清單；若已設定環境變數 `ANTHROPIC_API_KEY`，按下「更新模型清單」按鈕會從 Anthropic API 將最新模型取得到記憶體中（Scriptura 不會儲存或顯示金鑰，僅開啟畫面不會連線，已儲存但不在清單中的值會以「不在清單中」保留）。時間依執行畫面的電腦的本地時區顯示（`YYYY-MM-DD HH:MM`），儲存格式與 CLI 的 JSON 不變。`run-now` 需要時間，因此會在背景執行，你可以在畫面上確認其狀態。
+- **確認畫面**：啟用儲存庫（文件會被自動 commit 並 push）、將權限切換為 `bypass`、將自動註冊政策改為 `all` / `remote-owner`（你 push 的所有儲存庫，或所列擁有者名下的所有儲存庫都會被維護）、新增自訂種類的目標路徑、移除註冊，以及 `run-now`（以及還原到包含這些內容的歷史版本），第一次送出時不會寫入，而是顯示變更清單並要求一次性確認（10 分鐘內有效）。
+- **畫面**：頁首有四個項目：Overview / Repositories（註冊、啟用、暫停、恢復、移除、目標文件、`run-now`；被設定遷移停止的註冊不顯示「恢復」按鈕而顯示說明，以「啟用」重新啟用）/ History（維護歷程：結果、提交、原因）/ Settings。Settings 以分頁呈現：General（排除項目、共用的附加指示、自動註冊政策）/ Documents（預設的目標文件，以及新增、編輯與刪除文件種類和編輯 `templates/` 中的範本；`/settings/documents`）/ Worker / Settings history（變更歷史、差異、還原）/ Diagnostics。先前的 Document kinds、Update proposals 與 Consent 畫面已被移除（舊的 URL 會回傳 404）。Worker 畫面的模型與 effort 以清單選擇，而非手動輸入：模型清單為內建清單；若已設定環境變數 `ANTHROPIC_API_KEY`，按下「更新模型清單」按鈕會從 Anthropic API 將最新模型取得到記憶體中（Scriptura 不會儲存或顯示金鑰，僅開啟畫面不會連線，已儲存但不在清單中的值會以「不在清單中」保留）。時間依執行畫面的電腦的本地時區顯示（`YYYY-MM-DD HH:MM`），儲存格式與 CLI 的 JSON 不變。`run-now` 需要時間，因此會在背景執行，你可以在畫面上確認其狀態。
+- **維護歷程**：每次啟動了 worker 的維護執行，以及在啟動前就失敗的嘗試（由 hook 或 `run-now` 觸發），都會記錄到狀態 DB（`maintenance_runs`），並顯示在「History」中（可依儲存庫篩選，每頁 50 筆）：觸發方式、種類、結果（已提交並推送 / 無變更 / 已駁回 / 已暫停 / 失敗 / 結果不明）、各文件新增與刪除的行數、範圍與結果提交，以及原因。不會儲存文件內容與差異。每個儲存庫最多保留最新 200 筆，總計 2,000 筆，重複發生的相同失敗會合併為一列，並以「×次數」顯示。既未啟動 worker 也未失敗的執行（例如沒有到期的種類）不會記錄。
 
 ## 輸出語言
 
@@ -253,17 +240,14 @@ CLI、hook 與安裝程式的指引輸出提供 9 種語言（ja、en、zh-CN、
 
 | 指令 | 說明 |
 | --- | --- |
-| `enable --repo <path> --accept-consent <version> [--mode propose\|push\|off] [--branches a,b] [--documents AGENTS.md,README.md]` | 註冊並啟用儲存庫。`--documents` 接受 4 種內建種類（包含 `CHANGELOG.md`；不區分大小寫）以及設定中所定義的自訂種類 id。 |
+| `enable --repo <path> [--branches a,b] [--documents AGENTS.md,README.md]` | 註冊並啟用儲存庫（此後文件會被自動 commit 並 push）；被設定遷移停止的註冊也用它重新啟用。需要 remote、分支與 upstream，省略 `--branches` 時以目前的分支為對象。`--documents` 接受 4 種內建種類（包含 `CHANGELOG.md`；不區分大小寫）以及設定中所定義的自訂種類 id。已移除的 `--mode` / `--accept-consent` 選項與已移除的 `review` / `apply` / `discard` 指令會報錯並被拒絕（`<state>/proposals/` 中遺留的修補檔仍可用 `git apply` 套用）。 |
 | `disable --repo <path>` | 移除註冊。 |
 | `pause [--repo <path>]` / `resume [--repo <path>]` | 暫停／恢復（省略 `--repo` 時為目前工作目錄所在的儲存庫）。 |
-| `status` | 顯示安裝狀態、設定、同意、註冊、worker 設定、更新提案的數量，以及 Setup 版的資訊（`setup`：是否受管理、packId、版本、執行檔、自動更新、登入時管理介面是否常駐（`trayAutostart`）、最近的檢查／失敗時間、已下載的版本、註冊結果，以及遺留的舊版單機安裝）。`installedVersion` 來自單機版 `install` 的記錄（`install.json`，若無則為更早版本的 `current.json`）。 `installForm` 表示執行中程式的安裝形式（`setup` = Setup 版，`standalone` = 單機版 `install`，`other` = 外掛內建或開發建置），而 `installed` 只表示單機版 `install` 的安裝位置是否有執行檔。 |
+| `status` | 顯示安裝狀態、設定、註冊（各自的 `paused` 與 `migratedFrom`）、worker 設定、設定檔是否仍為舊格式（`legacy`），以及 Setup 版的資訊（`setup`：是否受管理、packId、版本、執行檔、自動更新、登入時管理介面是否常駐（`trayAutostart`）、最近的檢查／失敗時間、已下載的版本、註冊結果，以及遺留的舊版單機安裝）。`installedVersion` 來自單機版 `install` 的記錄（`install.json`，若無則為更早版本的 `current.json`）。 `installForm` 表示執行中程式的安裝形式（`setup` = Setup 版，`standalone` = 單機版 `install`，`other` = 外掛內建或開發建置），而 `installed` 只表示單機版 `install` 的安裝位置是否有執行檔。 |
 | `doctor [--verify]` | 診斷環境與設定（詳見後文）。 |
-| `run-now [--repo <path>] [--documents <id,...>]` | 不等待 push，立即執行一次維護（僅限已註冊且已同意的儲存庫；忽略時機，並處理所有已啟用的種類）。`--documents` 可縮小要處理的種類（未定義的種類，或在該儲存庫中已停用的種類，會在不啟動 worker 的情況下被拒絕）。**注意**：縮小範圍的 `run-now` 同樣會推進已處理位置，且由於每個 commit 只有一個更新提案，縮小範圍之外的種類在該次 push 中不會被維護。違反維護後檢查的 propose 會回傳 `outcome` 為 `rejected`（附帶 `reason`；這不算失敗，該次 push 視為已處理）。 |
+| `run-now [--repo <path>] [--documents <id,...>]` | 不等待 push，立即執行一次維護（僅限已註冊且未暫停的儲存庫；忽略時機，並處理所有已啟用的種類）。文件會和一般執行一樣被 commit 並 push。`--documents` 可縮小要處理的種類（未定義的種類，或在該儲存庫中已停用的種類，會在不啟動 worker 的情況下被拒絕）。**注意**：縮小範圍的 `run-now` 同樣會推進已處理位置，因此縮小範圍之外的種類在該次 push 中不會被維護。成功時 `outcome` 為 `completed`。 |
 | `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | 列出文件種類（內建與自訂），並顯示單一種類的詳細資訊（啟用或停用、目標路徑及其是否存在、上限、時機、範本狀態、最後完成時間；`show` 也會印出已設定的 guidance 與額外指示。唯讀，且不會印出文件內容）。 |
 | `ui [--port <n>] [--no-open] [--tray]` / `ui --autostart on\|off` | 啟動管理介面（詳見前文；`--tray` 使其常駐）/ 切換 Setup 版的登入時常駐設定。不可使用 `--json`。 |
-| `review [sha\|latest] [--repo <path>]` | 檢視更新提案的 diffstat、patch 路徑與目標文件。 |
-| `apply [sha\|latest] [--repo <path>]` | 將更新提案套用到工作樹。若目標文件有未 commit 的變更則拒絕。 |
-| `discard [sha\|latest] [--repo <path>]` | 捨棄更新提案。 |
 | `connect claude-code [--apply] [--executable <absolute path>]` / `--remove [--apply]` | 註冊 settings.json 的 Stop hook（逐個 hook 取代舊版維護 hook）／只移除 Scriptura 的 hook。在傳入 `--apply` 之前僅為預覽。 |
 | `update [--check] [--auto on\|off]` | 顯示 Setup 版的自動更新狀態／立即檢查並下載（不套用）／切換自動更新。 |
 | `update-apply` | 僅在沒有其他 Scriptura 處理程序正在執行時，才在驗證簽署者之後套用已下載的更新（登入時自動啟動。結果為一行 JSON，其 `status` 為 `unmanaged` / `disabled` / `nothingPending` / `busy` / `untrusted`（結束碼 2）/ `applied`）。 |
@@ -272,10 +256,10 @@ CLI、hook 與安裝程式的指引輸出提供 9 種語言（ja、en、zh-CN、
 
 ## 安全性
 
-- **選擇啟用**：沒有同意（含版本）與儲存庫註冊時，什麼都不會執行，甚至不會建立狀態資料夾。註冊只保存在使用者自己的設定檔中。
-- **不更動工作樹（propose）**：被 push 的 commit 會被展開到狀態資料夾下用完即棄的 clone 中，worker 只在那裡執行。由於 clone 是由被 push 的 commit 建立的，使用者未追蹤與被忽略的檔案（例如 `.env`）並不存在於 clone 中。然而，這僅僅是「檔案不在 clone 裡」這個事實；並不保證 `restricted` 的權限規則（`Read(./**)` 與拒絕敏感樣式）會禁止讀取 clone 之外的內容（這些規則是否拒絕 clone 之外的路徑尚未驗證）。clone 的 `origin` 已被移除，因此即使 worker 執行 push，也不會到達使用者的儲存庫。
+- **選擇啟用**：在註冊儲存庫（`enable` 或管理介面）之前，什麼都不會執行，甚至不會建立狀態資料夾。註冊只保存在使用者自己的設定檔中。
+- **自動 commit 並 push**：worker 在你真實的工作樹中執行，Scriptura 會不經詢問就 commit 並 push 目標文件。因此 `enable` 要求有 remote、分支與 upstream，而且下面的執行後檢查發現問題時不會 commit。請只對可以接受這種做法的儲存庫啟用；先前的 propose 模式（更新提案）已不存在。
 - **敏感樣式**：`.env*` / `*.pem` / `*.key` / `*.p12` / `*.pfx` / `id_rsa*` / `id_ed25519*` / `**/secrets/**` / `.git/config` 在 `restricted` 時，會被套用為 worker 的 Read / Edit 拒絕規則（`--disallowedTools`）。你可以用 `exclude` 追加，但無法取代它們而移除任何一項。使用 `bypass`（相容舊版；略過所有權限提示）時，這些規則不會被套用。
-- **執行後檢查**：若 worker 變更了目標文件（與 `.gitignore`）以外的任何內容，其結果不會被採用。Propose 會比較整個用完即棄的 clone（包含被忽略檔案的任何增長）。Push 模式在使用者的實際工作樹中執行，因此只有在 `restricted` 下，才會比較 worker 前後工作樹中已追蹤與未追蹤的檔案（對 `target/` 這類被忽略檔案的變更會被排除，因為它們無法與使用者同時進行的工作區分），而 `bypass` 則和以往一樣，只對要 commit 的文件做雜湊檢查。在 push 模式下，commit 與 push 狀態不確定時不會重新執行，而是透過狀態 DB 進行調和。上限、必要標題，以及已發布 CHANGELOG 條目的不可變性，與權限模式無關，一律會被檢查（見前文）。
+- **執行後檢查**：若 worker 變更了目標文件（與 `.gitignore`）以外的內容，其結果不會被採用。由於 worker 在使用者真實的工作樹中執行，只有在 `restricted` 下才會在 worker 前後比對工作樹中已追蹤與未追蹤的檔案（`target/` 等被忽略的檔案無法與使用者同時進行的工作區分，因此不在比對範圍內）；`bypass` 仍然只對要 commit 的文件做雜湊檢查。commit 與 push 的結果不確定時不會重新執行，而是透過狀態 DB 進行核對。上限、必要標題與已發布 CHANGELOG 項目的不變性，與權限模式無關，一律會被檢查（見上文）。
 - **環境衛生**：源自父工作階段（例如桌面應用程式）的中繼設定，會從傳給 worker 的環境變數中移除。
 
 ## 費用與資料傳送
@@ -286,20 +270,29 @@ CLI、hook 與安裝程式的指引輸出提供 9 種語言（ja、en、zh-CN、
 
 `scriptura doctor [--verify] [--json]` 會為每個項目回傳 `{id, status, detail}`（status 為 `ok` / `warn` / `fail` / `info`）。只要有任何 `fail`，結束碼就是 1。
 
-它會檢查所支援的平台、`git`、`claude`（執行檔的解析）、`claude auth status`（在與 worker 相同的環境中執行，只查看結束碼與 `authMethod`）、`gh`（僅在有 push 模式的 GitHub 儲存庫時）、設定與同意、狀態資料夾是否可寫入、重複的 hook 註冊、`allowManagedHooksOnly` / `disableAllHooks`，以及舊版 `agents-maintenance` 遺留的註冊。對於 Setup 版，它還會回報外掛程式與 Setup 版之間的重複註冊（`setupPlugin`）、Setup 版的 hook 是否存在（`setupHook`）、遺留的舊版單機安裝（`legacyInstall`），以及自動更新狀態（`autoUpdate`）（非 Setup 版則只有單一個 `info` 項目 `setup`）。`kinds` 項目會檢查文件種類的範本是否可讀取（位置與大小），並在上限小於既有文件目前的大小時（下一次維護可能會被駁回），以及存在以 push 模式維護 `CHANGELOG.md` 的儲存庫時（與發布流程衝突），回報 `info`。`--verify` 只會檢查外掛程式隨附的 `SHA256SUMS` 中所列執行檔（`bin/scriptura.exe` 與 `libexec/scriptura-*`）的 SHA-256（啟動器、hook 與 skill 不在範圍內；外掛程式之外的執行檔也不在範圍內）。
+它會檢查所支援的平台、`git`、`claude`（執行檔的解析）、`claude auth status`（在與 worker 相同的環境中執行，只查看結束碼與 `authMethod`）、`gh`（僅在有已啟用的 GitHub 儲存庫時）、設定（包含代表舊格式設定的 `configLegacy`、代表被遷移停止的註冊的 `migratedStopped`，以及代表已移除的更新提案遺留修補檔的 `legacyProposals`）、狀態資料夾是否可寫入、重複的 hook 註冊、`allowManagedHooksOnly` / `disableAllHooks`，以及舊版 `agents-maintenance` 遺留的註冊。對於 Setup 版，它還會回報外掛程式與 Setup 版之間的重複註冊（`setupPlugin`）、Setup 版的 hook 是否存在（`setupHook`）、遺留的舊版單機安裝（`legacyInstall`），以及自動更新狀態（`autoUpdate`）（非 Setup 版則只有單一個 `info` 項目 `setup`）。`kinds` 項目會檢查文件種類的範本是否可讀取（位置與大小），並在上限小於既有文件目前的大小時（下一次維護可能會被駁回），以及存在維護 `CHANGELOG.md` 的儲存庫時（與發布流程衝突），回報 `info`。`--verify` 只會檢查外掛程式隨附的 `SHA256SUMS` 中所列執行檔（`bin/scriptura.exe` 與 `libexec/scriptura-*`）的 SHA-256（啟動器、hook 與 skill 不在範圍內；外掛程式之外的執行檔也不在範圍內）。
 
 ## 狀態與儲存位置
 
 | 位置 | Windows | macOS | Linux |
 | --- | --- | --- | --- |
 | 安裝位置（固定的執行檔 `bin\scriptura(.exe)`） | `%LOCALAPPDATA%\Programs\Scriptura` | `~/Library/Application Support/Scriptura/app` | `$XDG_DATA_HOME/scriptura`（預設為 `~/.local/share/scriptura`） |
-| 狀態（DB、鎖、發布、更新提案、設定變更歷史 `config-history/`） | `%LOCALAPPDATA%\Scriptura\state` | `~/Library/Application Support/Scriptura/state` | `$XDG_STATE_HOME/scriptura`（預設為 `~/.local/state/scriptura`） |
+| 狀態（DB、鎖、發布、維護歷程（在 DB 中）、設定變更歷史 `config-history/`） | `%LOCALAPPDATA%\Scriptura\state` | `~/Library/Application Support/Scriptura/state` | `$XDG_STATE_HOME/scriptura`（預設為 `~/.local/state/scriptura`） |
 
 將 `SCRIPTURA_HOME` 設為絕對路徑時，狀態會放在 `<SCRIPTURA_HOME>/state`，安裝位置為 `<SCRIPTURA_HOME>/app`，設定則為 `<SCRIPTURA_HOME>/config.toml`。`SCRIPTURA_DB` 也可以只把狀態 DB 移到別處。範本放在與設定檔相同資料夾的 `templates/` 中。不會寫入任何東西到 Codex 或 Claude Code 的家目錄（除了 `connect claude-code --apply` / `--remove`、Setup 版的自動註冊，以及 `uninstall-setup --apply` 會改寫 `settings.json` 之外）。Setup 版的安裝位置（Windows 為 `%LOCALAPPDATA%\ScripturaApp`）由 Velopack 管理，並會在更新時被取代，因此不會在那裡保存任何狀態或設定。
 
 ## 舊版使用者的自動遷移
 
-曾執行過較舊的 Scriptura（沒有設定檔的版本）且仍保有狀態 DB 的使用者，在沒有設定檔的情況下執行 hook 時，會自動建立恰好一次設定檔，其行為與以往相同（所有儲存庫、`push` 模式、權限 bypass），並會收到通知。同意的來源會記錄為 `legacy-migration`。新使用者不會建立任何東西。若想縮小對象範圍，請以 `enable` 重新註冊，並設定 `policy = "explicit"`。舊版 `agents-maintenance` 的狀態（`~/.codex/hooks/state`）不會被沿用；它會從空的狀態開始。
+曾執行過較舊的 Scriptura（沒有設定檔的版本）且仍保有狀態 DB 的使用者，在沒有設定檔的情況下執行 hook 時，會自動建立恰好一次設定檔，其行為與以往相同（所有儲存庫、`push` 模式、權限 bypass），並會收到通知。新使用者不會建立任何東西。若想縮小對象範圍，請以 `enable` 重新註冊，並設定 `policy = "explicit"`。舊版 `agents-maintenance` 的狀態（`~/.codex/hooks/state`）不會被沿用；它會從空的狀態開始。
+
+## 舊設定的遷移（移除同意與 propose）
+
+- 設定檔現在一律以 `schema = 3` 儲存。`schema` 為 1、2 或省略的檔案會被視為舊格式，並在讀取時轉換；下一次 hook（或任何設定變更）會一次性以 schema 3 儲存，把先前的內容保存到 `config-history/`，並一次性通知被停止的註冊數量。
+- 有同意且實際以 `push` 模式執行的註冊會維持原樣繼續執行。其他註冊（`propose`、`off` 或沒有同意）會被暫停並記錄來源（`migrated_from`），在你用 `scriptura enable --repo <path>` 或管理介面重新啟用之前什麼都不做（由於 `enable` 會檢查 remote 與 upstream，`resume` 與從歷史還原都不能讓它們重新執行）。`status` 會顯示 `migratedFrom`，`doctor` 也會回報這些註冊。
+- `enrollment.policy` 為 `all` / `remote-owner` 時會回到 `explicit`（保留 owners），但檔案中有同意且 `defaults.mode = "push"` 的情況除外。
+- 刪除 `consent` 與 `mode` 鍵。仍帶有它們的 schema 3 檔案無效，什麼都不會執行。
+- `<state>/proposals/` 中遺留的修補檔既不會被讀取，也不會被刪除。不需要的話請手動刪除；尚未套用的修補檔可以用 `git apply` 套用。用完即丟的複製（`work-*`）也不再被自動清理。
+- 舊版 Scriptura 讀取 schema 3 的檔案時什麼都不做，因此同時使用外掛程式版與 Setup 版時，請兩者都更新。
 
 ## 不支援／未驗證
 

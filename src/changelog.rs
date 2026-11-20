@@ -3,7 +3,7 @@
 //! # 役割
 //! - **リリース済みエントリ不変の検査**（`released_entries_error`。純粋関数）: worker の保守前後で、
 //!   `Unreleased` 以外の版の節が 1 バイトも変わっていないことを Rust が確かめる。違反した変更は
-//!   push モードでは commit せず（phase は `ready` のまま）、propose では `Rejected` にする。
+//!   commit せず（phase は `ready` のまま）に止める。
 //!   どちらも上限超過（`kinds::limit_error`）と同じ経路・同じ扱いで、権限モードに関係なく通る。
 //! - **履歴の収集**（`prompt_parts`）: restricted の worker は `git log` を実行できないので、
 //!   CHANGELOG を最後に変更したコミット（起点）から今回 push までのコミット件名・変更パス・範囲内のタグを
@@ -1055,9 +1055,9 @@ pub fn prompt_parts(
 /// 保守後のリリース済みエントリ不変の検査（I/O）。権限モードに関係なく、上限検査の直後に呼ぶ。
 ///
 /// - `rel`: 検査する CHANGELOG のリポジトリ相対パス（記録上の実キー）。
-/// - `rev`: 編集前の内容を取るコミット（push モードは保守開始時の HEAD、propose は push されたコミット）。
-/// - `existed`: 編集前に対象があったか。Some なら呼び出し側の判断（push モードは記録のハッシュが null でないか）、
-///   None なら `rev` に存在するかで決める（propose のクローンは `rev` そのものなので同じ意味）。
+/// - `rev`: 編集前の内容を取るコミット（保守開始時の HEAD）。
+/// - `existed`: 編集前に対象があったか。Some なら呼び出し側の判断（記録のハッシュが null でないか）、
+///   None なら `rev` に存在するかで決める。
 ///
 /// 編集前の内容があるはずなのに Git から読めない（追跡されていない文書など）ときは検査できないので
 /// 違反として扱う（fail-closed）。
@@ -1068,7 +1068,7 @@ pub fn check_released_entries(
     existed: Option<bool>,
     kind: &ResolvedKind,
 ) -> Option<String> {
-    // `rel` は作業ツリー側の名前（propose は既定の `CHANGELOG.md`、push モードは index の実キー）。
+    // `rel` は作業ツリー側の名前（index の実キー）。
     // Git 上の綴りが違ってもよいように、`rev` のツリーから実際の綴りを引く（大文字小文字を区別しない）。
     let lookup = lookup_in_rev(root, rev, rel);
     // 呼び出し側が編集前の存在を知らない（None）ときは、`rev` にあるかで決める。判定不能は「あった」側に

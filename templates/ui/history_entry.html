@@ -1,11 +1,11 @@
 {% extends "ui/base.html" %}
 {% block content %}
-<a class="back" href="/history">← {{ crate::locale::tr("ui.history.back") }}</a>
+<a class="back" href="/settings/history">← {{ crate::locale::tr("ui.history.back") }}</a>
 <div class="heading"><h1>{{ crate::locale::tr("ui.history.entry") }} <code>{{ id }}</code></h1></div>
 <section class="panel">
   <p>{{ state }}</p>
   {% if restorable %}
-  <form method="post" action="/history/restore">
+  <form method="post" action="/settings/history/restore">
     <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="id" value="{{ id }}">
     <button class="primary" type="submit">{{ crate::locale::tr("ui.history.restore") }}</button>
     <span class="note">{{ crate::locale::tr("ui.history.restore_note") }}</span>

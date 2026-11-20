@@ -6,7 +6,7 @@
 // 設計上の要点:
 // - 設定の書き込みはすべて `config::update_in`（設定ロック・版の照合・変更履歴・アトミック保存）を通す。
 //   CLI は期待する版を省略（None）し、画面は表示時の版を必ず渡す。
-// - 拒否される経路（同意なし・Git でない・remote / upstream が無い・設定が無い・未登録・壊れた設定）は、
+// - 拒否される経路（Git でない・remote / upstream が無い・設定が無い・未登録・壊れた設定）は、
 //   設定ロックを取る前に返す。拒否しただけで状態フォルダーにロックや履歴を作らないため。
 //   ロック内でも同じ判定をやり直す（ロック前の確認と保存の間に他で変更されうるため）。
 // - `update_in` に渡す変更関数は純粋・短時間にする（Git・poll ロックを使わない）。enable の起点の記録
@@ -20,13 +20,10 @@ use std::{
 
 use crate::{
     config::{
-        self, CURRENT_CONSENT_VERSION, Config, Consent, ConsentSource, Document, HistoryEntry,
-        Loaded, Mode, Repository, Revision, SkipReason, Store, UpdateError, Updated,
-        normalize_remote, normalize_root,
+        self, Config, Document, HistoryEntry, Loaded, Repository, Revision, SkipReason, Store,
+        UpdateError, Updated, normalize_remote, normalize_root,
     },
-    kinds,
-    maintenance::{self, PollOptions, PollPlan},
-    proposal, timing,
+    kinds, maintenance, timing,
 };
 
 type OpResult<T> = Result<T, UpdateError>;
@@ -57,17 +54,6 @@ fn git_text(root: &Path, args: &[&str]) -> Option<String> {
 /// 指定パスを含む Git リポジトリのルート（正規化済み）。Git リポジトリでなければエラー。
 pub fn git_root(raw: &str) -> Result<PathBuf, String> {
     maintenance::resolve_repo_root(raw).ok_or_else(|| crate::t!("ops.not_git", path = raw))
-}
-
-/// 同意をこのまま保つか。現行の版で、利用者本人が明示した同意（CLI・管理画面）なら保つ。
-/// 旧利用者の自動移行で付与された同意（legacy-migration）は、明示の同意で置き換えて記録し直す
-/// （「移行で自動付与された」状態を、本人の同意に上げる従来の意図）。
-pub fn keeps_consent(consent: Option<&Consent>) -> bool {
-    matches!(
-        consent,
-        Some(c) if c.version >= CURRENT_CONSENT_VERSION
-            && matches!(c.source, ConsentSource::Cli | ConsentSource::Ui)
-    )
 }
 
 /// ロックを取らずに現在の設定を読む（拒否経路の事前確認用）。壊れていれば `Broken`。
@@ -106,28 +92,19 @@ fn require_registered(config: Option<&Config>, root: &str) -> Result<usize, Stri
 pub struct EnableRequest {
     /// リポジトリのパス（サブフォルダーでもよい。Git ルートへ正規化する）。
     pub repo: String,
-    pub mode: Mode,
-    /// 許可ブランチ。None なら push は現在のブランチだけ、propose / off は制限なし。
+    /// 許可ブランチ。None なら現在のブランチだけ。
     pub branches: Option<Vec<String>>,
     /// 対象の文書。None なら既存の登録の値（新規なら defaults）を保つ。
     pub documents: Option<Vec<Document>>,
-    /// 利用者が同意した同意文書の版。現行の版と一致しなければ拒否する。
-    pub consent_version: u32,
-    /// 同意を新たに記録するときの出所（CLI なら Cli、画面なら Ui）。
-    pub consent_source: ConsentSource,
 }
 
 /// Git の状態から決めた、設定へ書き込む値。`apply_enable` は設定ロック内でこれを適用するだけ（純粋）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct EnablePlan {
     pub root: String,
-    pub mode: Mode,
     pub branches: Vec<String>,
     pub remote: Option<String>,
     pub documents: Option<Vec<Document>>,
-    pub consent_source: ConsentSource,
-    /// 同意を新たに記録するときの時刻（RFC 3339）。
-    pub accepted_at: String,
 }
 
 /// 有効化の結果。
@@ -149,44 +126,37 @@ impl Enabled {
 }
 
 /// 有効化を設定へ適用する（純粋関数）。登録の位置を返す。
-/// 既存の登録・他の設定は保ち、明示の同意（CLI・画面）は上書きしない（`keeps_consent`）。
+/// 既存の登録・他の設定は保つ。旧形式からの移行で止めた登録（`migrated_from`）はここで解除する。
 pub fn apply_enable(config: &mut Config, plan: &EnablePlan) -> usize {
-    if !keeps_consent(config.consent.as_ref()) {
-        config.consent = Some(Consent {
-            version: CURRENT_CONSENT_VERSION,
-            accepted_at: plan.accepted_at.clone(),
-            source: plan.consent_source,
-        });
-    }
     let index = match find_repo(config, &plan.root) {
         Some(i) => i,
         None => {
             config.repository.push(Repository {
                 root: plan.root.clone(),
                 remote: None,
-                mode: None,
                 branches: Vec::new(),
                 documents: None,
                 exclude: Vec::new(),
                 paused: false,
+                migrated_from: None,
             });
             config.repository.len() - 1
         }
     };
     let repo = &mut config.repository[index];
     repo.root = plan.root.clone();
-    repo.mode = Some(plan.mode);
     repo.branches = plan.branches.clone();
     repo.remote = plan.remote.clone();
     if let Some(docs) = &plan.documents {
         repo.documents = Some(docs.clone());
     }
-    // 有効化し直したら再開扱い。
+    // 有効化し直したら再開扱い（移行で止めた由来も解除する）。
     repo.paused = false;
+    repo.migrated_from = None;
     index
 }
 
-/// Git の状態を調べて有効化の計画を作る（設定には触れない）。push モードで送信先が定まらないものは拒否。
+/// Git の状態を調べて有効化の計画を作る（設定には触れない）。文書は push されるので、送信先が定まらないものは拒否。
 pub fn plan_enable(req: &EnableRequest) -> Result<(PathBuf, EnablePlan), String> {
     let root = git_root(&req.repo)?;
     if req.branches.as_ref().is_some_and(|b| b.is_empty()) {
@@ -204,25 +174,21 @@ pub fn plan_enable(req: &EnableRequest) -> Result<(PathBuf, EnablePlan), String>
         .as_ref()
         .and_then(|b| git_text(&root, &["config", "--get", &format!("branch.{b}.remote")]))
         .filter(|r| r != ".");
-    if req.mode == Mode::Push {
-        // push モードは文書を実際に push するので、送信先が定まらないものは受け付けない。
-        if remotes.is_empty() {
-            return Err(crate::t!("ops.push_needs_remote").into());
-        }
-        // --branches を明示しても、現在のブランチの upstream は必須（push 先が定まらない登録を作らない）。
-        if branch.is_none() {
-            return Err(crate::t!("ops.push_detached").into());
-        }
-        if upstream_remote.is_none() {
-            return Err(crate::t!("ops.push_needs_upstream").into());
-        }
+    // 文書を実際に push するので、送信先が定まらないものは受け付けない。
+    if remotes.is_empty() {
+        return Err(crate::t!("ops.push_needs_remote").into());
     }
-    let branches = match (&req.branches, req.mode) {
-        (Some(list), _) => list.clone(),
-        // push は「いま居るブランチ」だけを既定にする（意図しないブランチでの push を避ける）。
-        (None, Mode::Push) => vec![branch.clone().unwrap_or_default()],
-        // propose / off はパッチを作るだけなのでブランチ制限なし。
-        (None, _) => Vec::new(),
+    // --branches を明示しても、現在のブランチの upstream は必須（push 先が定まらない登録を作らない）。
+    if branch.is_none() {
+        return Err(crate::t!("ops.push_detached").into());
+    }
+    if upstream_remote.is_none() {
+        return Err(crate::t!("ops.push_needs_upstream").into());
+    }
+    // 既定は「いま居るブランチ」だけ（意図しないブランチでの push を避ける）。
+    let branches = match &req.branches {
+        Some(list) => list.clone(),
+        None => vec![branch.clone().unwrap_or_default()],
     };
     // 期待する push 先。upstream の remote、無ければ origin、無ければ最初の remote。
     let remote_name = upstream_remote
@@ -234,19 +200,16 @@ pub fn plan_enable(req: &EnableRequest) -> Result<(PathBuf, EnablePlan), String>
         .and_then(|urls| urls.lines().find_map(normalize_remote));
     let plan = EnablePlan {
         root: root.to_string_lossy().into_owned(),
-        mode: req.mode,
         branches,
         remote,
         documents: req.documents.clone(),
-        consent_source: req.consent_source,
-        accepted_at: chrono::Utc::now().to_rfc3339(),
     };
     Ok((root, plan))
 }
 
 /// リポジトリを有効化（登録）する。
 ///
-/// 順序: 同意の版 → Git の状態 → 設定の事前確認（壊れていない・適用後に検証が通る。ロックなし）→
+/// 順序: Git の状態 → 設定の事前確認（壊れていない・適用後に検証が通る。ロックなし）→
 /// 起点の記録（`maintenance::baseline`）→ 設定ロック内で同じ変更を適用して保存。
 /// 起点 → 設定の順にするのは、保存後に失敗して「登録済みなのに起点が無い」状態を作らないため
 /// （起点だけ残っても、登録が無ければ何も処理されない）。起点の記録は状態 DB を新版として開く
@@ -259,12 +222,6 @@ pub fn enable(
     req: &EnableRequest,
     expected: Option<&Revision>,
 ) -> OpResult<Enabled> {
-    if req.consent_version != CURRENT_CONSENT_VERSION {
-        return Err(UpdateError::Rejected(crate::t!(
-            "ops.enable_consent_mismatch",
-            version = CURRENT_CONSENT_VERSION
-        )));
-    }
     let (root, plan) = plan_enable(req).map_err(UpdateError::Rejected)?;
     // 事前確認: 壊れた設定・検証に通らない変更（未定義のカスタム種類など）では起点を記録しない。
     let mut trial = peek(store, expected)?.unwrap_or_default();
@@ -293,7 +250,7 @@ pub struct Disabled {
     pub revision: Revision,
 }
 
-/// 登録を解除する（同意と他の設定は残る）。`root` は登録の root と OS の規則で照合する。
+/// 登録を解除する（他の設定は残る）。`root` は登録の root と OS の規則で照合する。
 pub fn disable(store: &Store, root: &str, expected: Option<&Revision>) -> OpResult<Disabled> {
     require_registered(peek(store, expected)?.as_ref(), root).map_err(UpdateError::Rejected)?;
     let updated = config::update_in(store, expected, |c, existed| {
@@ -315,16 +272,28 @@ pub struct PauseChanged {
     pub revision: Revision,
 }
 
-/// 登録を一時停止（paused=true）・再開（false）する。
+/// 登録を一時停止（paused=true）・再開（false）する。旧形式からの移行で止めた登録（`migrated_from`）は
+/// 再開できない（`enable` で有効化し直す）。
 pub fn set_paused(
     store: &Store,
     root: &str,
     paused: bool,
     expected: Option<&Revision>,
 ) -> OpResult<PauseChanged> {
-    require_registered(peek(store, expected)?.as_ref(), root).map_err(UpdateError::Rejected)?;
+    let refuse_resume = |c: &Config, index: usize| -> Result<(), String> {
+        if !paused && c.repository[index].migrated_from.is_some() {
+            return Err(crate::t!("ops.resume_migrated").to_string());
+        }
+        Ok(())
+    };
+    let current = peek(store, expected)?;
+    let index = require_registered(current.as_ref(), root).map_err(UpdateError::Rejected)?;
+    if let Some(c) = &current {
+        refuse_resume(c, index).map_err(UpdateError::Rejected)?;
+    }
     let updated = config::update_in(store, expected, |c, existed| {
         let index = require_registered(existed.then_some(&*c), root)?;
+        refuse_resume(c, index)?;
         let changed = c.repository[index].paused != paused;
         c.repository[index].paused = paused;
         Ok(changed)
@@ -335,35 +304,8 @@ pub fn set_paused(
     })
 }
 
-/// 登録のモードを変える（None は defaults に従う）。
-/// 結果が push になる変更（`Some(Push)`、または None で defaults が push）は拒否する。push は文書を
-/// 実際に push するので、remote・upstream の確認と既定ブランチの絞り込みを行う `enable`
-/// （mode=push）だけを経路にする（「push は明示の有効化だけ」の契約）。
-pub fn set_repository_mode(
-    store: &Store,
-    root: &str,
-    mode: Option<Mode>,
-    expected: Option<&Revision>,
-) -> OpResult<Updated<()>> {
-    let becomes_push = |c: &Config| mode.unwrap_or(c.defaults.mode) == Mode::Push;
-    let refuse_push = || crate::t!("ops.refuse_push").to_string();
-    let current = peek(store, expected)?;
-    require_registered(current.as_ref(), root).map_err(UpdateError::Rejected)?;
-    if current.as_ref().is_some_and(becomes_push) {
-        return Err(UpdateError::Rejected(refuse_push()));
-    }
-    config::update_in(store, expected, |c, existed| {
-        let index = require_registered(existed.then_some(&*c), root)?;
-        if becomes_push(c) {
-            return Err(refuse_push());
-        }
-        c.repository[index].mode = mode;
-        Ok(())
-    })
-}
-
 // ---------------------------------------------------------------------------
-// 汎用の編集（worker 設定・種類の設定・defaults・同意など。管理画面が使う）
+// 汎用の編集（worker 設定・種類の設定・defaults など。管理画面が使う）
 // ---------------------------------------------------------------------------
 
 /// 設定を任意に変更する。`f` は純粋・短時間にすること（設定ロックを持ったまま呼ぶ）。
@@ -415,32 +357,6 @@ pub fn set_worker(
     })
 }
 
-/// 同意を記録する（画面の同意ページ）。版が現行と一致しなければ拒否する。
-/// 現行の明示の同意が既にあれば、時刻と出所を書き換えない（`keeps_consent`）。
-pub fn record_consent(
-    store: &Store,
-    version: u32,
-    source: ConsentSource,
-    expected: Option<&Revision>,
-) -> OpResult<Updated<()>> {
-    if version != CURRENT_CONSENT_VERSION {
-        return Err(UpdateError::Rejected(crate::t!(
-            "ops.consent_mismatch",
-            version = CURRENT_CONSENT_VERSION
-        )));
-    }
-    edit(store, expected, |c| {
-        if !keeps_consent(c.consent.as_ref()) {
-            c.consent = Some(Consent {
-                version: CURRENT_CONSENT_VERSION,
-                accepted_at: chrono::Utc::now().to_rfc3339(),
-                source,
-            });
-        }
-        Ok(())
-    })
-}
-
 // ---------------------------------------------------------------------------
 // 変更履歴
 // ---------------------------------------------------------------------------
@@ -461,10 +377,10 @@ pub fn read_history(store: &Store, id: &str) -> OpResult<(Vec<u8>, Loaded)> {
 /// 書き込むのは解釈した設定を整形し直した内容（意味は同じ。コメントや書式は戻らない）。
 ///
 /// 登録が増える復元（解除済みの登録が戻る・新しく増える）の扱い:
-/// - 復元後に push モードになる登録が増える・既存の登録が push に変わる場合は拒否し、`enable --mode push`
-///   へ案内する。push は remote・upstream の確認と既定ブランチの絞り込みを行う `enable` だけが経路
-///   （`set_repository_mode` と同じ契約）。
-/// - それ以外（propose・off）で増える登録は、保存の前に `maintenance::baseline` で起点を記録する。
+/// - 復元後に有効な登録（一時停止でも移行由来の停止でもない）が増える、または既存の登録が有効に変わる
+///   場合は拒否し、`enable` へ案内する。push は remote・upstream の確認と既定ブランチの絞り込みを行う
+///   `enable` だけが経路。
+/// - 停止中（paused・移行由来）の登録が増える場合は、保存の前に `maintenance::baseline` で起点を記録する。
 ///   記録しないと、解除していた間の push が「新しい push」として処理されてしまう（enable と同じ理由）。
 ///   起点の記録は poll ロックを取るので設定ロックの外で行い、ロック順は「poll → 設定」の一方向を保つ。
 ///   ロック内では増える登録を判定し直し、起点を記録していない登録が増える（間に設定が変わった）なら
@@ -487,9 +403,9 @@ pub fn restore(store: &Store, id: &str, expected: Option<&Revision>) -> OpResult
             )));
         }
     };
-    // 事前確認（ロックなし）: push 化の拒否と、増える登録の起点の記録。
+    // 事前確認（ロックなし）: 有効化の拒否と、増える登録の起点の記録。
     let current = peek(store, expected)?.unwrap_or_default();
-    if let Some(root) = restore_becomes_push(&current, &restored) {
+    if let Some(root) = restore_becomes_active(&current, &restored) {
         return Err(UpdateError::Rejected(restore_push_refusal(&root)));
     }
     let added = added_registrations(&current, &restored);
@@ -508,7 +424,7 @@ pub fn restore(store: &Store, id: &str, expected: Option<&Revision>) -> OpResult
         .collect();
     edit(store, expected, |c| {
         // ロック内で同じ判定をやり直す（事前確認と保存の間に設定が変わりうるため）。
-        if let Some(root) = restore_becomes_push(c, &restored) {
+        if let Some(root) = restore_becomes_active(c, &restored) {
             return Err(restore_push_refusal(&root));
         }
         if let Some(root) = added_registrations(c, &restored)
@@ -532,25 +448,22 @@ fn added_registrations(before: &Config, after: &Config) -> Vec<String> {
         .collect()
 }
 
-/// 復元で push モードになる登録（新しく増える、または push 以外から push に変わる）の root。無ければ None。
-/// 実効モードは登録の値、無ければ defaults（既定のモードが push に変わる復元もここで捕まる）。
-fn restore_becomes_push(before: &Config, after: &Config) -> Option<String> {
-    let effective = |c: &Config, r: &Repository| r.mode.unwrap_or(c.defaults.mode);
+/// 復元で有効になる登録（新しく増える、または停止中・移行由来の停止から有効に変わる）の root。無ければ None。
+fn restore_becomes_active(before: &Config, after: &Config) -> Option<String> {
     after
         .repository
         .iter()
         .find(|r| {
-            effective(after, r) == Mode::Push
-                && find_repo(before, &r.root)
-                    .is_none_or(|i| effective(before, &before.repository[i]) != Mode::Push)
+            r.is_active()
+                && find_repo(before, &r.root).is_none_or(|i| !before.repository[i].is_active())
         })
         .map(|r| r.root.clone())
 }
 
-/// 復元を push 化のため拒否するときの説明（拒否しないなら None）。画面の事前確認（preview）でも使い、
+/// 復元を有効化のため拒否するときの説明（拒否しないなら None）。画面の事前確認（preview）でも使い、
 /// 確認画面を出してから拒否する遠回りを避ける。
 pub fn restore_refusal(current: &Config, restored: &Config) -> Option<String> {
-    restore_becomes_push(current, restored).map(|root| restore_push_refusal(&root))
+    restore_becomes_active(current, restored).map(|root| restore_push_refusal(&root))
 }
 
 fn restore_push_refusal(root: &str) -> String {
@@ -564,28 +477,19 @@ fn restore_push_refusal(root: &str) -> String {
 /// 判定で見送ったときの利用者向けの説明。
 pub fn skip_message(reason: SkipReason) -> &'static str {
     match reason {
-        SkipReason::NoConsent => crate::t!("ops.skip_no_consent"),
         SkipReason::NotEnrolled => crate::t!("ops.skip_not_enrolled"),
-        SkipReason::Off => crate::t!("ops.skip_off"),
         SkipReason::Paused => crate::t!("ops.skip_paused"),
+        SkipReason::Migrated => crate::t!("ops.skip_migrated"),
         SkipReason::RemoteMismatch => crate::t!("ops.skip_remote_mismatch"),
         SkipReason::BranchNotAllowed => crate::t!("ops.skip_branch"),
     }
 }
 
-/// run-now の結果。
+/// run-now の結果。propose（更新案）を廃止したので、実行できたときは常に push まで済ませた `Completed`。
 #[derive(Clone, Debug, PartialEq)]
 pub enum RunNow {
-    /// propose: 新しい更新案を作った。
-    Created(proposal::ProposalInfo),
-    /// propose: 更新案は作られなかった（変更なし・同じコミットの更新案が既にある・未 push のコミットがある）。
-    Unchanged,
-    /// push: 保守を実行した（変更があれば commit と push 済み）。
+    /// 保守を実行した（変更があれば commit と push 済み）。
     Completed,
-    /// propose: 保守後の検査（上限・必須見出し・CHANGELOG のリリース済み節の不変など）に違反したため、
-    /// 更新案を作らなかった。失敗ではなく「今回は作らない」という結果で、処理済み位置は進んでいる
-    /// （同じ push では worker を再実行しない）。理由は更新案メタ（`status=rejected`）の `reason`。
-    Rejected { reason: String },
 }
 
 /// 処理済み位置に関わらず、現在の upstream の状態を保守する。設定は書き換えない。
@@ -631,40 +535,6 @@ fn narrow_to_documents(
     Ok(timing::narrow_options(&options, &selected))
 }
 
-/// 直近（`since` 以降）に作られた棄却（`status=rejected`）の更新案メタから理由を取り出す。
-/// 棄却は保守エンジンが文字列のメッセージで返すため、構造化された理由は更新案メタ（json）から読む。
-fn rejected_reason_since(root: &Path, since: f64) -> Option<String> {
-    let mut best: Option<(f64, String)> = None;
-    for entry in std::fs::read_dir(proposal::proposals_dir(root))
-        .ok()?
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        let Some(meta) = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        else {
-            continue;
-        };
-        if meta["status"] != "rejected" {
-            continue;
-        }
-        let created = meta["created_unix"].as_f64().unwrap_or(0.0);
-        // 時計の刻みの差を 1 秒だけ許す。
-        if created + 1.0 < since {
-            continue;
-        }
-        let reason = meta["reason"].as_str().unwrap_or("").to_string();
-        if best.as_ref().is_none_or(|(t, _)| created > *t) {
-            best = Some((created, reason));
-        }
-    }
-    best.map(|(_, r)| r)
-}
-
 /// `run_now` の本体。`documents` が Some なら、その種類だけを処理する（`run-now --documents`）。
 pub fn run_now_for(
     store: &Store,
@@ -693,43 +563,10 @@ pub fn run_now_for(
     if let Some(wanted) = documents {
         options = narrow_to_documents(&config, &decision.documents, options, wanted)?;
     }
-    match decision.mode {
-        Mode::Propose => {
-            let started = timing::now_secs();
-            let before: HashSet<String> = proposal::list(root).into_iter().map(|x| x.sha).collect();
-            // フックと同じ poll ロックを取り、同時実行を避ける。
-            let lock = maintenance::acquire_poll_lock()?.ok_or(crate::t!("ops.run_busy"))?;
-            let message = maintenance::poll_repository_with(
-                root,
-                PollOptions {
-                    force: true,
-                    // 注意: 種類を絞った run-now も処理済み位置を進める。更新案はコミットごとに 1 つなので、
-                    // 絞り込みの外の種類は、この push については保守されない（次に期限が来た push で扱う）。
-                    ..PollOptions::default()
-                },
-                None,
-                &PollPlan::Propose(options),
-            )?;
-            drop(lock);
-            let created = proposal::list(root)
-                .into_iter()
-                .find(|x| !before.contains(&x.sha));
-            match (created, message) {
-                (Some(x), _) => Ok(RunNow::Created(x)),
-                // 棄却（保守後検査の違反）は失敗ではなく専用の結果にする。それ以外のメッセージは従来どおり Err。
-                (None, Some(message)) => match rejected_reason_since(root, started) {
-                    Some(reason) => Ok(RunNow::Rejected { reason }),
-                    None => Err(message),
-                },
-                (None, None) => Ok(RunNow::Unchanged),
-            }
-        }
-        Mode::Push => match maintenance::run_now(root, options)? {
-            // Some は失敗や実行中の通知（成功時は None）。
-            Some(message) => Err(message),
-            None => Ok(RunNow::Completed),
-        },
-        Mode::Off => Err(skip_message(SkipReason::Off).into()),
+    match maintenance::run_now(root, options)? {
+        // Some は失敗や実行中の通知（成功時は None）。
+        Some(message) => Err(message),
+        None => Ok(RunNow::Completed),
     }
 }
 
@@ -780,8 +617,6 @@ pub struct DocsOverview {
     /// 設定ファイルがあるか（無いときは組み込み既定だけを示す）。
     pub config_present: bool,
     pub registered: bool,
-    /// 登録済みのときの実効モード。
-    pub mode: Option<Mode>,
     pub kinds: Vec<KindView>,
 }
 
@@ -896,7 +731,6 @@ pub fn docs_overview(store: &Store, root: &Path) -> Result<DocsOverview, String>
     Ok(DocsOverview {
         config_present,
         registered: repo.is_some(),
-        mode: repo.map(|r| r.mode.unwrap_or(config.defaults.mode)),
         kinds,
     })
 }

@@ -7,12 +7,12 @@
 //
 // 設計上の要点:
 // - hook の経路とは独立。hook は画面の有無を一切見ない。画面が触るのは設定ファイル（ops 経由の書き込み）、
-//   状態 DB の読み取り（読み取り専用で開く）、更新案（proposal の公開関数）、doctor の診断だけ。
+//   状態 DB の読み取り（読み取り専用で開く）、doctor の診断だけ。
 // - tokio ランタイムは `run` の中でだけ作る（hook・CLI の経路では初期化しない）。
 // - 保護はすべて `guard` の 1 か所に集める（Host → Origin／Sec-Fetch-Site → Cookie → CSRF）。
 //   ハンドラ個別の検査にすると、新しい POST を足したときに漏れるため。
 // - 危険な変更の二段階確認は `confirm` の純粋関数 `dangers(before, after)` で設定の差分から判定する
-//   （フォームごとのフラグにしない）。設定を変えない危険操作（apply・push の run-now・登録解除）は固定で足す。
+//   （フォームごとのフラグにしない）。設定を変えない危険操作（run-now・有効化・登録解除）は固定で足す。
 // - 閲覧（GET）は副作用なし。状態フォルダー・DB・ロックを作らない。
 // - 応答に秘密値を出さない。remote URL は正規化済み（host/owner/repo）だけ、エンジン由来の自由文は
 //   資格情報らしい部分を伏せてから出す（`views::redact`）。
@@ -260,27 +260,28 @@ pub fn router(state: AppState) -> Router {
         .route("/repos/enable", post(handlers::repo_enable))
         .route("/repos/pause", post(handlers::repo_pause))
         .route("/repos/resume", post(handlers::repo_resume))
-        .route("/repos/mode", post(handlers::repo_mode))
         .route("/repos/documents", post(handlers::repo_documents))
         .route("/repos/disable", post(handlers::repo_disable))
         .route("/repos/run-now", post(handlers::repo_run_now))
         .route("/repos/{n}", get(handlers::repo_detail))
         .route("/jobs/{id}", get(handlers::job))
-        .route("/kinds", get(handlers::kinds))
         .route(
-            "/kinds/new",
+            "/settings/documents",
+            get(handlers::documents).post(handlers::documents_save),
+        )
+        .route(
+            "/settings/documents/new",
             get(handlers::kind_new).post(handlers::kind_create),
         )
         .route(
-            "/kinds/{id}",
+            "/settings/documents/{id}",
             get(handlers::kind_detail).post(handlers::kind_save),
         )
-        .route("/kinds/{id}/delete", post(handlers::kind_delete))
+        .route(
+            "/settings/documents/{id}/delete",
+            post(handlers::kind_delete),
+        )
         .route("/templates/save", post(handlers::template_save))
-        .route("/proposals", get(handlers::proposals))
-        .route("/proposals/apply", post(handlers::proposal_apply))
-        .route("/proposals/discard", post(handlers::proposal_discard))
-        .route("/proposals/{n}/{sha}", get(handlers::proposal_detail))
         .route(
             "/settings/worker",
             get(handlers::worker).post(handlers::worker_save),
@@ -293,14 +294,11 @@ pub fn router(state: AppState) -> Router {
             "/settings/general",
             get(handlers::general).post(handlers::general_save),
         )
-        .route(
-            "/consent",
-            get(handlers::consent).post(handlers::consent_save),
-        )
         .route("/doctor", get(handlers::doctor))
-        .route("/history", get(handlers::history))
-        .route("/history/restore", post(handlers::history_restore))
-        .route("/history/{id}", get(handlers::history_detail))
+        .route("/history", get(handlers::runs))
+        .route("/settings/history", get(handlers::history))
+        .route("/settings/history/restore", post(handlers::history_restore))
+        .route("/settings/history/{id}", get(handlers::history_detail))
         .route("/updates/check", post(handlers::update_check))
         .route("/updates/install", post(handlers::update_install))
         .route("/updates/settings", post(handlers::update_settings))

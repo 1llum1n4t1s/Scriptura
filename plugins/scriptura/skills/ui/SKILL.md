@@ -1,6 +1,6 @@
 ---
 name: ui
-description: Open the Scriptura management UI (settings, document kinds, proposals, history, diagnostics) in the browser. Open the Scriptura settings UI in the browser.
+description: Open the Scriptura management UI (repositories, history, settings including documents, diagnostics) in the browser. Open the Scriptura settings UI in the browser.
 allowed-tools: Bash(scriptura ui *)
 disable-model-invocation: true
 ---

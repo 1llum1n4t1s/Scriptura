@@ -6,35 +6,32 @@
 <section class="panel">
   <h2>{{ crate::locale::tr("ui.repo.state") }}</h2>
   <dl class="facts">
-    <dt>{{ crate::locale::tr("ui.repo.mode") }}</dt><dd><span class="badge{% if repo.push %} warning{% endif %}">{{ repo.mode }}</span>{% if repo.paused %} <span class="badge">{{ crate::locale::tr("ui.common.paused") }}</span>{% endif %}</dd>
+    <dt>{{ crate::locale::tr("ui.repo.status") }}</dt><dd>{% if repo.migrated %}<span class="badge warning">{{ crate::locale::tr("ui.repo.migrated") }}</span>{% else if repo.paused %}<span class="badge">{{ crate::locale::tr("ui.common.paused") }}</span>{% else %}<span class="badge published">{{ crate::locale::tr("ui.repo.active") }}</span>{% endif %}</dd>
     <dt>{{ crate::locale::tr("ui.repo.documents") }}</dt><dd>{{ repo.documents }}</dd>
     <dt>{{ crate::locale::tr("ui.repo.branches") }}</dt><dd>{{ repo.branches }}</dd>
     <dt>{{ crate::locale::tr("ui.repo.remote") }}</dt><dd>{% if repo.remote.is_empty() %}{{ crate::locale::tr("ui.repo.remote_any") }}{% else %}<code>{{ repo.remote }}</code>{% endif %}</dd>
-    <dt>{{ crate::locale::tr("ui.nav.proposals") }}</dt><dd>{{ crate::locale::tr2("ui.repo.proposal_counts", "pending", repo.pending, "applied", repo.applied) }} (<a href="/proposals">{{ crate::locale::tr("ui.nav.proposals") }}</a>)</dd>
   </dl>
   <div class="actions wrap">
-    {% if repo.paused %}
+    {% if repo.migrated %}
+    {% else if repo.paused %}
     <form method="post" action="/repos/resume"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ repo.root }}"><button type="submit">{{ crate::locale::tr("ui.repo.resume") }}</button></form>
     {% else %}
     <form method="post" action="/repos/pause"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ repo.root }}"><button type="submit">{{ crate::locale::tr("ui.repo.pause") }}</button></form>
     {% endif %}
+    {% if !repo.migrated %}
     <form method="post" action="/repos/run-now"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ repo.root }}"><button class="primary" type="submit">{{ crate::locale::tr("ui.repo.run_now") }}</button></form>
+    {% endif %}
     <form method="post" action="/repos/disable"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ repo.root }}"><button class="destructive" type="submit">{{ crate::locale::tr("ui.repo.disable") }}</button></form>
   </div>
+  {% if repo.migrated %}<p class="notice warning">{{ crate::locale::tr("ui.repo.migrated_note") }}</p>{% endif %}
 </section>
 <section class="panel">
-  <h2>{{ crate::locale::tr("ui.repo.mode") }}</h2>
-  <form method="post" action="/repos/mode" class="stack">
-    <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="root" value="{{ repo.root }}">
-    <label>{{ crate::locale::tr("ui.repo.mode") }}<select name="mode">{% for m in mode_choices %}<option value="{{ m.value }}"{% if m.selected %} selected{% endif %}>{{ m.label }}</option>{% endfor %}</select></label>
-    <div class="actions"><button type="submit">{{ crate::locale::tr("ui.repo.mode_save") }}</button></div>
-  </form>
-  <p class="note">{{ crate::locale::tr("ui.repo.push_note") }}</p>
+  <h2>{{ crate::locale::tr("ui.repo.reenable_heading") }}</h2>
   <form method="post" action="/repos/enable" class="stack">
-    <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="repo" value="{{ repo.root }}"><input type="hidden" name="mode" value="push">
-    <label>{{ crate::locale::tr("ui.repo.branches_label") }}<input name="branches"></label>
-    {% if needs_consent %}<p>{{ consent_text }}</p><input type="hidden" name="consent_version" value="{{ consent_version }}"><label class="checkbox"><input type="checkbox" name="consent" value="1">{{ crate::locale::tr1("ui.repo.consent_agree", "version", consent_version) }}</label>{% endif %}
-    <div class="actions"><button class="destructive" type="submit">{{ crate::locale::tr("ui.repo.reenable_push") }}</button></div>
+    <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="repo" value="{{ repo.root }}">
+    <label>{{ crate::locale::tr("ui.repos.branches_label") }}<input name="branches"></label>
+    <p class="note">{{ crate::locale::tr("ui.repos.enable_note") }}</p>
+    <div class="actions"><button class="destructive" type="submit">{{ crate::locale::tr("ui.repo.reenable") }}</button></div>
   </form>
 </section>
 </div>
@@ -56,10 +53,20 @@
   <div class="table-wrap"><table>
     <thead><tr><th>{{ crate::locale::tr("ui.kinds.kind") }}</th><th>{{ crate::locale::tr("ui.repo.enabled") }}</th><th>{{ crate::locale::tr("ui.repo.files") }}</th><th>{{ crate::locale::tr("ui.kind.summary_template") }}</th><th>{{ crate::locale::tr("ui.repo.last_done") }}</th></tr></thead>
     <tbody>
-    {% for k in kinds %}<tr><td><a href="/kinds/{{ k.id }}">{{ k.name }}</a></td><td>{% if k.enabled %}{{ crate::locale::tr("ui.repo.enabled") }}{% else %}-{% endif %}</td><td>{% for f in k.files %}<div class="path">{{ f }}</div>{% endfor %}</td><td>{{ k.template }}</td><td>{{ k.last_done }}</td></tr>
+    {% for k in kinds %}<tr><td><a href="/settings/documents/{{ k.id }}">{{ k.name }}</a></td><td>{% if k.enabled %}{{ crate::locale::tr("ui.repo.enabled") }}{% else %}-{% endif %}</td><td>{% for f in k.files %}<div class="path">{{ f }}</div>{% endfor %}</td><td>{{ k.template }}</td><td>{{ k.last_done }}</td></tr>
     {% endfor %}
     </tbody>
   </table></div>
+</section>
+<section class="panel">
+  <h2>{{ crate::locale::tr("ui.runs.recent") }}</h2>
+  {% if recent_runs.is_empty() %}<p class="note">{{ crate::locale::tr("ui.runs.none") }}</p>{% else %}
+  <div class="table-wrap"><table>
+    <thead><tr><th>{{ crate::locale::tr("ui.runs.time") }}</th><th>{{ crate::locale::tr("ui.runs.outcome") }}</th><th>{{ crate::locale::tr("ui.runs.documents") }}</th><th>{{ crate::locale::tr("ui.runs.reason") }}</th></tr></thead>
+    <tbody>{% for r in recent_runs %}<tr><td>{% let t = r.time %}{% include "ui/time_secs.html" %}{% if r.attempts > 1 %} <span class="badge">&times;{{ r.attempts }}</span>{% endif %}</td><td><span class="badge{% if !r.outcome_class.is_empty() %} {{ r.outcome_class }}{% endif %}">{{ r.outcome }}</span></td><td>{% for d in r.documents %}<div class="path">{{ d }}</div>{% endfor %}</td><td>{% if !r.message.is_empty() %}<span class="error-text">{{ r.message }}</span>{% endif %}</td></tr>{% endfor %}</tbody>
+  </table></div>
+  {% endif %}
+  <p><a href="{{ runs_href }}">{{ crate::locale::tr("ui.runs.all_for_repo") }}</a></p>
 </section>
 <section class="panel">
   <h2>{{ crate::locale::tr("ui.repo.cursors") }}</h2>

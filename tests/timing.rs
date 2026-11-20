@@ -1,6 +1,6 @@
 //! 文書種類ごとのメンテナンスタイミング（src/timing.rs）の純粋関数の契約テスト。
 //! I/O を持たない判定（`due_kinds` と各条件・CHANGELOG の節の照合・オプションの絞り込み）だけを見る。
-//! push 検知・状態 DB との結合は tests/maintenance.rs と tests/proposal.rs。
+//! push 検知・状態 DB との結合は tests/maintenance.rs。
 use scriptura::config::{Document, When};
 use scriptura::kinds::{ResolvedKind, ResolvedTiming, builtin_kind};
 use scriptura::maintenance::MaintenanceOptions;

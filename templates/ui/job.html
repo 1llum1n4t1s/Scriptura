@@ -8,7 +8,6 @@
   {% if running %}<p class="notice">{{ crate::locale::tr("ui.job.running") }}</p>
   {% else %}
   <p class="notice{% if !ok %} warning{% endif %}">{{ message }}</p>
-  {% if let Some(link) = proposal %}<p><a class="button primary" href="{{ link }}">{{ crate::locale::tr("ui.job.view_proposal") }}</a></p>{% endif %}
   {% endif %}
 </section>
 {% endblock %}

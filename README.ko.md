@@ -4,8 +4,7 @@
 
 Scriptura는 본인 저장소에 push한 뒤 백그라운드에서 `AGENTS.md` / `DESIGN.md` / `README.md`(그리고 옵트인으로 `CHANGELOG.md`와 사용자 정의 커스텀 문서)를 유지 관리합니다. Claude Code의 Stop hook에서 실행되며, 유지 관리 worker는 Claude Code CLI(기본값은 `claude -p --model claude-sonnet-5-5 --effort high`)입니다. Codex에는 의존하지 않습니다.
 
-- **기본값이 안전합니다.** 활성화하려면 명시적인 동의와 저장소 등록이 필요하며, 기본 모드는 `propose`입니다. `propose`는 문서 업데이트 제안(패치)만 만들고 작업 트리, `.git`, remote는 변경하지 않습니다.
-- 문서를 자동으로 commit하고 push하는 `push` 모드는 `--mode push`를 명시적으로 지정했을 때만 사용할 수 있습니다.
+- **기본값이 안전합니다.** `scriptura enable`(또는 관리 화면)로 저장소를 등록하기 전에는 아무것도 실행되지 않으며, 활성화에는 remote와 upstream이 필요합니다. 검토 단계는 없습니다. push할 때마다 worker가 대상 문서를 업데이트하고 Scriptura가 자동으로 commit과 push를 하며, 유지 관리 후 검사에서 대상 문서 외의 변경이 발견되면 commit하지 않습니다. 동의 기록과 이전의 `propose` 모드(업데이트 제안)는 제거되었습니다(「이전 설정의 마이그레이션」 참조).
 - 설정은 사용자 홈 디렉터리 아래의 파일 하나(`config.toml`)와 그 옆의 `templates/` 폴더에서만 읽습니다. 저장소 안의 파일을 통한 활성화나 설정은 읽지 않습니다(다른 사람의 저장소를 clone하기만 해도 자동 동작이 시작되는 일이 없도록 하기 위해서입니다).
 - 설정은 `scriptura ui`(브라우저 기반 관리 화면, 아래에서 설명)에서도 편집할 수 있습니다.
 
@@ -62,22 +61,14 @@ worker는 데스크톱 세션의 중계 설정을 상속하지 않으므로, 사
 
 유지 관리하려는 저장소에서 다음 중 하나를 수행하십시오.
 
-- 플러그인을 설치했다면: Claude Code에서 `/scriptura:setup`을 실행합니다(동의를 확인한 뒤 `scriptura enable`을 실행합니다).
+- 플러그인을 설치한 경우: Claude Code에서 `/scriptura:setup`을 실행합니다(문서가 자동으로 commit·push된다는 점을 채팅으로 확인한 뒤 `scriptura enable`을 실행합니다).
 - 명령줄에서 직접 실행:
 
 ```powershell
-scriptura enable --repo D:\Dev\MyRepo --accept-consent 1
+scriptura enable --repo D:\Dev\MyRepo
 ```
 
-`--accept-consent`는 동의 문서의 현재 버전(현재는 `1`)입니다. 생략하거나 버전이 틀리면 명령이 전송되는 데이터와 비용에 대한 설명을 출력하고 거부합니다. `enable`은 등록하기 전에 "현재의 push 상태"를 처리 완료로 기록하므로, 활성화 이전에 이루어진 push는 이후에도 처리되지 않습니다.
-
-## 모드
-
-| 모드 | 동작 |
-| --- | --- |
-| `propose`(기본값) | push할 때마다 worker가 일회용 clone에서 문서를 업데이트하고 **diff를 패치로 저장**합니다. 작업 트리, `.git`, remote는 변경되지 않습니다. `review`로 확인하고 `apply`로 작업 트리에 적용합니다(stage하지 않습니다). |
-| `push` | worker가 문서를 업데이트하고 자동으로 commit하고 push합니다. `--mode push`를 명시적으로 지정했을 때만 사용할 수 있습니다. remote와 upstream이 필요하며, `--branches`를 생략하면 현재 브랜치만 대상이 됩니다. |
-| `off` | 아무것도 하지 않습니다(등록은 남습니다). |
+`enable`에는 remote, 브랜치(detached HEAD가 아닐 것), upstream이 필요하며, `--branches`를 생략하면 현재 브랜치만 대상이 됩니다. 이후 push할 때마다 문서가 자동으로 commit·push됩니다(「비용과 데이터 전송」 참조). `enable`은 등록하기 전에 "현재 push 상태"를 처리 완료로 기록하므로, 활성화 이전의 push는 나중에 처리되지 않습니다. 이전의 `--mode`와 `--accept-consent` 옵션은 제거되었으며, 지정하면 오류로 거부됩니다.
 
 ## 설정 파일
 
@@ -89,18 +80,12 @@ scriptura enable --repo D:\Dev\MyRepo --accept-consent 1
 
 `SCRIPTURA_CONFIG`(파일의 절대 경로) 또는 `SCRIPTURA_HOME`(`<SCRIPTURA_HOME>/config.toml`)으로 재정의할 수 있습니다. 보통은 `enable` / `disable` / `pause` / `resume`과 관리 화면이 다시 쓰므로 직접 편집할 필요가 없습니다. 손상된 설정, 알 수 없는 키, 너무 새로운 `schema`는 "아무것도 하지 않음"으로 되돌아가며, `enable` 같은 명령은 설정을 다시 쓰지 않고 실패합니다.
 
-`schema`는 1 또는 2일 수 있습니다. 저장은 "필요한 최소 버전"으로 이루어집니다. 종류별 설정(`[kinds.*]`), `[defaults] instructions`, `CHANGELOG.md`나 커스텀 종류를 대상으로 나열한 구성, 관리 화면에서 한 동의 중 어느 것도 사용하지 않으면 파일은 `schema = 1`로 유지됩니다(이전 버전의 Scriptura도 읽을 수 있도록 하기 위해서입니다). 이 중 하나라도 사용하면 `schema = 2`가 되고, 이를 읽은 이전 버전은 "아무것도 하지 않음"으로 되돌아갑니다.
+저장은 항상 `schema = 3`으로 합니다. `schema`가 1, 2이거나 생략된 파일(이전 Scriptura가 쓴 것)은 이전 형식으로 읽어 들일 때 변환합니다(「이전 설정의 마이그레이션」 참조). 3보다 새로운 schema는 "아무것도 하지 않음"으로 처리합니다. 이전 버전의 Scriptura도 schema 3 파일을 읽으면 아무것도 하지 않으므로, 플러그인 판과 Setup 판을 함께 쓰는 경우에는 둘 다 업데이트하십시오.
 
 ```toml
-schema = 1
-
-[consent]
-version = 1
-accepted_at = "2026-11-14T00:00:00+00:00"
-source = "cli"
+schema = 3
 
 [defaults]
-mode = "propose"                                # propose / push / off
 documents = ["AGENTS.md", "DESIGN.md", "README.md"]
 exclude = ["private/**"]                        # 기본 민감 패턴에 추가됨 (`)`, 공백, 제어 문자를 포함하는 패턴은 허용되지 않음)
 
@@ -118,7 +103,6 @@ owners = []                                     # remote-owner용, 예: "github.
 [[repository]]
 root = "D:/Dev/MyRepo"
 remote = "github.com/me/myrepo"                 # 예상되는 push 대상 (일치하지 않으면 건너뜀)
-mode = "propose"
 branches = ["main"]                             # 비어 있으면 제한 없음
 documents = ["README.md"]
 paused = false
@@ -127,6 +111,8 @@ paused = false
 ## 문서 종류
 
 유지 관리할 문서는 "종류"로 관리됩니다.
+
+관리 화면에서는 같은 설정을 "설정"의 "문서" 탭에서 편집할 수 있습니다(기본 대상 문서 `defaults.documents`도 여기서 정합니다).
 
 | 종류 | 대상 | 기본값 |
 | --- | --- | --- |
@@ -158,7 +144,7 @@ paused = false
 
 ### 유지 관리 후 검사
 
-상한(`max_chars` / `max_bytes`), `required_headings`, AGENTS가 30,000바이트 미만일 것, 릴리스된 CHANGELOG 항목의 불변성은 worker의 권한 모드(`restricted` / `bypass`)와 관계없이 Rust가 검사합니다. 위반하면 `push` 모드에서는 commit하지 않고(변경 사항은 작업 트리에 남으며 다음 hook이 같은 검사를 수행합니다), `propose` 모드에서는 업데이트 제안을 만들지 않고 거부(`rejected`)하며 처리 완료 위치를 진행합니다. 같은 push에 대해 worker를 다시 실행하지 않습니다. `propose`에서 거부된 것은 `run-now`로만 다시 만들 수 있습니다.
+한도(`max_chars` / `max_bytes`), `required_headings`, AGENTS가 30,000바이트 미만일 것, 릴리스된 CHANGELOG 항목의 불변성은 worker의 권한 모드(`restricted` / `bypass`)와 관계없이 Rust가 검사합니다. 위반하면 commit하지 않으며(변경은 작업 트리에 남고, 다음 hook이 같은 검사를 거칩니다) 같은 push에 대해 worker를 다시 실행하지 않습니다.
 
 ### 시점(`[kinds.<id>.timing]`)
 
@@ -176,18 +162,18 @@ CHANGELOG와, 대상이 존재하지 않고 생성도 허용되지 않는 커스
 
 ### CHANGELOG 유지 관리(`[kinds.changelog.changelog]`)
 
-- 기존 형식을 따릅니다(Keep a Changelog 내장 템플릿은 파일을 만들 때만 사용합니다). push할 때마다 `Unreleased` 절만 업데이트하며, worker는 릴리스된 절을 변경할 수 없습니다. Rust가 유지 관리 전후를 비교해서 릴리스된 절이 1바이트라도 바뀌었거나, 절이 사라지거나 순서가 바뀌었거나, 링크 참조 정의가 사라졌다면 위의 검사 위반으로 처리합니다(push 모드는 commit하지 않고, propose는 거부합니다).
+- 기존 형식을 따릅니다(Keep a Changelog 내장 템플릿은 파일을 만들 때만 사용합니다). push할 때마다 `Unreleased` 절만 업데이트하며, worker는 릴리스된 절을 변경할 수 없습니다. Rust가 유지 관리 전후를 비교해서 릴리스된 절이 1바이트라도 바뀌었거나, 절이 사라지거나 순서가 바뀌었거나, 링크 참조 정의가 사라졌다면 위의 검사 위반으로 처리합니다(commit하지 않습니다).
 - 이력은 Rust가 `CHANGELOG.md`를 마지막으로 변경한 commit부터 이번 push까지의 모든 것을 모아 **신뢰할 수 없는 데이터**로 프롬프트에 전달합니다(범위 내의 commit 제목, 변경된 경로, 태그. 합계 최대 48 KiB). restricted worker는 `git log`를 실행할 수 없기 때문입니다. Scriptura 자신의 유지 관리 commit은 제외됩니다.
 - `on_release = "promote"`(기본값): 범위 내의 태그에 해당하는 버전의 절이 아직 없으면 `Unreleased`의 내용을 그 버전의 절로 옮깁니다. 절이 이미 있으면 아무것도 하지 않습니다(릴리스 절차가 먼저 작성했더라도 결과는 같습니다). `ignore`는 버전 절을 만들지 않습니다.
 - `backfill = "tags"`(기본값): `CHANGELOG.md`가 없을 때, 도달 가능한 태그를 최신 것부터 거슬러 올라가며 최대 `backfill_max_releases`(1~50, 기본값 20)개의 태그, 그리고 인접한 태그 사이의 commit을 합계 최대 `backfill_max_commits`(1~1000, 기본값 300)개까지 사용하여 버전별 절을 만듭니다. `none`은 거슬러 올라가지 않습니다. `format`(`existing` / `keep-a-changelog`)과 `release_tag`(기본값 `v*`)도 지정할 수 있습니다.
-- 파일 이름은 Git에서의 표기를 대소문자 구분 없이 해석합니다(`Changelog.md` 등도 대상입니다). 표기를 하나로 정할 수 없거나 편집 전의 내용을 Git에서 읽을 수 없으면 검증 불가로 간주하여 위반으로 처리합니다. push 모드에서 `CHANGELOG.md`가 Git에서 무시되고 있으면 worker를 시작하지 않고 새로운 유지 관리를 건너뜁니다.
+- 파일 이름은 Git에서의 표기를 대소문자 구분 없이 해석합니다(`Changelog.md` 등도 대상입니다). 표기를 하나로 정할 수 없거나 편집 전의 내용을 Git에서 읽을 수 없으면 검증 불가로 간주하여 위반으로 처리합니다. `CHANGELOG.md`가 Git에서 무시되고 있으면 worker를 시작하지 않고 새로운 유지 관리를 건너뜁니다.
 - 버전과 태그를 대응시킬 때는 `release_tag`의 고정 접두사(`v*`의 `v`, `release-*`의 `release-` 등)를 제외한 버전 이름도 일치로 간주합니다(`## [1.2.0]`). 위반 사유에는 제목 텍스트를 출력하지 않고 "n번째 버전 절"과 같이 번호로 표시합니다. 릴리스된 절의 링크 참조 정의에 대해서도 내용과 순서가 보존되었는지, 기존 레이블이 다시 정의되지 않았는지 검사합니다.
-- 제한 사항: 태그만 push하는 경우(`git push --tags`)는 감지할 수 없습니다. 다음 브랜치 push 또는 `--follow-tags`로 처리됩니다. push 모드에서 `CHANGELOG.md`를 유지 관리할 때, 같은 파일을 업데이트하는 릴리스 절차와 충돌할 수 있습니다(`doctor`가 이를 지적합니다).
+- 제한 사항: 태그만 push하는 경우(`git push --tags`)는 감지할 수 없습니다. 다음 브랜치 push 또는 `--follow-tags`로 처리됩니다. `CHANGELOG.md`를 유지 관리할 때, 같은 파일을 업데이트하는 릴리스 절차와 충돌할 수 있습니다(`doctor`가 이를 지적합니다).
 
-### 구성 예(schema 2)
+### 구성 예(schema 3)
 
 ```toml
-schema = 2
+schema = 3
 
 [defaults]
 documents = ["AGENTS.md", "DESIGN.md", "README.md", "CHANGELOG.md", "architecture"]
@@ -223,7 +209,7 @@ documents = ["README.md", "CHANGELOG.md"]
 
 ## 설정 쓰기와 변경 이력
 
-설정 쓰기는 CLI, 관리 화면, 기존 사용자의 자동 마이그레이션을 가리지 않고 모두 같은 경로(`src/ops.rs`와 `config::update_in`)를 거칩니다. 쓰는 쪽은 상태 폴더의 `config-lock.sqlite3`로 직렬화되며, 관리 화면은 표시한 버전(파일의 SHA-256, 파일이 없으면 `missing`)을 비교하여 파일이 다른 곳에서 변경되었으면 저장하지 않고 다시 불러오도록 안내합니다(CLI는 버전을 비교하지 않습니다). 저장 직전에 이전 내용을 상태 폴더의 `config-history/`에 따로 보관하며(50개까지 유지), 저장은 원자적으로 이루어집니다. 손상된 설정은 다시 쓰지 않습니다. 아무것도 바꾸지 않는 작업은 저장도 보관도 하지 않습니다. 관리 화면의 "이력"에서 diff를 확인하고 복원할 수 있으며, 복원하기 전의 내용도 이력에 남습니다. 복원으로 등록이 늘어나는 경우에는 확인 화면이 표시되고, 각 등록의 기점(활성화 이전의 push를 처리하지 않도록 하는 위치)이 저장하기 전에 기록됩니다. push 모드 등록이 늘어나거나 등록이 push로 바뀌는 복원은 거부되며 `enable --mode push`(remote와 upstream을 확인합니다)를 사용하도록 안내합니다.
+설정 쓰기는 CLI, 관리 화면, 기존 사용자의 자동 마이그레이션을 가리지 않고 모두 같은 경로(`src/ops.rs`와 `config::update_in`)를 거칩니다. 쓰는 쪽은 상태 폴더의 `config-lock.sqlite3`로 직렬화되며, 관리 화면은 표시한 버전(파일의 SHA-256, 파일이 없으면 `missing`)을 비교하여 파일이 다른 곳에서 변경되었으면 저장하지 않고 다시 불러오도록 안내합니다(CLI는 버전을 비교하지 않습니다). 저장 직전에 이전 내용을 상태 폴더의 `config-history/`에 따로 보관하며(50개까지 유지), 저장은 원자적으로 이루어집니다. 손상된 설정은 다시 쓰지 않습니다. 아무것도 바꾸지 않는 작업은 저장도 보관도 하지 않습니다. 관리 화면의 "설정 변경 기록"에서 diff를 확인하고 복원할 수 있으며, 복원하기 전의 내용도 이력에 남습니다. 복원으로 등록이 늘어나는 경우(일시 중지된 것 포함)에는 각 등록의 기점(활성화 이전의 push를 처리하지 않도록 하는 위치)이 저장하기 전에 기록됩니다. 유효한 등록(일시 중지도 아니고 이전으로 중지된 것도 아님)이 늘어나거나 등록이 유효하게 바뀌는 복원은 거부되며 `enable`(remote와 upstream을 확인합니다)을 사용하도록 안내합니다. 이전으로 중지된 등록은 복원으로도 재개할 수 없습니다.
 
 ## 관리 화면(`scriptura ui`)
 
@@ -232,7 +218,7 @@ scriptura ui [--port <n>] [--no-open] [--tray]
 scriptura ui --autostart on|off
 ```
 
-설정, 업데이트 제안, 진단을 다루는 브라우저 기반 화면입니다. 9개 언어(ja, en, zh-CN, zh-TW, ko, es, fr, de, pt-BR)로 제공됩니다. 언어는 화면 상단의 언어 선택(쿠키에 저장됨) → 브라우저의 `Accept-Language` → 영어 순으로 선택됩니다. 기본적으로는 상주하지 않으며, 화면에서 "종료"를 선택하거나 Ctrl+C를 누르거나 60분 동안 조작이 없으면 실행한 명령이 종료됩니다(`--tray`를 붙이면 상주합니다. 아래 참조). hook은 화면이 열려 있는지 확인하지 않습니다. cargo feature `ui`(기본값으로 활성)로 제어되며, `--no-default-features`로 빌드하면 포함되지 않습니다(그 경우 `scriptura ui`는 거부하고 종료합니다).
+저장소, 기록, 설정(문서 포함), 진단을 다루는 브라우저 기반 화면입니다. 9개 언어(ja, en, zh-CN, zh-TW, ko, es, fr, de, pt-BR)로 제공됩니다. 언어는 화면 상단의 언어 선택(쿠키에 저장됨) → 브라우저의 `Accept-Language` → 영어 순으로 선택됩니다. 기본적으로는 상주하지 않으며, 화면에서 "종료"를 선택하거나 Ctrl+C를 누르거나 60분 동안 조작이 없으면 실행한 명령이 종료됩니다(`--tray`를 붙이면 상주합니다. 아래 참조). hook은 화면이 열려 있는지 확인하지 않습니다. cargo feature `ui`(기본값으로 활성)로 제어되며, `--no-default-features`로 빌드하면 포함되지 않습니다(그 경우 `scriptura ui`는 거부하고 종료합니다).
 
 - **수신 대기**: `127.0.0.1`에서만(기본 포트는 7468이며 `--port 0`은 비어 있는 포트를 고릅니다). 포트가 사용 중이면 종료합니다.
 - **상주(`--tray`)**: Windows에서는 시스템 트레이, macOS에서는 메뉴 막대에 아이콘을 두고 상주합니다(Linux는 지원하지 않으며, `--tray`는 거부하고 종료합니다). 아이콘을 클릭하면 관리 화면이 열리고, 오른쪽 클릭 메뉴에서 "관리 화면 열기", "업데이트 확인"(Setup 판 전용, 개요 화면의 "앱 업데이트" 패널을 엽니다), "종료"를 고를 수 있습니다. 상주 중에는 조작이 없어도 종료되지 않습니다. 대신 60분 동안 조작이 없으면 세션을 만료시키고(열어 둔 탭은 401이 됩니다), 아이콘에서 화면을 열 때마다 일회용 키를 다시 발급합니다(다시 발급한 키는 5분 뒤에 만료되고, 사용되지 않은 이전 키는 무효가 됩니다). Windows에서는 기본 포트로 상주 중일 때 `scriptura ui --tray`를 다시 실행하면 두 번째는 시작하지 않고, 상주 중인 쪽이 브라우저를 엽니다. 터미널이 아닌 곳(시작 메뉴 등)에서 실행되면 콘솔 창이 없는 프로세스로 다시 실행합니다.
@@ -240,8 +226,9 @@ scriptura ui --autostart on|off
 - **"앱 업데이트" 패널(Setup 판 전용)**: 개요 화면의 "앱 업데이트" 패널(`#updates`)에는 현재 버전, 자동 업데이트와 로그온 시 상주의 체크박스, "업데이트 확인" 버튼, "업데이트 설치" 버튼(새 버전이 있을 때 표시)이 있습니다. 확인은 24시간 간격을 무시하며 내려받지 않습니다. 설치는 내려받아 서명자를 검증한 뒤, 설치 폴더에서 다른 Scriptura 프로세스(hook, worker, 다른 관리 화면)가 실행 중이 아니고 run-now도 진행 중이 아니면 업데이터에 적용을 요청하고 관리 화면을 종료합니다(그렇지 않으면 아무것도 하지 않고 나중에 다시 시도하라고 안내하며, 강제 종료는 하지 않습니다). 상주 중이면 업데이터가 새 버전을 시작하지만 세션은 새로워지므로, 열려 있던 탭에는 "트레이(메뉴 막대) 아이콘에서 다시 여세요"라고 표시됩니다. 터미널에서 시작한 관리 화면은 종료만 합니다. 트레이 메뉴의 "업데이트 확인"은 이 패널을 열고 자동으로 확인을 시작합니다. JavaScript가 없어도 같은 버튼으로 조작할 수 있으며 결과는 별도 화면에 표시됩니다. Setup 판이 아니면 패널에는 "Setup 버전에서만 사용할 수 있습니다"라고만 표시됩니다.
 - **보호**: 실행할 때마다 생성되는 일회용 키 URL(`/auth?key=…`)을 한 번 세션 쿠키(`HttpOnly; SameSite=Strict`)로 교환합니다(쿠키가 없으면 응답은 401입니다). Host는 `127.0.0.1:<port>` 또는 `localhost:<port>`뿐이어야 하고, Origin이 있으면 same-origin이어야 하며, POST에는 same-origin(`Origin` 또는 `Sec-Fetch-Site`)과 CSRF 토큰이 필요합니다. CSP, `nosniff`, `no-store` 같은 응답 헤더가 추가되며 비밀 값은 표시되지 않습니다. 브라우저는 쿠키를 포트별로 분리하지 않으므로, 쿠키는 같은 PC의 다른 127.0.0.1 포트에서 실행 중인 서비스에도 전송됩니다(같은 사용자의 프로세스는 이미 설정 파일을 만질 수 있으므로, 우려되는 것은 권한이 다른 로컬 서비스뿐입니다).
 - **충돌**: 저장은 표시한 버전을 비교하며, 파일이 다른 곳에서 변경되었으면 다시 불러오도록 안내합니다.
-- **확인 화면**: push 모드로의 전환, 권한을 `bypass`로 전환, enrollment 정책을 `all` / `remote-owner`로 변경, 커스텀 종류의 대상 경로 추가, 동의 기록, 등록 제거, 업데이트 제안 적용, push 모드에서의 `run-now`(그리고 이 중 하나라도 포함하는 버전으로 이력을 복원하는 것)는 첫 제출에서는 쓰지 않으며, 변경 사항 목록을 보여주고 일회용 확인을 요청합니다(10분간 유효).
-- **화면**: 헤더는 다섯 항목입니다. 개요 / 저장소(등록, 활성화, 일시 중지, 재개, 제거, 모드와 대상 문서, `run-now`) / 문서 종류(종류의 추가, 편집, 삭제. `templates/`의 템플릿 편집) / 업데이트 제안(diff 확인, 적용, 폐기) / 설정. 설정은 탭으로 표시되며 일반 / Worker / 동의 / 이력(변경 이력, diff, 복원) / 진단으로 나뉩니다. Worker 화면의 모델과 effort는 입력하지 않고 목록에서 선택합니다. 모델 목록은 기본 목록이며, 환경 변수 `ANTHROPIC_API_KEY`가 이미 설정되어 있으면 "모델 목록 새로 고침" 버튼으로 Anthropic API에서 최신 모델을 메모리로 가져옵니다(키는 저장하거나 표시하지 않고, 화면을 열기만 해서는 통신하지 않으며, 목록에 없는 저장된 값은 "목록에 없는 값"으로 남깁니다). 시각은 화면을 실행하는 PC의 로컬 시간대(`YYYY-MM-DD HH:MM`)로 표시하며, 저장 형식과 CLI의 JSON은 바뀌지 않습니다. `run-now`는 시간이 걸리므로 백그라운드에서 실행되며 화면에서 상태를 확인할 수 있습니다.
+- **확인 화면**: 저장소 활성화(문서가 자동으로 commit·push됩니다), 권한을 `bypass`로 바꾸기, 자동 등록 정책을 `all` / `remote-owner`로 바꾸기(push하는 모든 저장소, 또는 지정한 소유자의 모든 저장소가 유지 관리 대상이 됩니다), 커스텀 종류의 대상 경로 추가, 등록 제거, `run-now`(및 이들을 포함하는 버전으로의 이력 복원)는 처음 제출할 때 쓰지 않고, 변경 사항 목록을 보여 주며 1회용 확인(10분간 유효)을 요구합니다.
+- **화면**: 헤더는 네 항목입니다. 개요 / 저장소(등록, 활성화, 일시 중지, 재개, 제거, 대상 문서, `run-now`. 설정 이전으로 중지된 등록은 "재개" 버튼 대신 안내를 표시하며, "활성화"로 다시 활성화합니다) / 기록(유지보수 기록: 결과, 커밋, 사유) / 설정. 설정은 탭으로 표시되며 일반(제외 항목, 공통 추가 지시, 자동 등록 정책) / 문서(기본 대상 문서, 문서 종류의 추가·편집·삭제, `templates/`의 템플릿 편집. `/settings/documents`) / Worker / 설정 변경 기록(변경 이력, diff, 복원) / 진단으로 나뉩니다. 이전의 "문서 종류", "업데이트 제안", "동의" 화면은 제거되었습니다(예전 URL은 404를 반환합니다).Worker 화면의 모델과 effort는 입력하지 않고 목록에서 선택합니다. 모델 목록은 기본 목록이며, 환경 변수 `ANTHROPIC_API_KEY`가 이미 설정되어 있으면 "모델 목록 새로 고침" 버튼으로 Anthropic API에서 최신 모델을 메모리로 가져옵니다(키는 저장하거나 표시하지 않고, 화면을 열기만 해서는 통신하지 않으며, 목록에 없는 저장된 값은 "목록에 없는 값"으로 남깁니다). 시각은 화면을 실행하는 PC의 로컬 시간대(`YYYY-MM-DD HH:MM`)로 표시하며, 저장 형식과 CLI의 JSON은 바뀌지 않습니다. `run-now`는 시간이 걸리므로 백그라운드에서 실행되며 화면에서 상태를 확인할 수 있습니다.
+- **유지보수 기록**: worker를 시작한 유지보수 실행과 그 전에 실패한 시도(hook과 `run-now`)를 한 번씩 상태 DB(`maintenance_runs`)에 기록하고 "기록"에 표시합니다(저장소별 필터, 페이지당 50건). 실행 계기, 종류, 결과(커밋·푸시 완료 / 변경 없음 / 거부됨 / 보류 / 실패 / 결과 불명), 문서별 추가·삭제 줄 수, 범위와 결과 커밋, 사유를 보여 줍니다. 문서 본문과 diff는 저장하지 않습니다. 저장소별 최신 200건, 전체 2,000건까지 보관하며, 같은 실패가 반복되면 한 줄로 합쳐 "×횟수"로 표시합니다. worker를 시작하지도 실패하지도 않은 실행(기한이 된 종류가 없는 경우 등)은 기록하지 않습니다.
 
 ## 출력 언어
 
@@ -253,17 +240,14 @@ CLI, hook, 설치 프로그램의 안내 출력은 9개 언어(ja, en, zh-CN, zh
 
 | 명령 | 설명 |
 | --- | --- |
-| `enable --repo <path> --accept-consent <version> [--mode propose\|push\|off] [--branches a,b] [--documents AGENTS.md,README.md]` | 저장소를 등록하고 활성화합니다. `--documents`에는 내장 4종류(`CHANGELOG.md` 포함. 대소문자 구분 없음)와 설정에 정의된 커스텀 종류의 id를 지정할 수 있습니다. |
+| `enable --repo <path> [--branches a,b] [--documents AGENTS.md,README.md]` | 저장소를 등록하고 활성화합니다(이후 문서는 자동으로 commit·push됩니다). 설정 이전으로 중지된 등록도 이 명령으로 다시 활성화합니다. remote, 브랜치, upstream이 필요하며 `--branches`를 생략하면 현재 브랜치가 대상입니다. `--documents`에는 내장 4종류(`CHANGELOG.md` 포함. 대소문자 구분 없음)와 설정에 정의된 커스텀 종류의 id를 지정할 수 있습니다. 제거된 `--mode` / `--accept-consent` 옵션과 제거된 `review` / `apply` / `discard` 명령은 오류로 거부됩니다(`<state>/proposals/`에 남은 패치는 `git apply`로 적용할 수 있습니다). |
 | `disable --repo <path>` | 등록을 제거합니다. |
 | `pause [--repo <path>]` / `resume [--repo <path>]` | 일시 중지 / 재개(`--repo`를 생략하면 현재 작업 디렉터리의 저장소). |
-| `status` | 설치 상태, 설정, 동의, 등록, worker 설정, 업데이트 제안 수, Setup 판의 정보(`setup`: 관리 여부, packId, 버전, 실행 파일, 자동 업데이트, 로그온 시 관리 화면의 상주 여부(`trayAutostart`), 마지막 확인 / 실패 시각, 내려받은 버전, 등록 결과, 남아 있는 이전 단독 설치)를 표시합니다. `installedVersion`은 단독 `install`의 기록(`install.json`, 없으면 이전 버전의 `current.json`)에서 가져옵니다. `installForm`은 실행 중인 바이너리의 설치 형태(`setup` = Setup 버전, `standalone` = 단독 `install`, `other` = 플러그인 동봉 또는 개발 빌드)이고, `installed`는 단독 `install`의 설치 위치에 실행 파일이 있는지만 나타냅니다. |
+| `status` | 설치 상태, 설정, 등록(각각의 `paused`와 `migratedFrom`), worker 설정, 설정 파일이 아직 이전 형식인지(`legacy`), Setup 판의 정보(`setup`: 관리 여부, packId, 버전, 실행 파일, 자동 업데이트, 로그온 시 관리 화면의 상주 여부(`trayAutostart`), 마지막 확인 / 실패 시각, 내려받은 버전, 등록 결과, 남아 있는 이전 단독 설치)를 표시합니다. `installedVersion`은 단독 `install`의 기록(`install.json`, 없으면 이전 버전의 `current.json`)에서 가져옵니다. `installForm`은 실행 중인 바이너리의 설치 형태(`setup` = Setup 버전, `standalone` = 단독 `install`, `other` = 플러그인 동봉 또는 개발 빌드)이고, `installed`는 단독 `install`의 설치 위치에 실행 파일이 있는지만 나타냅니다. |
 | `doctor [--verify]` | 환경과 설정을 진단합니다(아래에서 설명). |
-| `run-now [--repo <path>] [--documents <id,...>]` | push를 기다리지 않고 지금 바로 유지 관리를 한 번 실행합니다(등록되고 동의한 저장소에 한하며, 시점은 무시하고 활성화된 모든 종류를 처리합니다). `--documents`는 처리할 종류를 좁힙니다(정의되지 않은 종류나 해당 저장소에서 비활성화된 종류는 worker를 시작하지 않고 거부됩니다). **주의**: 좁힌 `run-now`도 처리 완료 위치를 진행하며, 업데이트 제안은 commit당 하나이므로 좁힌 범위 밖의 종류는 그 push에 대해 유지 관리되지 않습니다. 유지 관리 후 검사를 위반한 propose는 `outcome`이 `rejected`로 반환됩니다(`reason` 포함. 실패가 아니며 그 push는 처리된 것으로 간주합니다). |
+| `run-now [--repo <path>] [--documents <id,...>]` | push를 기다리지 않고 지금 바로 유지 관리를 한 번 실행합니다(등록되었고 일시 중지되지 않은 저장소에 한하며, 시점은 무시하고 활성화된 모든 종류를 처리합니다). 문서는 일반 실행과 똑같이 commit·push됩니다. `--documents`는 처리할 종류를 좁힙니다(정의되지 않은 종류나 해당 저장소에서 비활성화된 종류는 worker를 시작하지 않고 거부됩니다). **주의**: 좁힌 `run-now`도 처리 완료 위치를 진행하므로, 좁힌 범위 밖의 종류는 그 push에 대해 유지 관리되지 않습니다. 성공하면 `outcome`은 `completed`입니다. |
 | `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | 문서 종류(내장과 커스텀)를 나열하고 하나의 상세(활성 또는 비활성, 대상 경로와 존재 여부, 상한, 시점, 템플릿 상태, 마지막 완료 시각. `show`는 설정된 guidance와 추가 지시도 출력합니다. 읽기 전용이며 문서 내용은 출력하지 않습니다)를 표시합니다. |
 | `ui [--port <n>] [--no-open] [--tray]` / `ui --autostart on\|off` | 관리 화면을 실행합니다(위에서 설명. `--tray`로 상주) / Setup 판의 로그온 시 상주를 전환합니다. `--json`은 사용할 수 없습니다. |
-| `review [sha\|latest] [--repo <path>]` | 업데이트 제안의 diffstat, 패치 경로, 대상 문서를 확인합니다. |
-| `apply [sha\|latest] [--repo <path>]` | 업데이트 제안을 작업 트리에 적용합니다. 대상 문서에 commit되지 않은 변경이 있으면 거부됩니다. |
-| `discard [sha\|latest] [--repo <path>]` | 업데이트 제안을 폐기합니다. |
 | `connect claude-code [--apply] [--executable <absolute path>]` / `--remove [--apply]` | settings.json의 Stop hook을 등록합니다(이전 유지 관리 hook을 hook 단위로 교체) / Scriptura의 hook만 제거합니다. `--apply`를 지정하기 전까지는 미리 보기입니다. |
 | `update [--check] [--auto on\|off]` | Setup 판의 자동 업데이트 상태를 표시 / 지금 확인하고 내려받기(적용하지 않음) / 자동 업데이트를 전환합니다. |
 | `update-apply` | 서명자를 검증한 뒤, 다른 Scriptura 프로세스가 실행 중이지 않을 때만 내려받은 업데이트를 적용합니다(로그온 시 자동으로 시작됩니다. 결과는 `status`가 `unmanaged` / `disabled` / `nothingPending` / `busy` / `untrusted`(종료 코드 2) / `applied` 중 하나인 JSON 한 줄입니다). |
@@ -272,10 +256,10 @@ CLI, hook, 설치 프로그램의 안내 출력은 9개 언어(ja, en, zh-CN, zh
 
 ## 안전
 
-- **옵트인**: 동의(버전 포함)와 저장소 등록이 없으면 아무것도 실행되지 않으며 상태 폴더조차 만들어지지 않습니다. 등록은 사용자 자신의 설정 파일에만 보관됩니다.
-- **작업 트리를 변경하지 않음(propose)**: push된 commit을 상태 폴더 아래의 일회용 clone에 펼치고, worker는 거기에서만 실행됩니다. clone은 push된 commit으로 만들어지므로 사용자의 추적되지 않는 파일과 무시되는 파일(`.env` 등)은 clone에 존재하지 않습니다. 다만 이것은 "파일이 clone에 없다"는 사실일 뿐이며, `restricted` 권한 규칙(`Read(./**)`와 민감 패턴의 거부)이 clone 밖의 읽기를 금지한다는 보증은 아닙니다(규칙이 clone 밖의 경로를 거부하는지는 검증되지 않았습니다). clone의 `origin`은 제거되므로 worker가 push하더라도 사용자의 저장소에는 아무것도 도달하지 않습니다.
+- **옵트인**: 저장소를 등록(`enable` 또는 관리 화면)하기 전에는 아무것도 실행되지 않으며 상태 폴더도 만들지 않습니다. 등록은 사용자 본인의 설정 파일에만 보관됩니다.
+- **자동 commit과 push**: worker는 사용자의 실제 작업 트리에서 실행되며, Scriptura는 대상 문서를 묻지 않고 commit·push합니다. 그래서 `enable`은 remote, 브랜치, upstream을 필수로 하고, 아래의 실행 후 검사에서 문제가 발견되면 commit하지 않습니다. 그래도 괜찮은 저장소에만 활성화하십시오. 이전의 propose 모드(업데이트 제안)는 더 이상 없습니다.
 - **민감 패턴**: `.env*` / `*.pem` / `*.key` / `*.p12` / `*.pfx` / `id_rsa*` / `id_ed25519*` / `**/secrets/**` / `.git/config`는 `restricted`일 때 worker의 Read / Edit 거부 규칙(`--disallowedTools`)으로 적용됩니다. `exclude`로 추가할 수는 있지만, 교체하여 일부를 제거할 수는 없습니다. `bypass`(기존 호환. 모든 권한 프롬프트를 건너뜀)에서는 이 규칙이 적용되지 않습니다.
-- **실행 후 검사**: worker가 대상 문서(와 `.gitignore`) 이외의 것을 변경했다면 그 결과는 채택되지 않습니다. propose는 일회용 clone 전체를 비교합니다(무시되는 파일의 증가 포함). push 모드는 사용자의 실제 작업 트리에서 실행되므로, `restricted`일 때만 worker 전후의 작업 트리의 추적되는 파일과 추적되지 않는 파일을 비교하며(`target/` 같은 무시되는 파일의 변경은 사용자의 동시 작업과 구별할 수 없으므로 제외됩니다), `bypass`는 이전처럼 commit 대상 문서의 해시 검사만 합니다. push 모드에서 commit과 push의 상태가 불확실하면 다시 실행하지 않고 상태 DB를 통해 조정합니다. 상한, 필수 제목, 릴리스된 CHANGELOG 항목의 불변성은 권한 모드와 관계없이 검사됩니다(위를 참조).
+- **실행 후 검사**: worker가 대상 문서(와 `.gitignore`) 이외를 변경한 경우 그 결과는 채택하지 않습니다. worker는 사용자의 실제 작업 트리에서 실행되므로, `restricted`일 때만 worker 전후로 작업 트리의 추적 파일과 미추적 파일을 비교합니다(`target/` 같은 무시된 파일은 사용자의 동시 작업과 구별할 수 없어 제외). `bypass`는 종전처럼 commit 대상 문서의 해시 검사만 합니다. commit과 push 결과가 불확실할 때는 다시 실행하지 않고 상태 DB로 정합성을 맞춥니다. 한도, 필수 제목, 릴리스된 CHANGELOG 항목의 불변성은 권한 모드와 관계없이 검사합니다(위 참조).
 - **환경 위생**: worker에 전달되는 환경 변수에서 부모 세션(데스크톱 앱 등)에서 유래한 중계 설정을 제거합니다.
 
 ## 비용과 데이터 전송
@@ -286,20 +270,29 @@ CLI, hook, 설치 프로그램의 안내 출력은 9개 언어(ja, en, zh-CN, zh
 
 `scriptura doctor [--verify] [--json]`은 항목마다 `{id, status, detail}`을 반환합니다(status는 `ok` / `warn` / `fail` / `info`). `fail`이 하나라도 있으면 종료 코드는 1입니다.
 
-지원 플랫폼, `git`, `claude`(실행 파일 해석), `claude auth status`(worker와 같은 환경에서 실행하며 종료 코드와 `authMethod`만 확인), `gh`(push 모드의 GitHub 저장소가 있을 때만), 설정과 동의, 상태 폴더에 쓸 수 있는지, hook의 중복 등록, `allowManagedHooksOnly` / `disableAllHooks`, 이전 `agents-maintenance`의 잔여 등록을 검사합니다. Setup 판에 대해서는 플러그인과 Setup 판의 중복 등록(`setupPlugin`), Setup 판의 hook 존재 여부(`setupHook`), 남아 있는 이전 단독 설치(`legacyInstall`), 자동 업데이트 상태(`autoUpdate`)도 보고합니다(Setup 판이 아닌 경우에는 `info` 항목 `setup` 하나뿐입니다). `kinds` 항목은 문서 종류의 템플릿을 읽을 수 있는지(위치와 크기)를 검사하고, 상한이 기존 문서의 현재 크기보다 작을 때(다음 유지 관리가 거부될 수 있습니다)와 push 모드로 `CHANGELOG.md`를 유지 관리하는 저장소가 있을 때(릴리스 절차와의 충돌)에 `info`를 보고합니다. `--verify`는 플러그인에 포함된 `SHA256SUMS`에 나열된 바이너리(`bin/scriptura.exe`와 `libexec/scriptura-*`)의 SHA-256만 검사합니다(런처, hook, 스킬은 대상이 아니며, 플러그인 밖의 실행 파일도 대상이 아닙니다).
+지원 플랫폼, `git`, `claude`(실행 파일 해석), `claude auth status`(worker와 같은 환경에서 실행하며 종료 코드와 `authMethod`만 확인), `gh`(활성화된 GitHub 저장소가 있을 때만), 설정(이전 형식 설정을 알리는 `configLegacy`, 설정 이전으로 중지된 등록을 알리는 `migratedStopped`, 제거된 업데이트 제안의 패치가 남아 있음을 알리는 `legacyProposals` 포함), 상태 폴더에 쓸 수 있는지, hook의 중복 등록, `allowManagedHooksOnly` / `disableAllHooks`, 이전 `agents-maintenance`의 잔여 등록을 검사합니다. Setup 판에 대해서는 플러그인과 Setup 판의 중복 등록(`setupPlugin`), Setup 판의 hook 존재 여부(`setupHook`), 남아 있는 이전 단독 설치(`legacyInstall`), 자동 업데이트 상태(`autoUpdate`)도 보고합니다(Setup 판이 아닌 경우에는 `info` 항목 `setup` 하나뿐입니다). `kinds` 항목은 문서 종류의 템플릿을 읽을 수 있는지(위치와 크기)를 검사하고, 상한이 기존 문서의 현재 크기보다 작을 때(다음 유지 관리가 거부될 수 있습니다)와 `CHANGELOG.md`를 유지 관리하는 저장소가 있을 때(릴리스 절차와의 충돌)에 `info`를 보고합니다. `--verify`는 플러그인에 포함된 `SHA256SUMS`에 나열된 바이너리(`bin/scriptura.exe`와 `libexec/scriptura-*`)의 SHA-256만 검사합니다(런처, hook, 스킬은 대상이 아니며, 플러그인 밖의 실행 파일도 대상이 아닙니다).
 
 ## 상태와 저장 위치
 
 | 위치 | Windows | macOS | Linux |
 | --- | --- | --- | --- |
 | 설치 위치(고정 실행 파일 `bin\scriptura(.exe)`) | `%LOCALAPPDATA%\Programs\Scriptura` | `~/Library/Application Support/Scriptura/app` | `$XDG_DATA_HOME/scriptura`(기본값 `~/.local/share/scriptura`) |
-| 상태(DB, 잠금, 게시, 업데이트 제안, 설정 변경 이력 `config-history/`) | `%LOCALAPPDATA%\Scriptura\state` | `~/Library/Application Support/Scriptura/state` | `$XDG_STATE_HOME/scriptura`(기본값 `~/.local/state/scriptura`) |
+| 상태(DB, 잠금, 게시,  유지보수 기록(DB 안), 설정 변경 이력 `config-history/`) | `%LOCALAPPDATA%\Scriptura\state` | `~/Library/Application Support/Scriptura/state` | `$XDG_STATE_HOME/scriptura`(기본값 `~/.local/state/scriptura`) |
 
 `SCRIPTURA_HOME`을 절대 경로로 설정하면 상태는 `<SCRIPTURA_HOME>/state`, 설치 위치는 `<SCRIPTURA_HOME>/app`, 설정은 `<SCRIPTURA_HOME>/config.toml`에 놓입니다. `SCRIPTURA_DB`로 상태 DB만 다른 곳으로 옮길 수도 있습니다. 템플릿은 설정 파일과 같은 폴더의 `templates/`에 둡니다. Codex나 Claude Code의 홈에는 아무것도 쓰지 않습니다(`connect claude-code --apply` / `--remove`, Setup 판의 자동 등록, `uninstall-setup --apply`가 `settings.json`을 다시 쓰는 경우는 예외입니다). Setup 판의 설치 위치(Windows `%LOCALAPPDATA%\ScripturaApp`)는 Velopack이 관리하며 업데이트할 때 교체되므로 상태나 설정은 거기에 보관하지 않습니다.
 
 ## 기존 사용자의 자동 마이그레이션
 
-이전 Scriptura(설정 파일이 없던 버전)를 실행했고 상태 DB가 남아 있는 사용자가 설정 파일이 없는 상태에서 hook을 실행하면, 이전과 같은 동작(모든 저장소, `push` 모드, 권한 bypass)으로 설정 파일이 정확히 한 번 자동 생성되며 그 사실이 통지됩니다. 동의의 출처는 `legacy-migration`으로 기록됩니다. 새 사용자에게는 아무것도 만들어지지 않습니다. 대상을 좁히고 싶다면 `enable`로 다시 등록하고 `policy = "explicit"`로 설정하십시오. 이전 `agents-maintenance`의 상태(`~/.codex/hooks/state`)는 이어받지 않으며 빈 상태에서 시작합니다.
+이전 Scriptura(설정 파일이 없던 버전)를 실행했고 상태 DB가 남아 있는 사용자가 설정 파일이 없는 상태에서 hook을 실행하면, 이전과 같은 동작(모든 저장소, `push` 모드, 권한 bypass)으로 설정 파일이 정확히 한 번 자동 생성되며 그 사실이 통지됩니다.  새 사용자에게는 아무것도 만들어지지 않습니다. 대상을 좁히고 싶다면 `enable`로 다시 등록하고 `policy = "explicit"`로 설정하십시오. 이전 `agents-maintenance`의 상태(`~/.codex/hooks/state`)는 이어받지 않으며 빈 상태에서 시작합니다.
+
+## 이전 설정의 마이그레이션(동의와 propose 제거)
+
+- 설정 파일은 이제 항상 `schema = 3`으로 저장됩니다. `schema`가 1, 2이거나 생략된 파일은 이전 형식으로 읽어 들일 때 변환되며, 다음 hook(또는 설정 변경)이 한 번 schema 3으로 저장하면서 이전 내용을 `config-history/`에 보관하고 중지된 등록의 수를 한 번 알립니다.
+- 동의가 있고 실질적으로 `push` 모드였던 등록은 그대로 계속 실행됩니다. 그 밖의 등록(`propose`, `off`, 동의 없음)은 출처를 기록하고(`migrated_from`) 일시 중지되며, `scriptura enable --repo <path>` 또는 관리 화면으로 다시 활성화하기 전까지 아무것도 하지 않습니다(`enable`이 remote와 upstream을 확인하므로 `resume`과 이력 복원으로는 재개되지 않습니다). `status`는 `migratedFrom`을 표시하고 `doctor`도 이러한 등록을 알립니다.
+- `enrollment.policy`가 `all` / `remote-owner`이면, 파일에 동의가 있고 `defaults.mode = "push"`였던 경우를 제외하고 `explicit`으로 되돌립니다(owners는 유지).
+- `consent`와 `mode` 키는 제거됩니다. 이들을 아직 가진 schema 3 파일은 유효하지 않으며 아무것도 실행되지 않습니다.
+- `<state>/proposals/`에 남은 패치는 읽지도 삭제하지도 않습니다. 필요 없으면 직접 삭제하십시오. 적용하지 않은 패치는 `git apply`로 적용할 수 있습니다. 일회용 클론(`work-*`)의 자동 정리도 없어졌습니다.
+- 이전 버전의 Scriptura는 schema 3 파일을 읽으면 아무것도 하지 않으므로, 플러그인 판과 Setup 판을 함께 쓰는 경우에는 둘 다 업데이트하십시오.
 
 ## 지원하지 않음 / 검증하지 않음
 
