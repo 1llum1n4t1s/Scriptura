@@ -308,7 +308,8 @@ Um usuário que executou uma versão mais antiga do Scriptura (uma versão que n
 
 ```powershell
 Set-Location D:\Dev\Scriptura
-cargo test --locked --features test-support -- --test-threads=1
+cargo nextest run --locked --features test-support   # cargo install cargo-nextest --locked
+cargo nextest run --locked --features test-support --profile quiescence
 cargo build --release
 cargo build --release --no-default-features   # a build without the admin UI (the ui feature)
 git diff --check

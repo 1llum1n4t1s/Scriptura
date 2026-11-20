@@ -1,0 +1,25 @@
+# cargo-nextest の設定。テストごとに別プロセスで走るため、`env::set_var` によるプロセス全体の環境変数の書き換えが
+# 他のテストへ漏れない。これで従来の `--test-threads=1`（全テストの直列実行）が要らなくなる。
+#
+# 実行（この 2 つで全件。`quiescence` を忘れると 1 件が走らない）:
+#   cargo nextest run --locked --features test-support
+#   cargo nextest run --locked --features test-support --profile quiescence
+# doctest は nextest で走らない（現状 0 件）。doctest を足したら `cargo test --doc --locked` を別に実行する。
+nextest-version = "0.9.152"
+
+# `python_worker_running_and_legacy_missing_fields_recovers` は、製品の `worker_quiescence_error`（Windows では
+# マシン上の全プロセスから `--no-session-persistence` 付きの claude/node/cmd を数える）を実際に通る。並列で走る
+# 他のテストの worker スタブをそのプロセス一覧が拾って失敗するので、ほかのテストと同時に動かさない専用の
+# プロファイルで単独実行する（test-group では、グループ外のテストとの同時実行を防げない）。
+
+[profile.default]
+default-filter = "not test(=python_worker_running_and_legacy_missing_fields_recovers)"
+# 不安定さを隠さない（再試行はしない）。
+retries = 0
+# 遅いテストの検出用。period ごとに「遅い」と表示するだけで、打ち切りはしない。
+slow-timeout = { period = "60s" }
+
+[profile.quiescence]
+default-filter = "test(=python_worker_running_and_legacy_missing_fields_recovers)"
+retries = 0
+slow-timeout = { period = "60s" }

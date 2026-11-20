@@ -308,7 +308,8 @@ CLI、hook 與安裝程式的指引輸出提供 9 種語言（ja、en、zh-CN、
 
 ```powershell
 Set-Location D:\Dev\Scriptura
-cargo test --locked --features test-support -- --test-threads=1
+cargo nextest run --locked --features test-support   # cargo install cargo-nextest --locked
+cargo nextest run --locked --features test-support --profile quiescence
 cargo build --release
 cargo build --release --no-default-features   # 不含管理介面（ui feature）的建置
 git diff --check

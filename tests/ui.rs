@@ -4,7 +4,7 @@
 //! 隔離: 画面の一部（状態 DB・doctor・settings.json）は環境変数で場所を決めるため、テストごとに
 //! `SCRIPTURA_HOME` / `SCRIPTURA_CONFIG` / `SCRIPTURA_DB` / `CLAUDE_CONFIG_DIR` / `LOCALAPPDATA` / `PATH`
 //! （先頭にスタブの claude）を一時フォルダーへ向ける。環境変数はプロセス全体の値なので、グローバルな Mutex で
-//! テストを直列化する（`--test-threads=1` でも念のため）。実環境の設定・状態は読み書きしない。
+//! テストを直列化する（nextest はテストごとに別プロセスなので効かないが、`cargo test` でも安全なよう残す）。実環境の設定・状態は読み書きしない。
 //! fixture の置き場は `SCRIPTURA_TEST_BASE`（未指定なら既存テストと同じ `validation/`）。
 #![cfg(all(feature = "test-support", feature = "ui"))]
 use axum::{

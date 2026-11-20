@@ -76,11 +76,14 @@ Scriptura は、利用者が登録した自分のリポジトリへの push 後�
 ## 検証
 
 ```powershell
-cargo test --locked --features test-support -- --test-threads=1
+cargo nextest run --locked --features test-support
+cargo nextest run --locked --features test-support --profile quiescence   # 他のテストと同時に動かせない 1 件
 cargo build --release
 cargo build --release --no-default-features
 cargo build --release --features update-feed-test   # Setup 版の隔離 E2E 用（配布しない）
 git diff --check
 ```
+
+テストは cargo-nextest（`cargo install cargo-nextest --locked`）でテストごとに別プロセス・並列で走らせる（`env::set_var` の干渉が無くなり、Windows の遅さを抑えるため。設定は `.config/nextest.toml`）。doctest は 0 件なので `cargo test --doc` は不要（足したら別に実行する）。2 行目はマシン上のプロセス一覧を見る 1 件を単独で走らせる。
 
 `--no-default-features` は管理画面（feature `ui`）を含まないビルドで、axum・askama・tokio をリンクしないことを確かめる。

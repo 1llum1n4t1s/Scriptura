@@ -47,18 +47,26 @@ fn find_real_git() -> String {
 /// 指定 PID のプロセスがまだ生きているか。
 #[cfg(windows)]
 fn process_alive(pid: &str) -> bool {
-    Command::new("pwsh")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!(
-                "$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue;if(-not $p){{exit 1}};exit 0"
-            ),
-        ])
-        .output()
-        .unwrap()
-        .status
-        .success()
+    // 外部プロセス（pwsh）を起動せず Win32 で直接見る（100ms ごとのポーリングで起動コストが積み上がるため）。
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    const STILL_ACTIVE: u32 = 259;
+    let pid: u32 = pid.trim().parse().expect("PID が数値ではありません");
+    // SAFETY: 取得したハンドルは必ず CloseHandle で閉じる。
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // 権限不足で開けないだけなら、プロセス自体は存在する（生きている扱い）。
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        // 終了コード取得に失敗した場合は、開けた以上は生きている扱いにする。
+        !ok || code == STILL_ACTIVE
+    }
 }
 
 /// 指定 PID のプロセスがまだ生きているか。ゾンビ（終了済みで回収待ち）は終了扱いにする。

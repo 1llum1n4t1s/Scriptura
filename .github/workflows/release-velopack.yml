@@ -30,8 +30,8 @@ name: Release Velopack
 #   新しい版を出した後に古い版の失敗 job を再実行することはできないので、その OS は新しい版で出し直す。
 #   ただし版付きの nupkg を R2 へ置いた後（releases.<channel>.json の前）で落ちた場合は、再実行しても署名・梱包のやり直しで
 #   内容が変わり、既存の nupkg と一致せず失敗する（版付きの成果物は上書きしない）。その場合は patch を上げて出し直す。
-# - Scriptura には ci.yml が無いため、配信の前に各 job 内でテスト（cargo test --locked --features test-support --
-#   --test-threads=1）も通す。
+# - Scriptura には ci.yml が無いため、配信の前に各 job 内でテスト（cargo nextest run --locked --features test-support。
+#   cargo-nextest は固定版の公式バイナリを SHA-256 照合して入れ、テストごとに別プロセスで並列実行する。.config/nextest.toml）も通す。
 # - 本人が事前に用意するもの（リポジトリの設定。値はここに書かない）:
 #     Environment `r2-release`（deployment は タグ v<x.y.z> と dryrun/* のみ）に
 #       Secrets:   R2_RELEASE_ACCESS_KEY_ID / R2_RELEASE_SECRET_ACCESS_KEY（R2）
@@ -170,7 +170,23 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $env:SCRIPTURA_HOME = Join-Path $env:RUNNER_TEMP 'scriptura-test-home'
-          cargo test --locked --features test-support -- --test-threads=1
+          # cargo-nextest（テストごとに別プロセスで並列実行する。.config/nextest.toml）は、公式リリースの固定版バイナリを
+          # SHA-256 と照合してから展開する（ソースビルドは数分かかる）。版を上げるときは版と下の SHA-256 を同時に変える。
+          $nextestVersion = '0.9.152'
+          $nextestSha256 = 'cc6bf4b6a7ac18e462cd6c9bae67e26921b888249c2988c6acabf3df387ed9d6' # x86_64-pc-windows-msvc.zip
+          $nextestDir = Join-Path $env:RUNNER_TEMP 'nextest'
+          New-Item -ItemType Directory -Force -Path $nextestDir | Out-Null
+          $nextestZip = Join-Path $nextestDir 'cargo-nextest.zip'
+          Invoke-WebRequest -Uri "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$nextestVersion/cargo-nextest-$nextestVersion-x86_64-pc-windows-msvc.zip" -OutFile $nextestZip
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $nextestZip).Hash.ToLowerInvariant() -cne $nextestSha256) { throw 'The cargo-nextest archive does not match the pinned SHA-256.' }
+          Expand-Archive -LiteralPath $nextestZip -DestinationPath $nextestDir -Force
+          $env:PATH = "$nextestDir$([IO.Path]::PathSeparator)$env:PATH"
+          cargo nextest --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo nextest run --locked --features test-support
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # 他のテストと同時に動かせない 1 件（.config/nextest.toml の quiescence）を単独で実行する。
+          cargo nextest run --locked --features test-support --profile quiescence
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build the executable
@@ -430,7 +446,19 @@ jobs:
           # テストが利用者の設定・状態へ書かないよう、保存場所を作業フォルダーへ隔離する。
           export SCRIPTURA_HOME="$CI_ROOT/validation/scriptura-home"
           export NO_PROXY=127.0.0.1,localhost,::1
-          cargo test --locked --features test-support -- --test-threads=1
+          # cargo-nextest（テストごとに別プロセスで並列実行する。.config/nextest.toml）は、公式リリースの固定版バイナリを
+          # SHA-256 と照合してから展開する（ソースビルドは数分かかる）。版を上げるときは版と SHA-256 を同時に変える。
+          nextest_version=0.9.152
+          nextest_sha256=2fadf57df4243e691f088ee3bff4f4ab9af16da0c95a1db84b5cb1685e098a76 # universal-apple-darwin.tar.gz
+          mkdir -p "$CI_ROOT/tools/nextest"
+          curl -fsSL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$nextest_version/cargo-nextest-$nextest_version-universal-apple-darwin.tar.gz" -o "$CI_ROOT/tools/nextest.tar.gz"
+          printf '%s  %s\n' "$nextest_sha256" "$CI_ROOT/tools/nextest.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$CI_ROOT/tools/nextest.tar.gz" -C "$CI_ROOT/tools/nextest"
+          export PATH="$CI_ROOT/tools/nextest:$PATH"
+          cargo nextest --version
+          cargo nextest run --locked --features test-support
+          # 他のテストと同時に動かせない 1 件（.config/nextest.toml の quiescence）を単独で実行する。
+          cargo nextest run --locked --features test-support --profile quiescence
           # AGENTS.md の検証にある --no-default-features（管理画面 = feature "ui" を含まないビルド）。
           cargo check --locked --no-default-features --bin scriptura
 
@@ -720,7 +748,23 @@ jobs:
           export SCRIPTURA_HOME="$CI_ROOT/validation/scriptura-home"
           export NO_PROXY=127.0.0.1,localhost,::1
           df -h / "$CI_ROOT" || true
-          cargo test --locked --features test-support -- --test-threads=1
+          # cargo-nextest（テストごとに別プロセスで並列実行する。.config/nextest.toml）は、公式リリースの固定版バイナリを
+          # SHA-256 と照合してから展開する（ソースビルドは数分かかる）。版を上げるときは版と SHA-256 を同時に変える。
+          nextest_version=0.9.152
+          case "$(uname -m)" in
+            x86_64) nextest_asset=x86_64-unknown-linux-gnu; nextest_sha256=d039b43c3e0958441b6ad0a39c8884d018b3d2e8fb9928f209074b1100b5e17a ;;
+            aarch64) nextest_asset=aarch64-unknown-linux-gnu; nextest_sha256=ca1f81a5b86533eb45ab97e0064aa88e925e53aab9a698ca6331a7cad1f85f07 ;;
+            *) echo "Unsupported CPU for cargo-nextest: $(uname -m)" >&2; exit 1 ;;
+          esac
+          mkdir -p "$CI_ROOT/tools/nextest"
+          curl -fsSL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$nextest_version/cargo-nextest-$nextest_version-$nextest_asset.tar.gz" -o "$CI_ROOT/tools/nextest.tar.gz"
+          printf '%s  %s\n' "$nextest_sha256" "$CI_ROOT/tools/nextest.tar.gz" | sha256sum -c -
+          tar -xzf "$CI_ROOT/tools/nextest.tar.gz" -C "$CI_ROOT/tools/nextest"
+          export PATH="$CI_ROOT/tools/nextest:$PATH"
+          cargo nextest --version
+          cargo nextest run --locked --features test-support
+          # 他のテストと同時に動かせない 1 件（.config/nextest.toml の quiescence）を単独で実行する。
+          cargo nextest run --locked --features test-support --profile quiescence
           # AGENTS.md の検証にある --no-default-features（管理画面 = feature "ui" を含まないビルド）。
           cargo check --locked --no-default-features --bin scriptura
           df -h / "$CI_ROOT" || true

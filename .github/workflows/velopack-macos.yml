@@ -5,7 +5,7 @@ name: Velopack macOS
 # 署名・公証・配信は release-velopack.yml の macos-installer が行う（ここでは未署名の検証用の一式を作るだけ）。
 #
 # 中身:
-#   1. cargo test --locked --features test-support -- --test-threads=1（macOS で走るもの）と
+#   1. cargo nextest run --locked --features test-support（macOS で走るもの。cargo-nextest は固定版の公式バイナリを SHA-256 照合して入れる）と
 #      cargo check --locked --no-default-features --bin scriptura。
 #   2. scripts/velopack/pack-macos.sh で、未署名・テスト用 packId（ScripturaVelopackTest）の 9.0.0 を梱包する
 #      （既定の機能でビルドし、.pkg・nupkg の構成と、nupkg の展開検査まで通す。署名・公証の検査は --sign のときだけ）。
@@ -147,7 +147,19 @@ jobs:
           # テストが利用者の設定・状態へ書かないよう、保存場所を作業フォルダーへ隔離する。
           export SCRIPTURA_HOME="$CI_ROOT/validation/scriptura-home"
           export NO_PROXY=127.0.0.1,localhost,::1
-          cargo test --locked --features test-support -- --test-threads=1
+          # cargo-nextest（テストごとに別プロセスで並列実行する。.config/nextest.toml）は、公式リリースの固定版バイナリを
+          # SHA-256 と照合してから展開する（ソースビルドは数分かかる）。版を上げるときは版と SHA-256 を同時に変える。
+          nextest_version=0.9.152
+          nextest_sha256=2fadf57df4243e691f088ee3bff4f4ab9af16da0c95a1db84b5cb1685e098a76 # universal-apple-darwin.tar.gz
+          mkdir -p "$CI_ROOT/tools/nextest"
+          curl -fsSL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$nextest_version/cargo-nextest-$nextest_version-universal-apple-darwin.tar.gz" -o "$CI_ROOT/tools/nextest.tar.gz"
+          printf '%s  %s\n' "$nextest_sha256" "$CI_ROOT/tools/nextest.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$CI_ROOT/tools/nextest.tar.gz" -C "$CI_ROOT/tools/nextest"
+          export PATH="$CI_ROOT/tools/nextest:$PATH"
+          cargo nextest --version
+          cargo nextest run --locked --features test-support
+          # 他のテストと同時に動かせない 1 件（.config/nextest.toml の quiescence）を単独で実行する。
+          cargo nextest run --locked --features test-support --profile quiescence
 
       - name: Check the build without the management screen
         # AGENTS.md の検証にある --no-default-features（管理画面 = feature "ui" を含まないビルド）。
