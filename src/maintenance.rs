@@ -250,10 +250,15 @@ fn git_output(
     capture(c, input, timeout, false)
 }
 pub fn run_git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    git_output(root, args, None, 2)
-        .ok()
-        .filter(|r| r.code == Some(0))
-        .map(|r| r.stdout)
+    run_git_settled(root, args).flatten()
+}
+/// `run_git` と同じ起動（期限・環境は同一）で、結果が確定したかも返す。
+/// 外側 None は「確定していない」（起動失敗・期限超過・終了コードなし）、内側 None は「正常終了コードが
+/// 0 以外」（`cat-file` の blob 不在など）。結果を再利用してよいのは外側が Some のときだけ。
+pub fn run_git_settled(root: &Path, args: &[&str]) -> Option<Option<Vec<u8>>> {
+    let r = git_output(root, args, None, 2).ok()?;
+    r.code?;
+    Some((r.code == Some(0)).then_some(r.stdout))
 }
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let r = git_output(root, args, None, 120).map_err(err)?;
@@ -545,7 +550,25 @@ pub fn agents_size_error(
     directories: &[PathBuf],
     validate_sizes: bool,
 ) -> Option<String> {
-    agents_problem(root, directories, validate_sizes).map(|p| p.message())
+    agents_size_error_with(root, directories, validate_sizes, &mut None)
+}
+/// `agents_size_error` の、追跡ファイル一覧（`git ls-files -z`）を呼び出しの間で使い回す版。
+/// `tracked` は、間に index・作業ツリーを変える操作が無い連続した検査の間だけ共有する
+/// （`None` で渡し、最初の検査が取得して入れる。取得に失敗したときは入れない）。
+fn agents_size_error_with(
+    root: &Path,
+    directories: &[PathBuf],
+    validate_sizes: bool,
+    tracked: &mut Option<String>,
+) -> Option<String> {
+    match scan_agents(root, directories, validate_sizes, false, None, tracked) {
+        Ok(found) => found.into_iter().next().map(|f| match f {
+            AgentsFinding::File { path, size } => AgentsProblem::File { path, size },
+            AgentsFinding::Chain { path, size, .. } => AgentsProblem::Chain { path, size },
+        }),
+        Err(e) => Some(AgentsProblem::Unverifiable(e)),
+    }
+    .map(|p| p.message())
 }
 /// 階層（ルートから子まで）の合計に数える 1 ファイル。`path` はリポジトリからの相対、`size` は実バイト
 /// （中身が空白だけなら 0 を数えるので、ここには 0 のものは入れない）。
@@ -576,7 +599,7 @@ pub fn agents_problem(
     directories: &[PathBuf],
     validate_sizes: bool,
 ) -> Option<AgentsProblem> {
-    match scan_agents(root, directories, validate_sizes, false, None) {
+    match scan_agents(root, directories, validate_sizes, false, None, &mut None) {
         Ok(found) => found.into_iter().next().map(|f| match f {
             AgentsFinding::File { path, size } => AgentsProblem::File { path, size },
             AgentsFinding::Chain { path, size, .. } => AgentsProblem::Chain { path, size },
@@ -594,7 +617,7 @@ pub fn agents_findings(
     directories: &[PathBuf],
     editable: &[String],
 ) -> Result<Vec<AgentsFinding>> {
-    scan_agents(root, directories, true, true, Some(editable))
+    scan_agents(root, directories, true, true, Some(editable), &mut None)
 }
 /// commit されるツリー（`touched` は作業ツリーの内容が commit に入る文書、それ以外は HEAD の内容）の
 /// AGENTS の大きさの違反。作業ツリーの大きさ検査（`agents_size_error`）と合わせて commit 前に使う。
@@ -603,7 +626,16 @@ pub fn agents_commit_view_error(
     directories: &[PathBuf],
     touched: &[String],
 ) -> Option<String> {
-    match scan_agents(root, directories, true, false, Some(touched)) {
+    agents_commit_view_error_with(root, directories, touched, &mut None)
+}
+/// `agents_commit_view_error` の、追跡ファイル一覧を使い回す版（共有の条件は `agents_size_error_with`）。
+fn agents_commit_view_error_with(
+    root: &Path,
+    directories: &[PathBuf],
+    touched: &[String],
+    tracked: &mut Option<String>,
+) -> Option<String> {
+    match scan_agents(root, directories, true, false, Some(touched), tracked) {
         Ok(found) => found.into_iter().next().map(|f| match f {
             AgentsFinding::File { path, size } => AgentsProblem::File { path, size },
             AgentsFinding::Chain { path, size, .. } => AgentsProblem::Chain { path, size },
@@ -622,10 +654,15 @@ fn agents_editable(root: &Path, editable: &[String], relative: &str) -> bool {
 }
 /// 検査対象の AGENTS ファイルの内容（無ければ None）と、編集できるか。`editable` が None なら
 /// 作業ツリーの内容だけ。Some のとき、編集できないファイルは作業ツリーと HEAD の blob の大きい方を返す。
+///
+/// `head_blobs` は HEAD の blob の読み取り結果（`git cat-file` の成否を含む）を、1 回の `scan_agents`
+/// （=間に作業ツリー・Git の状態を変える操作が無い 1 回の呼び出し）の中でだけ再利用する入れ物。
+/// 呼び出しごとに新しく作り、`scan_agents` の外へは持ち出さない。
 fn agents_file_bytes(
     root: &Path,
     p: &Path,
     editable: Option<&[String]>,
+    head_blobs: &mut BTreeMap<String, Option<Vec<u8>>>,
 ) -> Result<Option<(Vec<u8>, bool)>> {
     let worktree = match fs::symlink_metadata(p) {
         Ok(m) => {
@@ -644,7 +681,18 @@ fn agents_file_bytes(
     if agents_editable(root, allowed, &relative) {
         return Ok(worktree.map(|d| (d, true)));
     }
-    let head = run_git(root, &["cat-file", "blob", &format!("HEAD:{relative}")]);
+    // 確定した結果（成功、または blob 不在を示す正常な非 0 終了）だけを保持する。起動失敗・期限超過は
+    // 保持せず、次の問い合わせで取り直す。
+    let head = match head_blobs.get(&relative) {
+        Some(cached) => cached.clone(),
+        None => match run_git_settled(root, &["cat-file", "blob", &format!("HEAD:{relative}")]) {
+            Some(settled) => {
+                head_blobs.insert(relative.clone(), settled.clone());
+                settled
+            }
+            None => None,
+        },
+    };
     Ok(match (worktree, head) {
         (Some(a), Some(b)) => Some(if b.len() > a.len() { b } else { a }),
         (a, b) => a.or(b),
@@ -657,11 +705,15 @@ fn scan_agents(
     validate_sizes: bool,
     all: bool,
     editable: Option<&[String]>,
+    tracked_cache: &mut Option<String>,
 ) -> Result<Vec<AgentsFinding>> {
     {
-        let tracked = text(
-            run_git(root, &["ls-files", "-z"]).ok_or(crate::t!("maint.agents_tracked_list"))?,
-        )?;
+        if tracked_cache.is_none() {
+            *tracked_cache = Some(text(
+                run_git(root, &["ls-files", "-z"]).ok_or(crate::t!("maint.agents_tracked_list"))?,
+            )?);
+        }
+        let tracked = tracked_cache.as_deref().unwrap_or_default();
         let mut paths = BTreeSet::from([(root.to_path_buf(), true)]);
         paths.extend(directories.iter().cloned().map(|p| (p, true)));
         for name in tracked.split('\0').filter(|n| !n.is_empty()) {
@@ -672,6 +724,7 @@ fn scan_agents(
         let mut found: Vec<AgentsFinding> = Vec::new();
         let mut seen = BTreeSet::new();
         let mut seen_chains = BTreeSet::new();
+        let mut head_blobs: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
         for (path, observed) in paths {
             let mut chain = 0;
             let mut deepest: Option<(PathBuf, AgentsFinding)> = None;
@@ -700,7 +753,9 @@ fn scan_agents(
                 let mut sizes = BTreeMap::new();
                 for name in ["AGENTS.override.md", "AGENTS.md"] {
                     let p = d.join(name);
-                    let Some((data, can_edit)) = agents_file_bytes(root, &p, editable)? else {
+                    let Some((data, can_edit)) =
+                        agents_file_bytes(root, &p, editable, &mut head_blobs)?
+                    else {
                         continue;
                     };
                     let size = data.len();
@@ -966,8 +1021,26 @@ pub struct IndexEntry {
     pub actual: String,
 }
 pub fn index_stage0(root: &Path, relative: &str) -> Option<IndexEntry> {
-    let raw = run_git(root, &["ls-files", "-v", "-s", "-z"])?;
-    let data = std::str::from_utf8(&raw).ok()?;
+    IndexListing::default().stage0(root, relative)
+}
+/// `git ls-files -v -s -z` の出力を、同じ状態に対する複数の問い合わせ（`index_stage0` 相当）の間だけ
+/// 使い回す入れ物。呼び出しの間に index・作業ツリーを変える操作が無いループの中で 1 つ作り、
+/// ループの外へは持ち出さない。取得に失敗した（None）ときは保持せず、次の問い合わせで取り直す
+/// （従来の「問い合わせごとに 1 回取得」と同じ失敗時の挙動）。
+#[derive(Default)]
+struct IndexListing {
+    raw: Option<Vec<u8>>,
+}
+impl IndexListing {
+    fn stage0(&mut self, root: &Path, relative: &str) -> Option<IndexEntry> {
+        if self.raw.is_none() {
+            self.raw = run_git(root, &["ls-files", "-v", "-s", "-z"]);
+        }
+        parse_stage0(self.raw.as_deref()?, relative)
+    }
+}
+fn parse_stage0(raw: &[u8], relative: &str) -> Option<IndexEntry> {
+    let data = std::str::from_utf8(raw).ok()?;
     if !data.ends_with('\0') && !data.is_empty() {
         return None;
     }
@@ -1091,6 +1164,8 @@ pub fn interrupted_ignored_error(
         for d in documents {
             candidates.insert(safe_relative(root, d)?);
         }
+        // index の一覧は、この（index を変える操作の無い）ループの間だけ 1 回の取得を使い回す。
+        let mut listing = IndexListing::default();
         for relative in candidates {
             if !matches!(
                 Path::new(&relative)
@@ -1104,7 +1179,8 @@ pub fn interrupted_ignored_error(
                 continue;
             }
             safe_relative(root, &root.join(&relative))?;
-            let entry = index_stage0(root, &relative)
+            let entry = listing
+                .stage0(root, &relative)
                 .filter(|e| e.kind != "ambiguous")
                 .ok_or_else(|| crate::t!("maint.recovery_index", path = relative))?;
             let actual = &entry.actual;
@@ -1285,39 +1361,47 @@ impl Scope {
     }
 }
 /// `maintenance_scope` に、CHANGELOG・カスタム種類の対象（`kinds::other_scope`）を足したもの。
-pub fn maintenance_scope_for(
+/// push 範囲の変更パス（`git diff --name-only -z <previous> <pushed>`、
+/// 前回が無いときは `git diff-tree --root ... <pushed>` の出力）を呼び出し側が既に取得済みのときの版。
+/// 同じ呼び出しの連鎖の中で同じ git を 2 回起動しないための入口で、`changed` は呼び出し側が
+/// 取得した直後（間に作業ツリー・Git の状態を変える操作が無い）の値であること。
+pub fn maintenance_scope_for_changed(
     root: &Path,
-    previous: &str,
-    pushed: &str,
+    changed: Vec<u8>,
     kinds: &[ResolvedKind],
 ) -> Result<Scope> {
-    let mut scope = maintenance_scope(root, previous, pushed)?;
+    let mut scope = maintenance_scope_from(root, || changed)?;
     scope.other = crate::kinds::other_scope(root, kinds);
     Ok(scope)
 }
 pub fn maintenance_scope(root: &Path, previous: &str, pushed: &str) -> Result<Scope> {
+    maintenance_scope_from(root, || {
+        if previous.is_empty() {
+            None
+        } else {
+            run_git(root, &["diff", "--name-only", "-z", previous, pushed])
+        }
+        .or_else(|| {
+            run_git(
+                root,
+                &[
+                    "diff-tree",
+                    "--root",
+                    "--no-commit-id",
+                    "--name-only",
+                    "-r",
+                    "-z",
+                    pushed,
+                ],
+            )
+        })
+        .unwrap_or_default()
+    })
+}
+fn maintenance_scope_from(root: &Path, changed: impl FnOnce() -> Vec<u8>) -> Result<Scope> {
     let mut agents: BTreeSet<_> = active_agents_files(root, root).into_iter().collect();
     let mut design: BTreeSet<_> = scoped_design_files(root, root).into_iter().collect();
-    let paths = if previous.is_empty() {
-        None
-    } else {
-        run_git(root, &["diff", "--name-only", "-z", previous, pushed])
-    }
-    .or_else(|| {
-        run_git(
-            root,
-            &[
-                "diff-tree",
-                "--root",
-                "--no-commit-id",
-                "--name-only",
-                "-r",
-                "-z",
-                pushed,
-            ],
-        )
-    })
-    .unwrap_or_default();
+    let paths = changed();
     for name in text(paths)?.split('\0').filter(|n| !n.is_empty()) {
         let directory = root.join(name).parent().unwrap().to_path_buf();
         if safe_relative(root, &directory).is_err() {
@@ -1396,6 +1480,29 @@ pub fn build_maintenance_reason_with(
     pushed: &str,
     kinds: &[ResolvedKind],
     templates: &[crate::kinds::LoadedTemplate],
+) -> String {
+    build_maintenance_reason_with_memo(
+        root,
+        scope,
+        deleted,
+        previous,
+        pushed,
+        kinds,
+        templates,
+        &mut crate::kinds::SplitMemo::default(),
+    )
+}
+/// `build_maintenance_reason_with` の、分割先の候補を `memo` で使い回す版（`plan_documents_with` と共有する）。
+#[allow(clippy::too_many_arguments)]
+pub fn build_maintenance_reason_with_memo(
+    root: &Path,
+    scope: &Scope,
+    deleted: &[PathBuf],
+    previous: &str,
+    pushed: &str,
+    kinds: &[ResolvedKind],
+    templates: &[crate::kinds::LoadedTemplate],
+    memo: &mut crate::kinds::SplitMemo,
 ) -> String {
     let active = crate::kinds::active_kinds(root, scope, kinds);
     let has = |d: Document| active.iter().any(|k| k.document == d);
@@ -1625,8 +1732,8 @@ pub fn build_maintenance_reason_with(
     }
     reason.push_str("Check the exit code of git check-ignore --no-index against the evidence from -v, and verify that the regular documents are not ignored and the tracking candidates in git status --short -- <target path> .gitignore. When you create or edit documents, state the ignore status of each document in one line in your final answer. The calling Rust hook performs commit and push, limited to the targets. Leave the worker's changes unstaged, do not touch existing staged changes, and do not run git add, git commit, git push, git fetch or git pull. Verify with the target diff and status, and if no update is needed, make no changes.");
     // 種類別設定の枠（既定の構成では空で、文面は変わらない）。
-    reason.push_str(&crate::kinds::settings_frame(
-        root, scope, &active, templates,
+    reason.push_str(&crate::kinds::settings_frame_with(
+        root, scope, &active, templates, memo,
     ));
     // 未信頼の資料は利用者設定の枠とは別枠で最後に置く。
     reason.push_str(&changelog_frame);
@@ -2059,6 +2166,9 @@ fn poll_repository_inner(
         );
     };
     // 今回の push 範囲の変更パス。AGENTS サイズ検証の対象ディレクトリと、タイミングの `paths` 条件に使う。
+    // `diff` の生の出力は、下の `maintenance_scope_for_changed` へも渡す（同じ git を取り直さない。
+    // その間に worker・commit・push などの状態を変える操作は無い）。
+    let changed_raw = diff.clone();
     let changed_paths: Vec<String> = text(diff)?
         .split('\0')
         .filter(|s| !s.is_empty())
@@ -2176,7 +2286,7 @@ fn poll_repository_inner(
         Ok(t) => t,
         Err(message) => return Ok(Some(message)),
     };
-    let scope = match maintenance_scope_for(root, &prior_commit, &pushed, &kinds) {
+    let scope = match maintenance_scope_for_changed(root, changed_raw, &kinds) {
         Ok(scope) => scope,
         Err(e) => {
             return save_error(
@@ -2209,7 +2319,9 @@ fn poll_repository_inner(
         .filter(|n| !n.is_empty() && crate::kinds::keeps_deleted(&kinds, n))
         .map(|n| root.join(n))
         .collect();
-    let reason = build_maintenance_reason_with(
+    // プロンプトと許可パスの一覧は同じ状態（worker 起動前）から作るので、分割先の候補の取得を共有する。
+    let mut split_memo = crate::kinds::SplitMemo::default();
+    let reason = build_maintenance_reason_with_memo(
         root,
         &scope,
         &deleted,
@@ -2217,9 +2329,10 @@ fn poll_repository_inner(
         &pushed,
         &kinds,
         &templates,
+        &mut split_memo,
     );
     // worker に許す変更パスの元になる一覧（種類ごとの規則は `plan_documents`）。
-    let docs = crate::kinds::plan_documents(root, &scope, &kinds, &deleted);
+    let docs = crate::kinds::plan_documents_with(root, &scope, &kinds, &deleted, &mut split_memo);
     // 処理する文書が 1 つも無い（有効な種類が無い）新しい保守は、worker を起動せず位置だけ進める。
     // 種類別の最終完了（kind_runs）は記録しない（何も保守していないため）。未完了の保守の再開は
     // 記録済みの `before` で進むので、ここでは止めない。
@@ -3820,6 +3933,8 @@ pub fn publish_locked_with(
         let candidates = with_ancestor_gitignores(root, documents);
         let mut before = serde_json::Map::new();
         let mut ignored = vec![];
+        // index の一覧は、この（index を変える操作の無い）ループの間だけ 1 回の取得を使い回す。
+        let mut listing = IndexListing::default();
         for candidate in candidates {
             let relative = safe_relative(root, &candidate)?;
             if fs::symlink_metadata(&candidate).is_ok_and(|m| m.file_type().is_symlink()) {
@@ -3832,7 +3947,7 @@ pub fn publish_locked_with(
             {
                 continue;
             }
-            let Some(entry) = index_stage0(root, &relative) else {
+            let Some(entry) = listing.stage0(root, &relative) else {
                 continue;
             };
             if entry.kind == "ambiguous" {
@@ -4149,8 +4264,10 @@ pub fn publish_locked_with(
             .cloned()
             .collect()
     };
-    let mut hard = agents_size_error(root, &size_dirs, true)
-        .or_else(|| agents_commit_view_error(root, &size_dirs, &touched));
+    // 2 つの検査は連続していて間に状態を変える操作が無いので、追跡ファイル一覧の取得を共有する。
+    let mut tracked = None;
+    let mut hard = agents_size_error_with(root, &size_dirs, true, &mut tracked)
+        .or_else(|| agents_commit_view_error_with(root, &size_dirs, &touched, &mut tracked));
     let violations = crate::kinds::check_documents(root, &resolved, &editable);
     if hard.is_none()
         && let Some(v) = violations.iter().find(|v| !v.is_soft())

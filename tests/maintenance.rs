@@ -1952,6 +1952,36 @@ fn paused_and_migrated_stops_advance_the_cursor_without_running() {
         assert!(f.base.join("prompt.json").exists(), "{off}");
     }
 }
+/// 1 回の保守で、index の一覧（`git ls-files -v -s -z`）は文書の候補ごとではなく 1 回だけ取得する
+/// （git の起動回数の削減。`GIT_TRACE2_EVENT` で起動を数える）。
+#[test]
+fn one_maintenance_lists_the_index_once_for_all_candidates() {
+    let f = Fixture::new();
+    f.hook("UserPromptSubmit");
+    f.push_change("processed push");
+    let trace = f.base.join("git-trace2.jsonl");
+    fs::write(&trace, "").unwrap();
+    unsafe { env::set_var("GIT_TRACE2_EVENT", &trace) };
+    assert_eq!(f.hook("Stop"), None);
+    unsafe { env::remove_var("GIT_TRACE2_EVENT") };
+    assert!(f.base.join("prompt.json").exists(), "保守が走っている");
+    let listings = fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|e| e["event"] == "start")
+        .filter(|e| {
+            let argv: Vec<&str> = e["argv"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            argv.windows(4).any(|w| w == ["ls-files", "-v", "-s", "-z"])
+        })
+        .count();
+    assert_eq!(listings, 1, "index の一覧の取得は 1 回");
+}
 /// 旧形式（schema 2）の設定ファイルの本文。`defaults.mode` と同意の有無を引数で変える。
 fn old_format_config(root: &std::path::Path, consent: bool, mode: &str, policy: &str) -> String {
     let root = root.to_string_lossy().replace('\\', "/");

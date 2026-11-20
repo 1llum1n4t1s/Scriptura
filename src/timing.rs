@@ -206,6 +206,11 @@ pub fn narrow_options(run: &MaintenanceOptions, due: &[ResolvedKind]) -> Mainten
 /// 起点・不変検査と同じ `changelog::changelog_name_at`）。存在しない・UTF-8 でない場合は None。
 pub fn changelog_at(root: &Path, pushed: &str) -> Option<String> {
     let name = crate::changelog::changelog_name_at(root, pushed);
+    changelog_named_at(root, pushed, &name)
+}
+
+/// `changelog_at` の、綴り（`changelog::changelog_name_at` の結果）を呼び出し側が決めて渡す版。
+fn changelog_named_at(root: &Path, pushed: &str, name: &str) -> Option<String> {
     let raw = crate::maintenance::run_git(root, &["show", &format!("{pushed}:{name}")])?;
     String::from_utf8(raw).ok()
 }
@@ -221,11 +226,25 @@ pub fn changelog_at(root: &Path, pushed: &str) -> Option<String> {
 /// タグを取得できないときは「期限が来た」側に倒す（判定不能で文書保守を止めない。より早く実行される側）。
 pub fn release_due_in_repo(root: &Path, pushed: &str, prior: &str, kind: &ResolvedKind) -> bool {
     let glob = release_tag_glob(kind);
-    let changelog = changelog_at(root, pushed);
+    // 綴りの決定（ツリーの列挙）は、この関数の中の読み取りだけが続く間に 1 回だけ行い、本文と起点で共有する。
+    // 綴りを判定できなかった（Unknown。git の失敗を含む）ときは共有せず、起点側で引き直す。
+    let lookup = crate::changelog::lookup_in_rev(root, pushed, crate::changelog::CHANGELOG_PATH);
+    let shared_name = match &lookup {
+        crate::changelog::RevPath::Found(name) => Some(name.clone()),
+        crate::changelog::RevPath::Missing => Some(crate::changelog::CHANGELOG_PATH.to_string()),
+        crate::changelog::RevPath::Unknown => None,
+    };
+    let name = shared_name
+        .clone()
+        .unwrap_or_else(|| crate::changelog::CHANGELOG_PATH.to_string());
+    let changelog = changelog_named_at(root, pushed, &name);
     let tags = match &changelog {
         // 起点が取れない（git の失敗など）ときは全タグではなく今回の push 範囲のタグだけを見る
         // （古いタグで毎 push 期限到来にならないように。資料の収集と同じ方針）。
-        Some(_) => match crate::changelog::base_commit(root, pushed) {
+        Some(_) => match match shared_name {
+            Some(name) => crate::changelog::base_commit_of(root, pushed, &name),
+            None => crate::changelog::base_commit(root, pushed),
+        } {
             Some(base) => crate::changelog::range_tags(root, pushed, Some(&base), glob),
             None => crate::changelog::push_range_tags(root, pushed, prior, glob),
         },

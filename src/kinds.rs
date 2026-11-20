@@ -939,6 +939,40 @@ pub fn plan_documents(
     kinds: &[ResolvedKind],
     deleted: &[PathBuf],
 ) -> Vec<PathBuf> {
+    plan_documents_with(root, scope, kinds, deleted, &mut SplitMemo::default())
+}
+
+/// `split_candidates` の結果を、同じ `root`・`scope` に対する連続した呼び出し（プロンプトの組み立てと
+/// 許可パスの一覧。間に作業ツリー・Git の状態を変える操作が無い）の間だけ使い回す入れ物。
+/// 呼び出し側が保守 1 回ごとに新しく作り、worker の実行などをまたいで持ち越さない。
+#[derive(Default)]
+pub struct SplitMemo {
+    by_kind: BTreeMap<String, Vec<String>>,
+}
+
+impl SplitMemo {
+    pub fn candidates(&mut self, root: &Path, scope: &Scope, kind: &ResolvedKind) -> Vec<String> {
+        if let Some(found) = self.by_kind.get(kind.id()) {
+            return found.clone();
+        }
+        let mut complete = true;
+        let found = split_candidates_checked(root, scope, kind, &mut complete);
+        // 取得に失敗した結果（空候補）は保持しない。
+        if complete {
+            self.by_kind.insert(kind.id().to_string(), found.clone());
+        }
+        found
+    }
+}
+
+/// `plan_documents` の、分割先の候補を `memo` で使い回す版。
+pub fn plan_documents_with(
+    root: &Path,
+    scope: &Scope,
+    kinds: &[ResolvedKind],
+    deleted: &[PathBuf],
+    memo: &mut SplitMemo,
+) -> Vec<PathBuf> {
     let mut docs: Vec<PathBuf> = Vec::new();
     for kind in kinds {
         if !is_active(root, scope, kind) {
@@ -954,7 +988,7 @@ pub fn plan_documents(
             docs.extend(scope.size_only.iter().cloned());
         }
         docs.extend(
-            split_candidates(root, scope, kind)
+            memo.candidates(root, scope, kind)
                 .iter()
                 .map(|p| root.join(p)),
         );
@@ -1026,6 +1060,17 @@ fn split_stem(heading: &str, index: usize) -> String {
 /// (1) 分割先の直下に既に追跡されている `*.md`、(2) 本文の `## ` 見出しから作る新規ファイル名
 /// （既存と重複しないもの）。合計 `MAX_SPLIT_FILES` 件まで。分割先が無い種類・リンクなどの危険な実体は含めない。
 pub fn split_candidates(root: &Path, scope: &Scope, kind: &ResolvedKind) -> Vec<String> {
+    split_candidates_checked(root, scope, kind, &mut true)
+}
+
+/// `split_candidates` と同じ。追跡ファイルの取得（`git ls-files`）に失敗したときは `*complete` を false にする
+/// （`SplitMemo` は失敗した結果を保持せず、次の問い合わせで取り直す）。
+fn split_candidates_checked(
+    root: &Path,
+    scope: &Scope,
+    kind: &ResolvedKind,
+    complete: &mut bool,
+) -> Vec<String> {
     let Some(dir) = &kind.split_dir else {
         return Vec::new();
     };
@@ -1037,18 +1082,22 @@ pub fn split_candidates(root: &Path, scope: &Scope, kind: &ResolvedKind) -> Vec<
         }
     };
     let prefix = format!("{dir}/");
-    let mut tracked: Vec<String> = crate::maintenance::run_git(
+    let listed = crate::maintenance::run_git(
         root,
         &["-c", "core.quotepath=false", "ls-files", "-z", "--", dir],
-    )
-    .map(|raw| {
-        String::from_utf8_lossy(&raw)
-            .split('\0')
-            .filter(|n| !n.is_empty())
-            .map(str::to_owned)
-            .collect()
-    })
-    .unwrap_or_default();
+    );
+    if listed.is_none() {
+        *complete = false;
+    }
+    let mut tracked: Vec<String> = listed
+        .map(|raw| {
+            String::from_utf8_lossy(&raw)
+                .split('\0')
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
     tracked.sort();
     for name in tracked {
         let Some(rest) = name.strip_prefix(&prefix) else {
@@ -1653,6 +1702,17 @@ pub fn settings_frame(
     active: &[&ResolvedKind],
     templates: &[LoadedTemplate],
 ) -> String {
+    settings_frame_with(root, scope, active, templates, &mut SplitMemo::default())
+}
+
+/// `settings_frame` の、分割先の候補を `memo` で使い回す版。
+pub fn settings_frame_with(
+    root: &Path,
+    scope: &Scope,
+    active: &[&ResolvedKind],
+    templates: &[LoadedTemplate],
+    memo: &mut SplitMemo,
+) -> String {
     let indent = |text: &str| {
         text.lines()
             .map(|l| format!("  {l}"))
@@ -1698,7 +1758,7 @@ pub fn settings_frame(
                 "- Limits: {}{current}. These are requirements that the program checks after maintenance. If a file already exceeds a limit, bringing it within the limit is itself a required part of this task: remove duplication and outdated statements, tighten wording and drop low-value detail, and aim for at most {FIXUP_TARGET_PERCENT}% of the limit.",
                 limits.join(", ")
             ));
-            let split = split_candidates(root, scope, kind);
+            let split = memo.candidates(root, scope, kind);
             if let Some(dir) = kind.split_dir.as_deref().filter(|_| !split.is_empty()) {
                 let agents_rule = if kind.document == Document::Agents {
                     " Keep the rules that apply to all work in AGENTS.md and move only details, adding a line such as \"Before changing X, read docs/agents/x.md\" for each moved topic."
