@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.0.6] - 2026-11-20
+
 ### Added
 
 - 文書の分割先 `[kinds.<id>] split_dir` を足した。上限（`max_chars` / `max_bytes`）を設定した CHANGELOG 以外の種類は、既定で `docs/<id>` へ詳細を移して上限内に収められる（上限の無い種類は分割しない）。`split_dir` を書いた設定は 1.0.5 以前では読めない。管理画面の種類の設定と `docs show --json`（`splitDir`）にも出る。
