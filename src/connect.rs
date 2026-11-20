@@ -756,9 +756,10 @@ mod tests {
                 assert_eq!(hooks.len(), 1);
                 let hook = &hooks[0];
                 let command = hook["command"].as_str().unwrap();
+                // 実行ファイル名は環境で違う（Windows は scriptura.exe、非 Windows の Setup 版は AppImage 名など）。
                 assert!(
-                    command.ends_with("scriptura.exe\" hook")
-                        || command.ends_with("scriptura\" hook")
+                    command.starts_with('"') && command.ends_with("\" hook"),
+                    "{command}"
                 );
                 assert_eq!(hook["if"], condition);
                 assert_eq!(hook["async"], true);

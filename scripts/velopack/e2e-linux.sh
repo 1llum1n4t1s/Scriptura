@@ -9,13 +9,13 @@
 #
 # 本物の利用者環境に触れないよう、テスト用 packId 以外は受け付けず、HOME・XDG_CONFIG_HOME・SCRIPTURA_HOME・
 # CLAUDE_CONFIG_DIR・TMPDIR を作業フォルダーの配下に閉じる。Scriptura は MCP も Codex も CLI の呼び出しも持たない
-# （Claude Code への登録は CLAUDE_CONFIG_DIR/settings.json の Stop hook `"<AppImage>" hook` を直接編集する）ため、
+# （Claude Code への登録は CLAUDE_CONFIG_DIR/settings.json の hook（PostToolUse・PostToolUseFailure・SessionStart）`"<AppImage>" hook` を直接編集する）ため、
 # Remnifold の E2E にあった claude / codex のスタブは置かない。Velopack の Linux の取得先は
 # /var/tmp/velopack/<packId>/packages に固定されている（HOME に従わない。velopack crate の locator）ため、
 # テスト用 packId のその場所だけを最初に空にする。
 #
 # 確かめること（各段階で assert し、失敗したら非 0 で終わる）:
-#   A. 導入（AppImage の配置）→ 引数なしの起動で Claude Code の Stop hook の登録と XDG autostart の作成。
+#   A. 導入（AppImage の配置）→ 引数なしの起動で Claude Code の hook（PostToolUse・PostToolUseFailure・SessionStart）の登録と XDG autostart の作成。
 #      他者の hook は残す。2回目の起動は何も変えない。
 #   B. 複数の `hook`（stdin に {}）を同時に起動しても、更新の取得（SCRIPTURA_UPDATE_FEED_DIR の FileSource）はちょうど1回。
 #   C. `hook` が動いている間の `update-apply` は busy（適用しない・強制終了しない）。
@@ -176,19 +176,26 @@ assert "registered" in values, values
 PY
 }
 
-# settings.json の Stop hook を調べる。$1 = present（自分の hook がちょうど1つ）/ absent（自分の hook は無い）。
-# どちらでも、他者の hook（unrelated-stop-hook）は残っていること。
+# settings.json の hook を調べる。$1 = present（自分の hook が PostToolUse 2・PostToolUseFailure 2・SessionStart 1 で、
+# Stop には無い）/ absent（どのイベントにも自分の hook は無い）。どちらでも、他者の Stop hook（unrelated-stop-hook）は残っていること。
 assert_stop_hooks() {
-  python3 - "$settings" "$app" "$1" <<'PY' || fail "Stop hooks are not as expected ($1)"
+  python3 - "$settings" "$app" "$1" <<'PY' || fail "hooks are not as expected ($1)"
 import json, sys
 path, app, mode = sys.argv[1:]
-commands = [h["command"] for e in json.load(open(path))["hooks"]["Stop"] for h in e["hooks"]]
-mine = [c for c in commands if f'"{app}" hook' in c]
-assert "echo unrelated-stop-hook" in commands, commands
+hooks = json.load(open(path))["hooks"]
+def commands(event):
+    return [h["command"] for e in hooks.get(event, []) for h in e["hooks"]]
+def mine(event):
+    return [c for c in commands(event) if f'"{app}" hook' in c]
+assert "echo unrelated-stop-hook" in commands("Stop"), commands("Stop")
+events = ["Stop", "PostToolUse", "PostToolUseFailure", "SessionStart"]
 if mode == "present":
-    assert len(mine) == 1, commands
+    expected = {"Stop": 0, "PostToolUse": 2, "PostToolUseFailure": 2, "SessionStart": 1}
+    for event in events:
+        assert len(mine(event)) == expected[event], (event, commands(event))
 else:
-    assert not mine and app not in "".join(commands), commands
+    for event in events:
+        assert not mine(event) and app not in "".join(commands(event)), (event, commands(event))
 PY
 }
 
