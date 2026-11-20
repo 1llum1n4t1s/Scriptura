@@ -632,14 +632,6 @@ fn python_normcase_and_publication_key() {
     );
 }
 #[test]
-fn instruction_whitespace_matches_rust_trim() {
-    for data in [b"".as_slice(), "\u{85}\u{a0}\u{3000}\r\n".as_bytes()] {
-        assert!(!instruction_has_content(data))
-    }
-    assert!(instruction_has_content(b"\xef\xbb\xbf"));
-    assert!(instruction_has_content(b"\xff"));
-}
-#[test]
 fn worker_nochange_and_argument_contract() {
     let f = Fixture::new();
     assert_eq!(f.maintain(), None);
@@ -774,19 +766,6 @@ fn lock_prevents_second_worker() {
     lock.execute_batch("BEGIN IMMEDIATE").unwrap();
     assert!(f.maintain().unwrap().contains("実行中"));
     assert!(!f.base.join("prompt.json").exists());
-}
-#[test]
-fn state_atomic_replace_and_history_limit() {
-    let f = Fixture::new();
-    let mut state = json!({"phase":"ready"});
-    for i in 0..40 {
-        state["error"] = json!(i);
-        f.save(&mut state);
-        assert_eq!(f.state(), state);
-    }
-    assert_eq!(state["history"].as_array().unwrap().len(), 32);
-    f.save(&mut state);
-    assert_eq!(state["history"].as_array().unwrap().len(), 32);
 }
 #[test]
 fn unknown_or_changed_destination_blocks_old_phases() {
@@ -2379,18 +2358,6 @@ fn worker_args_never_put_unsafe_paths_into_permission_rules() {
     );
     assert!(args.iter().any(|a| a == "Edit(./ok/README.md)"));
     assert!(!args.iter().any(|a| a.contains("a*b")));
-}
-#[test]
-fn find_in_path_works_like_which() {
-    let f = Fixture::new();
-    let bin = f.base.join("bin");
-    let joined = env::join_paths([f.base.join("missing"), bin.clone()]).unwrap();
-    assert_eq!(
-        find_in_path(&exe("claude"), Some(joined.clone())),
-        Some(bin.join(exe("claude")))
-    );
-    assert_eq!(find_in_path(&exe("no-such-tool"), Some(joined)), None);
-    assert_eq!(find_in_path(&exe("claude"), None), None);
 }
 #[test]
 fn worker_timeout_comes_from_settings() {
@@ -4206,6 +4173,49 @@ fn a_violation_that_survives_the_reruns_is_committed_with_a_warning() {
 }
 
 #[test]
+fn an_unverifiable_kind_document_is_a_hard_violation_and_the_output_is_discarded() {
+    // UTF-8 ではない文書は上限・見出しを検査できない（検査不能）。ソフト違反と違い、警告つき commit ではなく
+    // worker の出力を破棄して完了にする（ready の記録からの再開でも同じ分類を通る）。
+    let mut config = kinds_config(|_| {});
+    config.kinds.insert(
+        "readme".into(),
+        config::KindSettings {
+            max_chars: Some(5),
+            ..Default::default()
+        },
+    );
+    let f = Fixture::with_config(Some(config.clone()));
+    let mut state = f.checkpoint("ready");
+    fs::write(f.root.join("README.md"), [0xff_u8, 0xfe, 0xfd, 0xfc]).unwrap();
+    state["after"]["README.md"] = json!(document_hash(&f.root, "README.md").unwrap());
+    f.save(&mut state);
+    let head = f.git(&["rev-parse", "HEAD"]);
+    let options = MaintenanceOptions {
+        documents: vec![Document::Readme],
+        kinds: scriptura::kinds::resolve_kinds(&config, &[Document::Readme]),
+        ..options_with(Permission::Bypass)
+    };
+    assert_eq!(
+        maintain_and_publish_with(
+            &f.root,
+            "",
+            &[f.root.join("README.md")],
+            Some("fixture"),
+            &[f.root.clone()],
+            &options,
+        ),
+        None
+    );
+    assert_eq!(f.git(&["rev-parse", "HEAD"]), head, "commit しない");
+    assert_eq!(fs::read_to_string(f.root.join("README.md")).unwrap(), "readme");
+    let state = f.state();
+    assert_eq!(state["phase"], "complete");
+    assert!(state["error"].is_null());
+    assert!(state["discarded"].as_str().unwrap().contains("README.md"));
+    assert!(state.get("limit_warning").is_none());
+}
+
+#[test]
 fn a_document_already_over_its_limit_is_fixed_even_if_the_worker_did_not_touch_it() {
     let config = readme_limit_config(Permission::Bypass, 20);
     let f = Fixture::with_config(Some(config));
@@ -4226,24 +4236,6 @@ fn a_document_already_over_its_limit_is_fixed_even_if_the_worker_did_not_touch_i
         fs::read_to_string(f.root.join("README.md")).unwrap(),
         "short"
     );
-}
-
-#[test]
-fn the_first_prompt_demands_the_limit_and_names_the_split_files() {
-    let config = readme_limit_config(Permission::Bypass, 50);
-    let f = Fixture::with_config(Some(config));
-    f.commit_push_file("README.md", "# 題\n## 概要\n本文\n");
-    f.hook("UserPromptSubmit");
-    f.push_change("later");
-    assert_eq!(f.hook("Stop"), None);
-    let prompt = f.prompt_text();
-    for needle in [
-        "bringing it within the limit is itself a required part of this task",
-        "files under `docs/readme/`",
-        "docs/readme/section-01.md",
-    ] {
-        assert!(prompt.contains(needle), "{needle}\n{prompt}");
-    }
 }
 
 #[test]

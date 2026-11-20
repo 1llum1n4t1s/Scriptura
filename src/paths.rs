@@ -13,6 +13,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// 利用者のホームフォルダー（Windows は USERPROFILE、それ以外は HOME。未設定なら空のパス）。
+pub(crate) fn home_dir() -> PathBuf {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .map(PathBuf::from)
+        .unwrap_or_default()
+}
+
 /// 状態（DB・ロック・publications）を置くフォルダ。
 pub fn state_dir() -> PathBuf {
     resolve(|name| std::env::var_os(name), std::env::consts::OS).state

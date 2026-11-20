@@ -794,5 +794,16 @@ mod tests {
         );
         assert!(parse_args(&s(&["--autostart"])).is_err());
         assert!(parse_args(&s(&["--autostart", "maybe"])).is_err());
+        // 常駐の起動引数（更新後の再起動にも使う）は、自分の引数の解釈で受け付けられる形になる。
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            assert_eq!(resident_args(None, false), ["ui", "--tray", "--no-open"]);
+            assert_eq!(
+                resident_args(Some(0), true),
+                ["ui", "--tray", "--port", "0"]
+            );
+            let parsed = parse_args(&resident_args(Some(0), false)[1..]).unwrap();
+            assert!(parsed.tray && !parsed.open && parsed.port == 0);
+        }
     }
 }

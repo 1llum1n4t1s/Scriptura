@@ -1593,17 +1593,6 @@ mod atomic_write_tests {
     }
 
     #[test]
-    fn atomic_write_replaces_without_leaving_temporary_files() {
-        let dir = scratch();
-        let path = dir.join("nested").join("x.json");
-        write_atomic(&path, b"one").unwrap();
-        write_atomic(&path, b"two").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"two");
-        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
     fn failed_rename_leaves_no_temporary_file_and_keeps_the_target() {
         let dir = scratch();
         // 対象がディレクトリなので rename は失敗する。

@@ -11,7 +11,7 @@ use std::{
     env, fs,
     io::{self, Read},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, UNIX_EPOCH},
 };
 type Result<T> = std::result::Result<T, String>;
 const LIMIT: usize = 30_000;
@@ -93,12 +93,6 @@ pub struct PollOptions {
     pub force: bool,
     /// 現在の push 状態を「処理済み」として記録するだけで何もしない（enable 用。以前の push を処理しない）。
     pub baseline: bool,
-}
-fn now() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
 }
 /// バイト列を小文字 16 進で表す（sha2 0.11 の出力は `LowerHex` を実装しないため、ここで固定する）。
 pub fn hex_lower(bytes: &[u8]) -> String {
@@ -525,7 +519,7 @@ fn dedup_dirs(dirs: &mut Vec<PathBuf>) {
 /// AGENTS の大きさの検査で見つかった問題。`File` は 1 ファイルが 30,000 バイト以上、`Chain` は階層の合計が
 /// 30,000 バイト以上、`Unverifiable` は確認できなかった理由。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AgentsProblem {
+enum AgentsProblem {
     File { path: String, size: usize },
     Chain { path: String, size: usize },
     Unverifiable(String),
@@ -561,14 +555,25 @@ fn agents_size_error_with(
     validate_sizes: bool,
     tracked: &mut Option<String>,
 ) -> Option<String> {
-    match scan_agents(root, directories, validate_sizes, false, None, tracked) {
+    first_problem(scan_agents(
+        root,
+        directories,
+        validate_sizes,
+        false,
+        None,
+        tracked,
+    ))
+    .map(|p| p.message())
+}
+/// `scan_agents` の結果から先頭の 1 件の違反（確認できなかったときは検査不能）を取り出す。
+fn first_problem(found: Result<Vec<AgentsFinding>>) -> Option<AgentsProblem> {
+    match found {
         Ok(found) => found.into_iter().next().map(|f| match f {
             AgentsFinding::File { path, size } => AgentsProblem::File { path, size },
             AgentsFinding::Chain { path, size, .. } => AgentsProblem::Chain { path, size },
         }),
         Err(e) => Some(AgentsProblem::Unverifiable(e)),
     }
-    .map(|p| p.message())
 }
 /// 階層（ルートから子まで）の合計に数える 1 ファイル。`path` はリポジトリからの相対、`size` は実バイト
 /// （中身が空白だけなら 0 を数えるので、ここには 0 のものは入れない）。
@@ -581,7 +586,7 @@ pub struct ChainMember {
     /// 側（HEAD）の大きさも考えて、作業ツリーとの大きい方を `size` に入れる。
     pub editable: bool,
 }
-/// AGENTS の大きさの検査で見つかった違反の全件版（`agents_problem` は先頭の 1 件だけ）。
+/// AGENTS の大きさの検査で見つかった違反の全件版（`agents_size_error` は先頭の 1 件だけ）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentsFinding {
     File {
@@ -593,19 +598,6 @@ pub enum AgentsFinding {
         size: usize,
         members: Vec<ChainMember>,
     },
-}
-pub fn agents_problem(
-    root: &Path,
-    directories: &[PathBuf],
-    validate_sizes: bool,
-) -> Option<AgentsProblem> {
-    match scan_agents(root, directories, validate_sizes, false, None, &mut None) {
-        Ok(found) => found.into_iter().next().map(|f| match f {
-            AgentsFinding::File { path, size } => AgentsProblem::File { path, size },
-            AgentsFinding::Chain { path, size, .. } => AgentsProblem::Chain { path, size },
-        }),
-        Err(e) => Some(AgentsProblem::Unverifiable(e)),
-    }
 }
 /// 大きさの違反を全件（重複なし）で返す。階層は、ルートから葉までの最も深い超過だけを報告する
 /// （より浅い祖先の超過は含まれるので省く）。`editable` は worker が編集できるパス（個人用 override は
@@ -635,13 +627,14 @@ fn agents_commit_view_error_with(
     touched: &[String],
     tracked: &mut Option<String>,
 ) -> Option<String> {
-    match scan_agents(root, directories, true, false, Some(touched), tracked) {
-        Ok(found) => found.into_iter().next().map(|f| match f {
-            AgentsFinding::File { path, size } => AgentsProblem::File { path, size },
-            AgentsFinding::Chain { path, size, .. } => AgentsProblem::Chain { path, size },
-        }),
-        Err(e) => Some(AgentsProblem::Unverifiable(e)),
-    }
+    first_problem(scan_agents(
+        root,
+        directories,
+        true,
+        false,
+        Some(touched),
+        tracked,
+    ))
     .map(|p| p.message())
 }
 /// worker が編集できる AGENTS か（個人用 override は不可。許可パスとの照合は `is_allowed_path`）。
@@ -1277,7 +1270,7 @@ pub fn open_state_db() -> Result<Connection> {
     let _ = db.execute_batch(crate::runlog::DDL);
     db.execute(
         "INSERT OR IGNORE INTO poll_metadata VALUES ('started_at',?1)",
-        [now().to_string()],
+        [crate::timing::now_secs().to_string()],
     )
     .map_err(err)?;
     if version < STATE_SCHEMA_VERSION {
@@ -1760,7 +1753,7 @@ fn save_cursor(
             s(snapshot, "upstream"),
             s(snapshot, "destination"),
             fingerprint,
-            now(),
+            crate::timing::now_secs(),
             error,
             processed
         ],
@@ -1835,7 +1828,7 @@ pub fn poll_repository_reported(
     cwd: Option<&str>,
     plan: &PollPlan,
 ) -> Result<PollReport> {
-    let started = now();
+    let started = crate::timing::now_secs();
     let drafts: RefCell<Vec<crate::runlog::Run>> = RefCell::new(Vec::new());
     let notes: RefCell<Vec<String>> = RefCell::new(Vec::new());
     let result = poll_repository_inner(root, opts, cwd, plan, &drafts, &notes);
@@ -1844,7 +1837,7 @@ pub fn poll_repository_reported(
     if !drafts.is_empty()
         && let Ok(db) = open_state_db()
     {
-        let finished = now();
+        let finished = crate::timing::now_secs();
         let origin = if opts.force { "run_now" } else { "hook" };
         for mut run in drafts {
             run.started_at = started;
@@ -2370,7 +2363,7 @@ fn poll_repository_inner(
     // 保守が完了した（処理済み位置を error なしで保存した）ので、今回対象になった種類の最終完了を記録する。
     // 検査に違反して出力を破棄した回は完了に数えない（位置だけ進める）。
     if discarded.is_empty() {
-        crate::timing::record_kind_runs(&db, &repo_key, record, &processed, now())?;
+        crate::timing::record_kind_runs(&db, &repo_key, record, &processed, crate::timing::now_secs())?;
     }
     // 保守履歴: 完了した publication 状態から、commit・push 済みか、変更なしか、破棄したかを分ける。
     if s(&finished, "phase") == "complete" {
@@ -2490,7 +2483,7 @@ fn due_kinds_for(
         &crate::timing::TimingInput {
             changed_paths: &changed,
             last_done: &last_done,
-            now: now(),
+            now: crate::timing::now_secs(),
             force,
             release_due: &release,
         },
@@ -2655,7 +2648,7 @@ pub fn handle_hook(payload: &Value) -> Result<Option<String>> {
                         Err(e) => {
                             return Ok(Some(crate::t!(
                                 "maint.migration_failed",
-                                reason = crate::cli::one_line(&format!("{e:?}"))
+                                reason = crate::cli::one_line(&e.to_string())
                             )));
                         }
                     };
@@ -3404,7 +3397,7 @@ pub(crate) fn same_file_ignoring_case(root: &Path, a: &str, b: &str) -> bool {
 }
 
 pub fn save_publication(path: &Path, state: &mut Value) -> Result<()> {
-    state["updated_at"] = json!(now());
+    state["updated_at"] = json!(crate::timing::now_secs());
     let event = json!({"phase":state["phase"],"error":state["error"],"warning":state["warning"]});
     if !state["history"].is_array() {
         state["history"] = json!([])
@@ -3722,6 +3715,65 @@ pub(crate) fn with_ancestor_gitignores(root: &Path, documents: &[PathBuf]) -> BT
         }
     }
     candidates
+}
+/// 保守後検査のうち、ハード違反（worker の出力を破棄する理由）の判定。状態は読むだけで変えない。
+/// 戻りの 1 つ目は最初に見つかったハード違反の文（無ければ None）、2 つ目は種類の違反の全件
+/// （ソフト違反は呼び出し側が警告として全件使うので、ハード違反の有無に関係なく必ず検査する）。
+/// 検査の順序は AGENTS の大きさ → commit される側のツリー → 種類のハード違反 → CHANGELOG の不変で、
+/// 先に確定したらそれ以降のハード検査（CHANGELOG の git 呼び出しなど）は行わない。
+fn hard_violation(
+    root: &Path,
+    state: &Value,
+    size_dirs: &[PathBuf],
+    options: &MaintenanceOptions,
+    editable: &[String],
+) -> (Option<String>, Vec<crate::kinds::Violation>) {
+    let resolved = options.resolved_kinds();
+    // commit に入る文書（記録が変更前と違うもの・無視から外れるもの）は作業ツリーの内容、それ以外は HEAD の
+    // 内容で数えた階層の大きさも検査する（編集できない文書を作業ツリーで過小に数えて、commit されるツリーが
+    // 上限を超えるのを防ぐ）。
+    let touched: Vec<String> = {
+        let after = &state["after"];
+        let ignored: Vec<&str> = state["ignored_before"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        editable
+            .iter()
+            .filter(|k| {
+                after.get(k.as_str()) != state["before"].get(k.as_str())
+                    || ignored.contains(&k.as_str())
+            })
+            .cloned()
+            .collect()
+    };
+    // 2 つの検査は連続していて間に状態を変える操作が無いので、追跡ファイル一覧の取得を共有する。
+    let mut tracked = None;
+    let mut hard = agents_size_error_with(root, size_dirs, true, &mut tracked)
+        .or_else(|| agents_commit_view_error_with(root, size_dirs, &touched, &mut tracked));
+    let violations = crate::kinds::check_documents(root, &resolved, editable);
+    if hard.is_none()
+        && let Some(v) = violations.iter().find(|v| !v.is_soft())
+    {
+        hard = Some(crate::kinds::violations_message(std::slice::from_ref(v)));
+    }
+    // CHANGELOG のリリース済みエントリ不変の検査（権限モードに関係なく通る）。
+    // 編集前の内容は保守開始時の HEAD（`state.head`）の CHANGELOG.md。記録のハッシュが null なら新規作成で、
+    // 上限と必須見出しの検査だけになる。CHANGELOG の種類が無い・編集を許していないときは git を呼ばない。
+    if hard.is_none()
+        && let Some(kind) = crate::changelog::changelog_kind(&resolved)
+        && let Some(rel) = crate::changelog::find_changelog_path(editable)
+    {
+        let existed = !state["before"][rel.as_str()].is_null();
+        hard = crate::changelog::check_released_entries(
+            root,
+            rel,
+            &s(state, "head"),
+            Some(existed),
+            kind,
+        );
+    }
+    (hard, violations)
 }
 pub fn publish_locked_with(
     root: &Path,
@@ -4245,51 +4297,7 @@ pub fn publish_locked_with(
         .keys()
         .cloned()
         .collect();
-    let resolved = options.resolved_kinds();
-    // commit に入る文書（記録が変更前と違うもの・無視から外れるもの）は作業ツリーの内容、それ以外は HEAD の
-    // 内容で数えた階層の大きさも検査する（編集できない文書を作業ツリーで過小に数えて、commit されるツリーが
-    // 上限を超えるのを防ぐ）。
-    let touched: Vec<String> = {
-        let after = &state["after"];
-        let ignored: Vec<&str> = state["ignored_before"]
-            .as_array()
-            .map(|a| a.iter().filter_map(Value::as_str).collect())
-            .unwrap_or_default();
-        editable
-            .iter()
-            .filter(|k| {
-                after.get(k.as_str()) != state["before"].get(k.as_str())
-                    || ignored.contains(&k.as_str())
-            })
-            .cloned()
-            .collect()
-    };
-    // 2 つの検査は連続していて間に状態を変える操作が無いので、追跡ファイル一覧の取得を共有する。
-    let mut tracked = None;
-    let mut hard = agents_size_error_with(root, &size_dirs, true, &mut tracked)
-        .or_else(|| agents_commit_view_error_with(root, &size_dirs, &touched, &mut tracked));
-    let violations = crate::kinds::check_documents(root, &resolved, &editable);
-    if hard.is_none()
-        && let Some(v) = violations.iter().find(|v| !v.is_soft())
-    {
-        hard = Some(crate::kinds::violations_message(std::slice::from_ref(v)));
-    }
-    // CHANGELOG のリリース済みエントリ不変の検査（権限モードに関係なく通る）。
-    // 編集前の内容は保守開始時の HEAD（`state.head`）の CHANGELOG.md。記録のハッシュが null なら新規作成で、
-    // 上限と必須見出しの検査だけになる。CHANGELOG の種類が無い・編集を許していないときは git を呼ばない。
-    if hard.is_none()
-        && let Some(kind) = crate::changelog::changelog_kind(&resolved)
-        && let Some(rel) = crate::changelog::find_changelog_path(&editable)
-    {
-        let existed = !state["before"][rel.as_str()].is_null();
-        hard = crate::changelog::check_released_entries(
-            root,
-            rel,
-            &s(&state, "head"),
-            Some(existed),
-            kind,
-        );
-    }
+    let (hard, violations) = hard_violation(root, &state, &size_dirs, options, &editable);
     if let Some(e) = hard {
         let kept = discard_outputs(root, &state);
         if kept.is_empty() {

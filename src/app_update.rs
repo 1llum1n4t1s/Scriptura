@@ -77,14 +77,6 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 // ───────────────────────── 共通の小さな補助 ─────────────────────────
 
-/// 利用者のホームフォルダー（macOS の LaunchAgents と Linux の autostart の既定の置き場に使う）。
-#[cfg_attr(windows, allow(dead_code))]
-pub(crate) fn home_dir() -> PathBuf {
-    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-        .map(PathBuf::from)
-        .unwrap_or_default()
-}
-
 /// ログオン時の起動に引き継ぐ `SCRIPTURA_HOME`（絶対パスのときだけ。paths の解決規則と同じ）。
 pub(crate) fn scriptura_home() -> Option<PathBuf> {
     std::env::var_os("SCRIPTURA_HOME")
@@ -1183,21 +1175,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "ui", any(windows, target_os = "macos")))]
-    fn resident_restart_arguments_start_the_tray_without_a_browser() {
-        assert_eq!(
-            crate::ui::resident_args(None, false),
-            ["ui", "--tray", "--no-open"]
-        );
-        assert_eq!(
-            crate::ui::resident_args(Some(0), true),
-            ["ui", "--tray", "--port", "0"]
-        );
-        // 管理外のビルドでは、適用後に常駐を起動しない（従来どおり再起動なし）。
-        assert_eq!(resident_restart_args(), None);
-    }
-
-    #[test]
     fn defaults_are_on_and_unchecked() {
         let settings = AutoUpdateSettings::default();
         assert!(settings.auto_update);
@@ -1328,6 +1305,8 @@ mod tests {
         );
         assert_eq!(uninstall_setup(true)["status"], "unmanaged");
         assert!(!welcome(false));
+        // 管理外のビルドでは、適用後に常駐を起動しない（従来どおり再起動なし）。
+        assert_eq!(resident_restart_args(), None);
         // どれも状態フォルダーへ触れずに戻る（ここでは戻ることだけを確かめる。状態フォルダーが作られないことは
         // tests/cli.rs の子プロセスのテストが隔離した環境で確かめる）。
         after_hook();

@@ -154,7 +154,7 @@ mod xdg {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .filter(|dir| dir.is_absolute())
-            .unwrap_or_else(|| crate::app_update::home_dir().join(".config"))
+            .unwrap_or_else(|| crate::paths::home_dir().join(".config"))
             .join("autostart")
     }
 
@@ -416,7 +416,7 @@ mod macos {
 
     /// 本番の置き場。`HOME` を差し替えた隔離検証では、その配下になる。
     pub fn launch_agents_dir() -> PathBuf {
-        crate::app_update::home_dir()
+        crate::paths::home_dir()
             .join("Library")
             .join("LaunchAgents")
     }

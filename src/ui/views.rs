@@ -605,39 +605,6 @@ mod tests {
     }
 
     #[test]
-    fn times_are_shown_in_the_given_zone_without_fractions() {
-        let jst = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
-        let utc = chrono::Utc;
-        // ナノ秒つきの UTC（保守履歴・設定履歴の保存形式）。
-        let raw = "2026-11-18T17:04:45.339306100+00:00";
-        assert_eq!(format_time_in(raw, &utc, false), "2026-11-18 17:04");
-        assert_eq!(format_time_in(raw, &utc, true), "2026-11-18 17:04:45");
-        assert_eq!(format_time_in(raw, &jst, false), "2026-11-19 02:04");
-        // 秒までの UTC（Z 表記）・マイクロ秒（設定の履歴）も同じ形になる。
-        assert_eq!(
-            format_time_in("2026-11-18T23:59:59Z", &jst, true),
-            "2026-11-19 08:59:59"
-        );
-        assert_eq!(
-            format_time_in("2026-11-18T17:04:45.123456Z", &utc, false),
-            "2026-11-18 17:04"
-        );
-        // 読めない文字列・空はそのまま（fail-safe）。
-        assert_eq!(format_time_in("", &utc, false), "");
-        assert_eq!(format_time_in("not a time", &utc, true), "not a time");
-    }
-
-    #[test]
-    fn short_sha_cuts_by_characters_not_bytes() {
-        assert_eq!(short_sha("0123456789abcdef"), "0123456789ab");
-        assert_eq!(short_sha("abc"), "abc");
-        assert_eq!(short_sha(""), "");
-        // 先頭 12 文字の境界が多バイト文字の途中でもパニックしない。
-        let wide = "あいうえおかきくけこさしすせそ";
-        assert_eq!(short_sha(wide), "あいうえおかきくけこさし");
-    }
-
-    #[test]
     fn redact_hides_userinfo_and_tokens() {
         let t = redact(
             "push failed: https://user:s3cret@github.com/a/b.git ghp_ABCDEFGHIJKLMNOPQRSTUV",

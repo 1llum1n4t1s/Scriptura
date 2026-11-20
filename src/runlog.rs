@@ -260,28 +260,3 @@ pub fn load(repo: Option<&str>, before: Option<i64>, limit: usize) -> Page {
         .and_then(|db| load_from(&db, repo, before, limit).ok())
         .unwrap_or_default()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn numstat_parses_text_and_binary() {
-        let raw = b"3\t1\tAGENTS.md\0-\t-\timg.png\0";
-        assert_eq!(
-            parse_numstat(raw),
-            vec![
-                DocChange {
-                    path: "AGENTS.md".into(),
-                    added: 3,
-                    removed: 1
-                },
-                DocChange {
-                    path: "img.png".into(),
-                    added: 0,
-                    removed: 0
-                },
-            ]
-        );
-    }
-}

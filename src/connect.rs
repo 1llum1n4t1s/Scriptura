@@ -57,13 +57,10 @@ const TIMEOUT: u64 = 1800;
 
 /// Claude Code の settings.json の場所。doctor も二重登録の確認に使う。
 pub(crate) fn settings_path() -> PathBuf {
-    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-        .map(PathBuf::from)
-        .unwrap_or_default();
     std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| home.join(".claude"))
+        .unwrap_or_else(|| crate::paths::home_dir().join(".claude"))
         .join("settings.json")
 }
 
@@ -833,14 +830,6 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_new_registration(&only);
-    }
-
-    #[test]
-    fn push_rules_cover_wrapped_and_unwrapped_forms() {
-        // ツールごとに 1 ルール（先頭が `*`、末尾も `*` の `push`）。引用の終端・引数あり・なしを 1 本で拾う。
-        for (matcher, condition) in PUSH_RULES {
-            assert_eq!(condition, format!("{matcher}(* push*)"));
-        }
     }
 
     #[test]

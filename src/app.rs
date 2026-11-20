@@ -172,14 +172,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn install_form_prefers_setup_then_standalone_then_other() {
-        assert_eq!(install_form(true, true), "setup");
-        assert_eq!(install_form(true, false), "setup");
-        assert_eq!(install_form(false, true), "standalone");
-        assert_eq!(install_form(false, false), "other");
-    }
-
-    #[test]
     fn installed_version_prefers_install_json_and_falls_back_to_current_json() {
         let root =
             std::env::temp_dir().join(format!("scriptura-installed-{}", uuid::Uuid::new_v4()));

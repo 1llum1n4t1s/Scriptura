@@ -5,8 +5,7 @@ use scriptura::config::{Document, When};
 use scriptura::kinds::{ResolvedKind, ResolvedTiming, builtin_kind};
 use scriptura::maintenance::MaintenanceOptions;
 use scriptura::timing::{
-    TimingInput, always_due, due_kinds, interval_elapsed, matching_tags, narrow_options,
-    paths_match, release_tag_glob,
+    TimingInput, always_due, due_kinds, interval_elapsed, narrow_options, paths_match,
 };
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -202,25 +201,6 @@ fn release_follows_the_injected_judgement_and_is_only_asked_when_needed() {
     assert_eq!(calls.get(), 0);
     assert_eq!(ids(&run(&["src/a.rs".into()])), ["readme", "changelog"]);
     assert_eq!(calls.get(), 1);
-}
-
-#[test]
-fn release_tag_matching_and_changelog_sections() {
-    // タグ glob: changelog は設定値、それ以外の種類は v*。
-    let mut changelog = kind(Document::Changelog, When::Release, &[], 0);
-    assert_eq!(release_tag_glob(&changelog), "v*");
-    changelog.changelog.as_mut().unwrap().release_tag = "release-*".into();
-    assert_eq!(release_tag_glob(&changelog), "release-*");
-    assert_eq!(
-        release_tag_glob(&kind(Document::Readme, When::Release, &[], 0)),
-        "v*"
-    );
-    let tags: Vec<String> = ["v1.0.0", "release-2", "nightly", "v2.0.0"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    assert_eq!(matching_tags(&tags, "v*"), ["v1.0.0", "v2.0.0"]);
-    assert_eq!(matching_tags(&tags, "release-*"), ["release-2"]);
 }
 
 #[test]

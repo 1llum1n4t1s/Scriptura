@@ -29,7 +29,7 @@ pub const BODY_LIMIT: usize = 512 * 1024;
 pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).expect("OS の乱数を取得できません");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    crate::maintenance::hex_lower(&bytes)
 }
 
 /// 定数時間の比較（長さが違えば即 false。長さは秘密ではない）。

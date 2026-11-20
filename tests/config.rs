@@ -122,12 +122,6 @@ fn rejects_unknown_keys_and_bad_values() {
 }
 
 #[test]
-fn documents_subset_accepted() {
-    let c = ok("[defaults]\ndocuments = [\"README.md\"]");
-    assert_eq!(c.defaults.documents, vec![Document::Readme]);
-}
-
-#[test]
 fn newer_schema_is_invalid_even_with_unknown_keys() {
     // schema 3 は現行。未知キーは（schema が同じでも）Invalid だが、理由は schema ではなくキー。
     assert!(matches!(

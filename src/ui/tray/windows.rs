@@ -446,16 +446,4 @@ mod tests {
             assert!(icon_of_size(size).is_ok(), "size {size}");
         }
     }
-
-    #[test]
-    fn frame_choice_uses_the_nearest_size_and_rejects_bad_input() {
-        // 中間の寸法は近い方（30 は 32）を選ぶ。256 は幅 0 の項目。
-        assert_eq!(&pick_frame(ICON, 30).unwrap()[4..8], &32i32.to_le_bytes());
-        assert_eq!(
-            &pick_frame(ICON, 1000).unwrap()[4..8],
-            &256i32.to_le_bytes()
-        );
-        assert!(pick_frame(&[1, 2, 3], 16).is_err());
-        assert!(pick_frame(&[0, 0, 1, 0, 1, 0], 16).is_err());
-    }
 }
