@@ -352,6 +352,16 @@ pub struct Defaults {
     /// 全種類共通の追加編集指示（2000 字以内）。
     #[serde(skip_serializing_if = "String::is_empty")]
     pub instructions: String,
+    /// Scriptura が文書を書く言語（`ja` / `en` など）。全種類に共通で、未設定なら既存の文書の言語に従う
+    /// （新規作成は日本語）。種類ごとの `language` より優先する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// 文書の最大文字数・最大バイト数。全種類に共通（CHANGELOG を除く。AGENTS はバイト数を 30,000 未満に
+    /// 丸める）。設定すると、種類ごとの（旧）`max_chars` / `max_bytes` より優先する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_chars: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
 }
 
 impl Default for Defaults {
@@ -360,6 +370,9 @@ impl Default for Defaults {
             documents: Document::ALL.to_vec(),
             exclude: Vec::new(),
             instructions: String::new(),
+            language: None,
+            max_chars: None,
+            max_bytes: None,
         }
     }
 }
@@ -497,6 +510,9 @@ impl Config {
                 documents: Document::ALL.to_vec(),
                 exclude: Vec::new(),
                 instructions: String::new(),
+                language: None,
+                max_chars: None,
+                max_bytes: None,
             },
             worker: Worker {
                 permission: Permission::Bypass,
@@ -520,6 +536,23 @@ impl Config {
         }
         check_globs("defaults.exclude", &self.defaults.exclude)?;
         kinds::validate_instructions("defaults.instructions", &self.defaults.instructions)?;
+        for (name, value) in [
+            ("defaults.max_chars", self.defaults.max_chars),
+            ("defaults.max_bytes", self.defaults.max_bytes),
+        ] {
+            if value == Some(0) {
+                return Err(crate::t!("kinds.at_least_one", field = name));
+            }
+        }
+        if let Some(l) = &self.defaults.language
+            && !kinds::valid_language(l)
+        {
+            return Err(crate::t!(
+                "kinds.language_invalid",
+                field = "defaults.language",
+                value = l
+            ));
+        }
         kinds::validate_kinds(self)?;
         let w = &self.worker;
         if w.model.trim().is_empty() {

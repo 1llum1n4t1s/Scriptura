@@ -20,7 +20,14 @@ use axum::{
 use super::{AppState, views};
 
 /// セッション Cookie の名前。
+/// セッション Cookie 名の接頭辞。Cookie はポートで分けられないため、名前にポートを含めて、同じ 127.0.0.1 の
+/// 別の起動（別ポート）の Cookie と上書きし合わないようにする（上書きされるとログインが切れる）。
 pub const SESSION_COOKIE: &str = "scriptura_session";
+
+/// ポートごとのセッション Cookie 名。
+pub fn session_cookie_name(port: u16) -> String {
+    format!("{SESSION_COOKIE}_{port}")
+}
 /// POST 本文の上限（テンプレート 16 KiB を URL エンコードしても十分収まる大きさ）。
 pub const BODY_LIMIT: usize = 512 * 1024;
 
@@ -144,13 +151,17 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
             );
         }
     }
-    // 3. セッション Cookie（`/auth` と同梱の静的ファイル 2 つだけ免除。完全一致で判定する）。
+    // 3. セッション Cookie（`/auth` と同梱の静的ファイル 3 つだけ免除。完全一致で判定する）。
     //    前方一致にすると、存在しない `/assets/x` が 404 画面（CSRF トークンを含む枠）を
     //    Cookie なしで返してしまうため。
     let path = req.uri().path();
-    let public = matches!(path, "/auth" | "/assets/app.css" | "/assets/app.js");
+    let public = matches!(
+        path,
+        "/auth" | "/assets/app.css" | "/assets/app.js" | "/assets/icon.png"
+    );
     if !public {
         let session = state.session();
+        let cookie_name = session_cookie_name(state.port());
         let has_session = req
             .headers()
             .get_all(header::COOKIE)
@@ -158,7 +169,7 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
             .filter_map(|v| v.to_str().ok())
             .flat_map(|v| v.split(';'))
             .filter_map(|pair| pair.trim().split_once('='))
-            .any(|(name, value)| name == SESSION_COOKIE && same(value, &session));
+            .any(|(name, value)| name == cookie_name && same(value, &session));
         if !has_session {
             // 常駐中はコンソールに表示した URL が無いので、トレイのアイコンから開き直す案内にする。
             let message = if state.is_resident() {

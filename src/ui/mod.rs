@@ -3,7 +3,7 @@
 // 方式: axum + askama の SSR。静的な CSS と少量の JS は実行ファイルへ埋め込み、CDN は使わない。
 // 既定は常駐しない: `scriptura ui` で起動し、Ctrl+C／画面の「終了」（POST + CSRF）／60 分無操作で終わる。
 // `--tray` を付けると、タスクトレイ（Windows）・メニューバー（macOS）に常駐する（`tray`）。常駐は無操作で
-// 終了しない代わりに、60 分無操作でセッションを失効させ、アイコンの「開く」のたびに使い捨て鍵を発行し直す。
+// 終了せず、セッションも失効させない（開いたままのタブのログインが切れない）。アイコンの「開く」のたびに使い捨て鍵を発行し直す。
 //
 // 設計上の要点:
 // - hook の経路とは独立。hook は画面の有無を一切見ない。画面が触るのは設定ファイル（ops 経由の書き込み）、
@@ -44,7 +44,7 @@ mod tray;
 mod views;
 
 pub use confirm::{dangers, line_diff};
-pub use guard::SESSION_COOKIE;
+pub use guard::{SESSION_COOKIE, session_cookie_name};
 
 /// 既定のポート（Skilvella の 7465 と重ならない値）。
 pub const DEFAULT_PORT: u16 = 7468;
@@ -67,8 +67,8 @@ pub struct Inner {
     pub(crate) hosts: [String; 2],
     /// 受け付ける Origin（`http://` + hosts）。
     pub(crate) origins: [String; 2],
-    /// セッション Cookie の値と CSRF トークン。常駐しない起動では起動から終了まで同じ値。常駐（`--tray`）では
-    /// 60 分無操作で作り直し、開いたままのタブを無効にする（[`AppState::expire_session`]）。
+    /// セッション Cookie の値と CSRF トークン。常駐しない起動では起動から終了まで同じ値。常駐（`--tray`）でも同じ値で、
+    /// プロセスが終わるまで失効しない。
     creds: Mutex<Creds>,
     /// 使い捨て鍵。一度交換したら None になり、二度目は無効。常駐ではトレイの「開く」のたびに置き換える。
     auth_key: Mutex<Option<AuthKey>>,
@@ -207,21 +207,6 @@ impl AppState {
         value
     }
 
-    /// セッションを失効させる（常駐中の 60 分無操作）。セッション Cookie の値と CSRF トークンを作り直し、
-    /// 未使用の鍵と二段階確認の nonce も捨てる。開いたままのタブは 401 になり、トレイの「開く」で入り直す。
-    pub fn expire_session(&self) {
-        {
-            let mut creds = self.creds.lock().unwrap_or_else(|p| p.into_inner());
-            creds.session = guard::random_token();
-            creds.csrf = guard::random_token();
-        }
-        *self.auth_key.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        self.nonces
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
-    }
-
     /// 操作があったことを記録する。
     pub(crate) fn touch(&self) {
         if let Ok(mut at) = self.last_activity.lock() {
@@ -255,6 +240,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth", get(handlers::auth))
         .route("/assets/app.css", get(handlers::asset_css))
         .route("/assets/app.js", get(handlers::asset_js))
+        .route("/assets/icon.png", get(handlers::asset_icon))
         .route("/", get(handlers::overview))
         .route("/repos", get(handlers::repos))
         .route("/repos/enable", post(handlers::repo_enable))
@@ -495,7 +481,7 @@ fn announce(port: u16, key: &str, open: bool, resident: bool) {
     }
 }
 
-/// サーバーの本体。`resident`（常駐）では 60 分無操作でも終了せず、代わりにセッションを失効させる。
+/// サーバーの本体。`resident`（常駐）では 60 分無操作でも終了せず、セッションも失効させない。
 async fn serve(listener: tokio::net::TcpListener, state: AppState, resident: bool) -> i32 {
     let app = router(state.clone());
     let waiter = state.clone();
@@ -503,14 +489,10 @@ async fn serve(listener: tokio::net::TcpListener, state: AppState, resident: boo
         let idle = async {
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                if waiter.idle_for() >= IDLE_LIMIT && !waiter.has_running_jobs() {
-                    if resident {
-                        // 常駐は終了しない。開いたままのタブを無効にして、トレイの「開く」で入り直してもらう。
-                        waiter.expire_session();
-                    } else {
-                        println!("{}", crate::t!("ui.cli.idle_exit"));
-                        break;
-                    }
+                // 常駐は終了もログアウトもしない（トレイの「開く」は使い捨て鍵を発行し直すだけ）。
+                if !resident && waiter.idle_for() >= IDLE_LIMIT && !waiter.has_running_jobs() {
+                    println!("{}", crate::t!("ui.cli.idle_exit"));
+                    break;
                 }
             }
         };

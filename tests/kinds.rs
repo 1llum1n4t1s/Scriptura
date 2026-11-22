@@ -1273,6 +1273,19 @@ fn split_candidates_come_from_tracked_files_and_h2_headings() {
             "docs/readme/section-02.md",
             // 組み込みの対象名は -section を付ける（重複した見出しは 1 件）
             "docs/readme/readme-section.md",
+            // 見出しから名前が取れないときのための、内容を表す汎用の主題名（末尾）
+            "docs/readme/overview.md",
+            "docs/readme/architecture.md",
+            "docs/readme/workflow.md",
+            "docs/readme/configuration.md",
+            "docs/readme/commands.md",
+            "docs/readme/testing.md",
+            "docs/readme/security.md",
+            "docs/readme/release-process.md",
+            "docs/readme/troubleshooting.md",
+            "docs/readme/data-model.md",
+            "docs/readme/conventions.md",
+            "docs/readme/api-reference.md",
         ]
     );
     // 許可パスにも入る（分割先が無い種類は入らない）。
@@ -1486,6 +1499,8 @@ fn settings_frame_demands_the_limit_and_lists_the_split_files() {
         "docs/readme/section-01.md",
         "docs/readme/usage-notes.md",
         "relative link",
+        "Each file name must describe its content",
+        "docs/readme/testing.md",
     ] {
         assert!(frame.contains(needle), "{needle}\n{frame}");
     }

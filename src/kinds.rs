@@ -239,6 +239,7 @@ pub fn resolve_kind(config: &Config, document: &Document) -> Option<ResolvedKind
         _ => builtin_kind(document)?,
     };
     kind.common_instructions = normalize_text(&config.defaults.instructions);
+    let global_language = config.defaults.language.clone();
     if let Some(s) = settings {
         if let Some(v) = s.create_if_missing {
             kind.create_if_missing = v;
@@ -272,6 +273,23 @@ pub fn resolve_kind(config: &Config, document: &Document) -> Option<ResolvedKind
                 .unwrap_or(base.backfill_max_releases);
             base.backfill_max_commits = c.backfill_max_commits.unwrap_or(base.backfill_max_commits);
         }
+    }
+    // 全体設定の上限は、種類ごとの（旧）設定より優先する（CHANGELOG は上限を持たない。AGENTS は 30,000 未満へ丸める）。
+    if kind.document != Document::Changelog {
+        if let Some(n) = config.defaults.max_chars {
+            kind.max_chars = Some(n);
+        }
+        if let Some(n) = config.defaults.max_bytes {
+            kind.max_bytes = Some(if kind.document == Document::Agents {
+                n.min(AGENTS_MAX_BYTES)
+            } else {
+                n
+            });
+        }
+    }
+    // 全体設定の言語は、種類ごとの（旧）設定より優先する。
+    if global_language.is_some() {
+        kind.language = global_language;
     }
     kind.split_dir = resolve_split_dir(config, &kind);
     Some(kind)
@@ -370,7 +388,7 @@ pub fn validate_template_spec(field: &str, spec: &str) -> Result<(), String> {
 }
 
 /// `language` の形式（`ja` / `en-US` など）。
-fn valid_language(lang: &str) -> bool {
+pub fn valid_language(lang: &str) -> bool {
     let (primary, region) = match lang.split_once('-') {
         Some((p, r)) => (p, Some(r)),
         None => (lang, None),
@@ -1002,6 +1020,26 @@ pub const MAX_SPLIT_FILES: usize = 20;
 /// 分割先の既定の予約名（組み込みの対象名と衝突させない）。
 const SPLIT_RESERVED_STEMS: &[&str] = &["agents", "design", "readme", "changelog"];
 
+/// 見出しから名前が取れない（日本語の見出しなど）ときのために、内容を表す汎用の主題名を候補の末尾へ足す。
+/// `section-NN` のような内容の分からない名前しか選べなくならないようにするためで、worker には内容に合う名前を選ばせる。
+const SPLIT_TOPIC_STEMS: &[&str] = &[
+    "overview",
+    "architecture",
+    "workflow",
+    "configuration",
+    "commands",
+    "testing",
+    "security",
+    "release-process",
+    "troubleshooting",
+    "data-model",
+    "conventions",
+    "api-reference",
+];
+
+/// 分割先のファイル名と内容を一致させる規則（worker が読む文なので英語に固定）。
+const SPLIT_NAMING_RULE: &str = "Each file name must describe its content: choose, from the allowed files, the name that matches the topic you move (for example a topic about testing goes in testing.md), and never put content in a file whose name does not describe it. Use a `section-NN` name only when no other allowed name fits the topic; a file that already exists keeps only content that matches its name.";
+
 /// 本文（フェンス付きコードブロックの外）の `## ` 見出しの文字列。
 pub fn h2_headings(text: &str) -> Vec<String> {
     let mut fence: Option<char> = None;
@@ -1127,6 +1165,15 @@ fn split_candidates_checked(
             ) {
                 push(&mut out, name);
             }
+        }
+    }
+    for stem in SPLIT_TOPIC_STEMS {
+        let name = format!("{prefix}{stem}.md");
+        if matches!(
+            path_state(root, &name),
+            PathState::File | PathState::Missing
+        ) {
+            push(&mut out, name);
         }
     }
     out
@@ -1592,7 +1639,7 @@ pub fn agents_over_lines(agents: &[AgentsOver]) -> Vec<String> {
             .collect::<Vec<_>>()
             .join("\n");
         lines.push(format!(
-            "- The AGENTS files applied to `{}` are read together (root to child) and total {} bytes, but the total must stay under 30000 bytes. Remove at least {} bytes in total from the editable files below; aim to remove about {} bytes so the total is at most {} bytes. Members:\n{listed}\n  Merge duplicated or overlapping rules (keep each rule once, in the most general file), drop outdated or low-value detail, and you may move detailed content into other editable documents (for example DESIGN.md), leaving a short pointer to it. The program re-measures the actual bytes after your edit.",
+            "- The AGENTS files applied to `{}` are read together (root to child) and total {} bytes, but the total must stay under 30000 bytes. Remove at least {} bytes in total from the editable files below; aim to remove about {} bytes so the total is at most {} bytes. Members:\n{listed}\n  Start by moving detailed content out into other editable documents (for example DESIGN.md or files under docs/, whose file names must describe their content), leaving a short pointer to it, rather than trimming first; while doing so, merge duplicated or overlapping rules (keep each rule once, in the most general file) and drop outdated or low-value detail. The program re-measures the actual bytes after your edit.",
             a.path,
             a.size,
             a.required_cut,
@@ -1668,14 +1715,14 @@ pub fn fixup_prompt(
                 && matches!(v, Violation::MaxChars { .. } | Violation::MaxBytes { .. })
             {
                 note(format!(
-                    "If detail must be kept, you may move it into files under `{dir}/` that are in the editable paths below, one topic per file, leaving a one- or two-sentence summary and a relative link in the main document."
+                    "Start by splitting right away, without trimming first: move detail into files under `{dir}/` that are in the editable paths below, one topic per file, and decide what to condense or drop only while splitting, leaving a one- or two-sentence summary and a relative link in the main document. {SPLIT_NAMING_RULE}"
                 ));
             }
         }
     }
     lines.extend(agents_over_lines(agents));
     format!(
-        "The maintenance result for this push still violates checks that the program enforces after every run. Fix only these violations and do not redo the rest of the maintenance:\n{}\nReduce size by removing duplication, outdated statements and low-value detail and by tightening wording; do not simply cut text off.{}\nThe only editable paths are those in this JSON array: {}. Do not edit any other path.",
+        "The maintenance result for this push still violates checks that the program enforces after every run. Fix only these violations and do not redo the rest of the maintenance:\n{}\nReduce size by splitting detail out where a split directory is given below; while splitting, also remove duplication, outdated statements and low-value detail and tighten wording. Do not simply cut text off.{}\nThe only editable paths are those in this JSON array: {}. Do not edit any other path.",
         lines.join("\n"),
         notes.iter().map(|n| format!(" {n}")).collect::<String>(),
         serde_json::json!(allowed)
@@ -1755,7 +1802,7 @@ pub fn settings_frame_with(
                 format!(" (currently: {})", now.join("; "))
             };
             lines.push(format!(
-                "- Limits: {}{current}. These are requirements that the program checks after maintenance. If a file already exceeds a limit, bringing it within the limit is itself a required part of this task: remove duplication and outdated statements, tighten wording and drop low-value detail, and aim for at most {FIXUP_TARGET_PERCENT}% of the limit.",
+                "- Limits: {}{current}. These are requirements that the program checks after maintenance. If a file already exceeds a limit, bringing it within the limit is itself a required part of this task. Start by splitting detail out into the split directory (see the Splitting line, when present) right away, without first trying to cut text; decide what to remove (duplication, outdated statements, low-value detail) while you split, and aim for at most {FIXUP_TARGET_PERCENT}% of the limit.",
                 limits.join(", ")
             ));
             let split = memo.candidates(root, scope, kind);
@@ -1766,7 +1813,7 @@ pub fn settings_frame_with(
                     ""
                 };
                 lines.push(format!(
-                    "- Splitting: if detail cannot fit within the limits, move it into files under `{dir}/`. Create or edit only these files: {}. Use one topic per file, and leave a one- or two-sentence summary with a relative link to the new file in the main document.{agents_rule}",
+                    "- Splitting: when a file reaches or exceeds its limit, start splitting immediately instead of trimming first. Move detail into files under `{dir}/`, and consider what to condense or drop only while you do the splitting. Create or edit only these files: {}. Use one topic per file, and leave a one- or two-sentence summary with a relative link to the new file in the main document. {SPLIT_NAMING_RULE}{agents_rule}",
                     split.join(", ")
                 ));
             }

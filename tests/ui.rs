@@ -365,7 +365,10 @@ async fn host_origin_cookie_and_one_time_key_are_enforced() {
     // 偽の Cookie も 401。
     req = Request::get("/")
         .header(header::HOST, HOST)
-        .header(header::COOKIE, format!("{}=deadbeef", ui::SESSION_COOKIE))
+        .header(
+            header::COOKIE,
+            format!("{}=deadbeef", ui::session_cookie_name(7468)),
+        )
         .body(Body::empty())
         .unwrap();
     assert_eq!(fx.raw(req).await.status, StatusCode::UNAUTHORIZED);
@@ -400,7 +403,7 @@ async fn session_cookie_is_http_only_strict_and_key_is_single_use() {
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
     assert_eq!(res.headers()[header::LOCATION], "/");
     let cookie = res.headers()[header::SET_COOKIE].to_str().unwrap();
-    assert!(cookie.starts_with(&format!("{}=", ui::SESSION_COOKIE)));
+    assert!(cookie.starts_with(&format!("{}=", ui::session_cookie_name(7468))));
     assert!(cookie.contains("HttpOnly"));
     assert!(cookie.contains("SameSite=Strict"));
     assert!(cookie.contains("Path=/"));
@@ -463,18 +466,16 @@ async fn reissued_keys_replace_old_ones_and_expired_sessions_are_refused() {
 
     // セッションが有効なあいだは画面に入れる（存在しないページは 404）。
     assert_eq!(with_cookie(cookie.clone()).await, StatusCode::NOT_FOUND);
-    // 失効させると、未使用の鍵も前の Cookie も無効になる。
+    // 鍵を発行し直しても、すでに入っているセッションは切れない（開いたままのタブのログインが保たれる）。
+    // 未使用の古い鍵だけが無効になる。Cookie 名はポートごと（同じホストの別ポートの起動と上書きし合わない）。
     let unused_key = state.issue_key();
-    state.expire_session();
+    let again = state.issue_key();
     assert_eq!(auth(unused_key).await.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(with_cookie(cookie.clone()).await, StatusCode::UNAUTHORIZED);
-    // 発行し直せば入り直せる。Cookie の値は前と違う。
-    let res = auth(state.issue_key()).await;
+    assert_eq!(with_cookie(cookie.clone()).await, StatusCode::NOT_FOUND);
+    let res = auth(again).await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
-    let renewed = cookie_of(&res);
-    assert_ne!(renewed, cookie);
-    assert_eq!(with_cookie(renewed).await, StatusCode::NOT_FOUND);
-    assert_eq!(with_cookie(cookie).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(with_cookie(cookie_of(&res)).await, StatusCode::NOT_FOUND);
+    assert_eq!(with_cookie(cookie).await, StatusCode::NOT_FOUND);
 }
 
 /// 常駐（`--tray`）では、ログインが切れた画面とフッターが常駐の事実に合う文言になる
@@ -554,10 +555,7 @@ async fn resident_screens_explain_reopening_from_the_tray() {
         .to_string();
     let (status, body) = body_of(app.oneshot(ja("/", Some(&cookie))).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(
-        body.contains("常駐中。60 分操作が無いとログインが切れます"),
-        "{body}"
-    );
+    assert!(body.contains("（常駐中）"), "{body}");
     assert!(!body.contains("60 分操作が無いと終了します"), "{body}");
 }
 
@@ -628,6 +626,7 @@ async fn get_pages_render_without_creating_state_or_config() {
         "/doctor",
         "/assets/app.css",
         "/assets/app.js",
+        "/assets/icon.png",
     ] {
         let r = fx.get(path).await;
         assert_eq!(r.status, StatusCode::OK, "{path}: {}", r.body);
@@ -1081,29 +1080,29 @@ async fn run_now_always_confirms_and_runs_as_a_background_job() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kind_form_shows_builtin_defaults_as_placeholders_without_saving_them() {
     let fx = Fx::new().await;
+    // 上限は全体設定（全般）の項目で、種類ごとの画面には出ない。
     let agents = fx.get("/settings/documents/agents").await;
     assert_eq!(agents.status, StatusCode::OK);
     assert!(
-        agents
-            .body
-            .contains(r#"name="max_bytes" inputmode="numeric" value="" placeholder="29999（既定・30,000 バイト未満）""#),
+        !agents.body.contains(r#"name="max_bytes""#),
         "{}",
         agents.body
     );
     let design = fx.get("/settings/documents/design").await;
     assert!(
-        design.body.contains(
-            r#"name="max_bytes" inputmode="numeric" value="" placeholder="上限なし（既定）""#
-        ),
+        !design.body.contains(r#"name="max_chars""#),
         "{}",
         design.body
     );
-    assert!(design.body.contains(r#"placeholder="0（既定）""#));
+    let general = fx.get("/settings/general").await;
     assert!(
-        design
-            .body
-            .contains("既存の文書に合わせる（新規は日本語）（既定）")
+        general.body.contains(
+            r#"name="max_bytes" inputmode="numeric" value="" placeholder="上限なし（既定）""#
+        ),
+        "{}",
+        general.body
     );
+    assert!(design.body.contains(r#"placeholder="0（既定）""#));
     assert!(design.body.contains(r#"placeholder="例: architecture.md""#));
     // プレースホルダーは値ではない: 既定のまま保存しても設定には何も書かれない。
     let rev = fx.revision();
@@ -1125,14 +1124,12 @@ async fn kinds_are_edited_and_user_text_is_escaped() {
             &[
                 ("revision", &rev),
                 ("instructions", "<script>alert(1)</script>"),
-                ("max_bytes", "20000"),
                 ("required_headings", "## 概要\r\n## 構成"),
             ],
         )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     let k = fx.config().kinds["agents"].clone();
-    assert_eq!(k.max_bytes, Some(20000));
     assert_eq!(k.required_headings, vec!["## 概要", "## 構成"]);
     let page = fx.get("/settings/documents/agents").await;
     assert!(!page.body.contains("<script>alert"));
@@ -1141,12 +1138,16 @@ async fn kinds_are_edited_and_user_text_is_escaped() {
         page.body
             .contains("&#60;script&#62;alert(1)&#60;/script&#62;")
     );
-    // 検証に通らない値は 400 で書かない（AGENTS の max_bytes は 29,999 以下）。
+    // 検証に通らない値は 400 で書かない（全体の上限は 1 以上の数）。
     let rev = fx.revision();
     let r = fx
         .post(
-            "/settings/documents/agents",
-            &[("revision", &rev), ("max_bytes", "40000")],
+            "/settings/general",
+            &[
+                ("revision", &rev),
+                ("policy", "explicit"),
+                ("max_chars", "0"),
+            ],
         )
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
@@ -2647,28 +2648,19 @@ async fn split_dir_field_is_saved_validated_and_hidden_for_changelog() {
     let changelog = fx.get("/settings/documents/changelog").await;
     assert_eq!(changelog.status, StatusCode::OK);
     assert!(!changelog.body.contains(r#"name="split_dir""#));
-    // 上限・言語・分割先を保存すると、フォームにそのまま値として出る（旧設定の値が消えて見えない回帰の防止）。
+    // 分割先を保存すると、フォームにそのまま値として出る（旧設定の値が消えて見えない回帰の防止）。
     let rev = fx.revision();
     let r = fx
         .post(
             "/settings/documents/readme",
-            &[
-                ("revision", &rev),
-                ("max_chars", "3000"),
-                ("language", "ja"),
-                ("split_dir", "guide/parts"),
-            ],
+            &[("revision", &rev), ("split_dir", "guide/parts")],
         )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     let k = fx.config().kinds["readme"].clone();
     assert_eq!(k.split_dir.as_deref(), Some("guide/parts"));
     let page = fx.get("/settings/documents/readme").await;
-    for needle in [
-        r#"name="max_chars" inputmode="numeric" value="3000""#,
-        r#"name="language" value="ja""#,
-        r#"name="split_dir" value="guide/parts""#,
-    ] {
+    for needle in [r#"name="split_dir" value="guide/parts""#] {
         assert!(page.body.contains(needle), "{needle}\n{}", page.body);
     }
     // 検証に通らない分割先（.. を含む・他の種類の分割先と重なる）は 400 で書かない。
@@ -2676,11 +2668,7 @@ async fn split_dir_field_is_saved_validated_and_hidden_for_changelog() {
     let r = fx
         .post(
             "/settings/documents/readme",
-            &[
-                ("revision", &rev),
-                ("max_chars", "3000"),
-                ("split_dir", "../outside"),
-            ],
+            &[("revision", &rev), ("split_dir", "../outside")],
         )
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
@@ -2689,13 +2677,85 @@ async fn split_dir_field_is_saved_validated_and_hidden_for_changelog() {
     let r = fx
         .post(
             "/settings/documents/readme",
-            &[
-                ("revision", &rev),
-                ("max_chars", "3000"),
-                ("split_dir", "<b>x</b>"),
-            ],
+            &[("revision", &rev), ("split_dir", "<b>x</b>")],
         )
         .await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     assert!(!r.body.contains("<b>x</b>"), "{}", r.body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn template_has_no_dropdown_and_icon_is_served() {
+    let fx = Fx::new().await;
+    for kind in ["changelog", "agents"] {
+        let body = fx.get(&format!("/settings/documents/{kind}")).await.body;
+        assert!(!body.contains("name=\"template\""), "{body}");
+        assert!(body.contains("name=\"template_file\""), "{body}");
+    }
+    let page = fx.get("/").await.body;
+    assert!(page.contains("rel=\"icon\"") && page.contains("class=\"brand\""));
+    assert_eq!(fx.raw(get("/assets/icon.png")).await.status, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn document_language_is_a_global_dropdown_and_not_a_per_kind_field() {
+    let fx = Fx::new().await;
+    let general = fx.get("/settings/general").await.body;
+    assert!(general.contains("<select name=\"language\">"), "{general}");
+    assert!(general.contains("<option value=\"ja\">"), "{general}");
+    let design = fx.get("/settings/documents/design").await.body;
+    assert!(!design.contains("ja・en-US"), "{design}");
+    let rev = fx.revision();
+    let r = fx
+        .post(
+            "/settings/general",
+            &[
+                ("revision", rev.as_str()),
+                ("language", "en"),
+                ("policy", "explicit"),
+            ],
+        )
+        .await;
+    assert!(
+        r.status.is_redirection() || r.status.is_success(),
+        "{}",
+        r.body
+    );
+    assert_eq!(fx.config().defaults.language.as_deref(), Some("en"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn global_limits_apply_to_every_kind_except_changelog() {
+    let fx = Fx::new().await;
+    let rev = fx.revision();
+    let r = fx
+        .post(
+            "/settings/general",
+            &[
+                ("revision", rev.as_str()),
+                ("policy", "explicit"),
+                ("max_chars", "3000"),
+                ("max_bytes", "40000"),
+            ],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    let config = fx.config();
+    assert_eq!(config.defaults.max_chars, Some(3000));
+    let resolve = |id: &str| {
+        scriptura::kinds::resolve_kind(
+            &config,
+            &scriptura::config::Document::try_from(id.to_string()).unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(resolve("readme").max_chars, Some(3000));
+    assert_eq!(resolve("design").max_bytes, Some(40000));
+    // AGENTS のバイト数は 30,000 未満へ丸める。
+    assert_eq!(
+        resolve("agents").max_bytes,
+        Some(scriptura::kinds::AGENTS_MAX_BYTES)
+    );
+    // CHANGELOG は対象外。
+    assert_eq!(resolve("changelog").max_chars, None);
 }

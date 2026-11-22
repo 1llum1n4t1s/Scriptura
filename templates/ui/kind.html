@@ -19,13 +19,7 @@
     {% endif %}
     <label>{{ crate::locale::tr("ui.kind.when_missing") }}<select name="create_if_missing">{% for c in form.create_if_missing %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
     <div class="row">
-      <label>{{ crate::locale::tr("ui.kind.summary_template") }}<select name="template">{% for c in form.template %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
       <label>{{ crate::locale::tr("ui.kind.template_file_label") }}<input name="template_file" value="{{ form.template_file }}" placeholder="{{ form.ph_template_file }}"></label>
-    </div>
-    <div class="row">
-      <label>{{ crate::locale::tr("ui.kind.max_chars") }}<input name="max_chars" inputmode="numeric" value="{{ form.max_chars }}" placeholder="{{ form.ph_max_chars }}"></label>
-      <label>{{ crate::locale::tr("ui.kind.max_bytes") }}<input name="max_bytes" inputmode="numeric" value="{{ form.max_bytes }}" placeholder="{{ form.ph_max_bytes }}"></label>
-      <label>{{ crate::locale::tr("ui.kind.language") }}<input name="language" value="{{ form.language }}" placeholder="{{ form.ph_language }}"></label>
     </div>
     {% if !form.is_changelog %}<label>{{ crate::locale::tr("ui.kind.split_dir") }}<input name="split_dir" value="{{ form.split_dir }}" placeholder="{{ form.ph_split_dir }}"></label>{% endif %}
     <label>{{ crate::locale::tr1("ui.kind.instructions", "max", instructions_max) }}<textarea name="instructions" rows="4" data-max="{{ instructions_max }}" placeholder="{{ form.ph_none }}">{{ form.instructions }}</textarea><span class="counter" data-for="instructions"></span></label>

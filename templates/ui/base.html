@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="{{ crate::ui::views::lang() }}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="same-origin">{% block head %}{% endblock %}<title>{{ layout.title }} - Scriptura</title><link rel="stylesheet" href="/assets/app.css"><script src="/assets/app.js" defer></script></head>
+<html lang="{{ crate::ui::views::lang() }}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="same-origin">{% block head %}{% endblock %}<title>{{ layout.title }} - Scriptura</title><link rel="icon" type="image/png" href="/assets/icon.png"><link rel="stylesheet" href="/assets/app.css"><script src="/assets/app.js" defer></script></head>
 <body data-unit-chars="{{ crate::locale::tr("ui.js.chars") }}" data-unit-bytes="{{ crate::locale::tr("ui.js.bytes") }}">
 <a class="skip" href="#main">{{ crate::locale::tr("ui.base.skip") }}</a>
 <header class="topbar">
-  <a class="brand" href="/">Scriptura<span>{{ crate::locale::tr("ui.base.brand") }}</span></a>
+  <a class="brand" href="/"><img src="/assets/icon.png" alt="" width="28" height="28">Scriptura<span>{{ crate::locale::tr("ui.base.brand") }}</span></a>
   <nav aria-label="{{ crate::locale::tr("ui.base.nav_label") }}">
     <a href="/" aria-current="{% if layout.nav == "overview" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.overview") }}</a>
     <a href="/repos" aria-current="{% if layout.nav == "repos" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.repos") }}</a>

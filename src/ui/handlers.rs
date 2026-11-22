@@ -21,7 +21,7 @@ use serde::Deserialize;
 use super::{
     AppState,
     confirm::{self, dangers},
-    guard::{FormData, SESSION_COOKIE},
+    guard::{FormData, session_cookie_name},
     models, read,
     views::{self, *},
 };
@@ -418,7 +418,8 @@ pub async fn auth(State(state): State<AppState>, Query(q): Query<AuthQuery>) -> 
     state.touch();
     let mut response = Redirect::to(auth_destination(q.next.as_deref())).into_response();
     if let Ok(cookie) = HeaderValue::from_str(&format!(
-        "{SESSION_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/",
+        "{}={}; HttpOnly; SameSite=Strict; Path=/",
+        session_cookie_name(state.port()),
         state.session()
     )) {
         response.headers_mut().insert(header::SET_COOKIE, cookie);
@@ -438,6 +439,15 @@ pub async fn asset_js() -> Response {
     (
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
         include_str!("../../assets/ui/app.js"),
+    )
+        .into_response()
+}
+
+/// ファビコンとヘッダーのアイコン（実行ファイルへ埋め込み。CDN は使わない）。
+pub async fn asset_icon() -> Response {
+    (
+        [(header::CONTENT_TYPE, "image/png")],
+        include_bytes!("../../assets/icons/icon-64.png").as_slice(),
     )
         .into_response()
 }
@@ -1401,12 +1411,6 @@ fn num_text<T: ToString>(v: Option<T>) -> String {
 fn kind_form(id: &str, s: &KindSettings, is_new: bool) -> KindForm {
     let builtin = kinds::is_builtin_id(id);
     let doc = Document::try_from(id.to_string()).ok();
-    let template_choice = match s.template.as_deref() {
-        None => None,
-        Some("builtin") => Some("builtin"),
-        Some("none") => Some("none"),
-        Some(_) => Some("file"),
-    };
     let timing = s.timing.clone().unwrap_or_default();
     let cl = s.changelog.clone().unwrap_or_default();
     KindForm {
@@ -1433,25 +1437,13 @@ fn kind_form(id: &str, s: &KindSettings, is_new: bool) -> KindForm {
                 crate::t!("ui.kind.create_default_no")
             },
         ),
-        template: opt_choices(
-            template_choice,
-            &[
-                ("builtin", crate::t!("ui.kind.template_builtin")),
-                ("none", crate::t!("ui.kind.template_none")),
-                ("file", crate::t!("ui.kind.template_file")),
-            ],
-            crate::t!("ui.kind.default"),
-        ),
         template_file: s
             .template
             .as_deref()
             .and_then(|t| t.strip_prefix("templates/"))
             .unwrap_or("")
             .to_string(),
-        max_chars: num_text(s.max_chars),
-        max_bytes: num_text(s.max_bytes),
         instructions: s.instructions.clone().unwrap_or_default(),
-        language: s.language.clone().unwrap_or_default(),
         required_headings: s.required_headings.join("\n"),
         split_dir: s.split_dir.clone().unwrap_or_default(),
         timing_when: opt_choices(
@@ -1506,18 +1498,7 @@ fn kind_form(id: &str, s: &KindSettings, is_new: bool) -> KindForm {
         cl_backfill_max_releases: num_text(cl.backfill_max_releases),
         cl_backfill_max_commits: num_text(cl.backfill_max_commits),
         ph_none: crate::t!("ui.kind.ph.none").to_string(),
-        ph_max_chars: crate::t!("ui.kind.ph.no_limit").to_string(),
-        // AGENTS.md の 30,000 bytes 未満の検査（agents_size_error）は組み込みの agents だけに効く。
-        ph_max_bytes: if id == "agents" {
-            crate::t!(
-                "ui.kind.ph.max_bytes_agents",
-                value = kinds::AGENTS_MAX_BYTES
-            )
-        } else {
-            crate::t!("ui.kind.ph.no_limit").to_string()
-        },
         ph_split_dir: crate::t!("ui.kind.ph.split_dir", value = kinds::default_split_dir(id)),
-        ph_language: crate::t!("ui.kind.ph.language").to_string(),
         ph_min_interval: crate::t!(
             "ui.kind.ph.interval",
             value = kinds::ResolvedTiming::default().min_interval_hours
@@ -1560,21 +1541,11 @@ fn parse_kind_form(form: &FormData, id: &str) -> Result<KindSettings, String> {
         Some("false") => Some(false),
         _ => None,
     };
-    s.template = match form.get("template") {
-        Some("builtin") => Some("builtin".into()),
-        Some("none") => Some("none".into()),
-        Some("file") => {
-            let name = form
-                .text("template_file")
-                .ok_or(crate::t!("ui.kind.template_file_required"))?;
-            Some(format!("{}/{name}", kinds::TEMPLATES_DIR))
-        }
-        _ => None,
-    };
-    s.max_chars = parse_num(form, "max_chars", crate::t!("ui.kind.max_chars"))?;
-    s.max_bytes = parse_num(form, "max_bytes", crate::t!("ui.kind.max_bytes"))?;
+    // テンプレートは使うファイル名だけを設定する（空欄は未設定。CHANGELOG は組み込み、それ以外は使わない）。
+    s.template = form
+        .text("template_file")
+        .map(|name| format!("{}/{name}", kinds::TEMPLATES_DIR));
     s.instructions = normalized(form, "instructions");
-    s.language = form.text("language");
     s.required_headings = lines_of(form.get("required_headings"));
     s.split_dir = if id == "changelog" {
         None
@@ -2175,6 +2146,29 @@ pub async fn worker_save(
     .await
 }
 
+/// 文書を書く言語の選択肢（先頭は「既存の文書に従う」。言語名はその言語自身の表記で、訳さない）。
+/// 設定ファイルに一覧外の値があるときも、その値を選択肢に残す。
+fn document_language_choices(current: Option<&str>) -> Vec<Choice> {
+    let mut out = vec![Choice::new(
+        "",
+        crate::t!("ui.general.language_auto"),
+        current.is_none(),
+    )];
+    let mut known = false;
+    for l in crate::locale::Language::ALL {
+        known |= current == Some(l.tag());
+        out.push(Choice::new(
+            l.tag(),
+            l.native_name(),
+            current == Some(l.tag()),
+        ));
+    }
+    if let (Some(c), false) = (current, known) {
+        out.push(Choice::new(c, c, true));
+    }
+    out
+}
+
 pub async fn general(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
     let cur = current(&state);
     let d = &cur.config.defaults;
@@ -2184,6 +2178,10 @@ pub async fn general(State(state): State<AppState>, Query(q): Query<Msg>) -> Res
         exclude: d.exclude.join("\n"),
         instructions: d.instructions.clone(),
         instructions_max: kinds::INSTRUCTIONS_MAX_CHARS,
+        languages: document_language_choices(d.language.as_deref()),
+        max_chars: num_text(d.max_chars),
+        max_bytes: num_text(d.max_bytes),
+        ph_no_limit: crate::t!("ui.kind.ph.no_limit").to_string(),
         policies: vec![
             Choice::new(
                 "explicit",
@@ -2218,6 +2216,9 @@ pub async fn general(State(state): State<AppState>, Query(q): Query<Msg>) -> Res
 struct GeneralValues {
     exclude: Vec<String>,
     instructions: String,
+    language: Option<String>,
+    max_chars: Option<u64>,
+    max_bytes: Option<u64>,
     policy: Policy,
     owners: Vec<String>,
 }
@@ -2225,6 +2226,9 @@ struct GeneralValues {
 fn apply_general(c: &mut Config, v: GeneralValues) -> Result<(), String> {
     c.defaults.exclude = v.exclude;
     c.defaults.instructions = v.instructions;
+    c.defaults.language = v.language;
+    c.defaults.max_chars = v.max_chars;
+    c.defaults.max_bytes = v.max_bytes;
     c.enrollment.policy = v.policy;
     c.enrollment.owners = v.owners;
     Ok(())
@@ -2248,9 +2252,20 @@ pub async fn general_save(
             );
         }
     };
+    let max_chars = match parse_num(&form, "max_chars", crate::t!("ui.kind.max_chars")) {
+        Ok(v) => v,
+        Err(e) => return error_page(&state, StatusCode::BAD_REQUEST, e, back),
+    };
+    let max_bytes = match parse_num(&form, "max_bytes", crate::t!("ui.kind.max_bytes")) {
+        Ok(v) => v,
+        Err(e) => return error_page(&state, StatusCode::BAD_REQUEST, e, back),
+    };
     let values = GeneralValues {
         exclude: lines_of(form.get("exclude")),
         instructions: normalized(&form, "instructions").unwrap_or_default(),
+        language: form.text("language"),
+        max_chars,
+        max_bytes,
         policy,
         owners: lines_of(form.get("owners")),
     };
