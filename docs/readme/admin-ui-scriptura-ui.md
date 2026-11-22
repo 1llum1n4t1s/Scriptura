@@ -1,0 +1,18 @@
+# Admin UI (`scriptura ui`)
+
+```powershell
+scriptura ui [--port <n>] [--no-open] [--tray]
+scriptura ui --autostart on|off
+```
+
+A browser screen for repositories, settings, history, and diagnostics, in 9 languages (selector cookie → `Accept-Language` → English). By default it ends on "Quit", Ctrl+C, or after 60 minutes idle. It needs cargo feature `ui` (default); without it the command refuses.
+
+- **Listening**: only `127.0.0.1` (default port 7468; `--port 0` picks a free one; exits if in use).
+- **Resident (`--tray`)**: tray icon on Windows, menu bar on macOS (Linux refuses). No idle exit or session expiry; each open issues a new one-time key (valid 5 minutes).
+- **Resident at logon (Setup edition; on by default)**: turn off with `scriptura ui --autostart off` or the panel checkbox (`tray_autostart` in `app-update.json`; a missing or unreadable value counts as on). It starts after the logon-time `update-apply`. Not available with the plugin-bundled or standalone `install` executable.
+- **"App updates" panel (Setup edition)**: overview `#updates`; shows the version, the auto-update and resident-at-logon checkboxes, "Check for updates" (ignores the 24-hour throttle, downloads nothing), and "Install update": it downloads, verifies the signer, and, if no other Scriptura process or run-now is active, asks the updater to apply it and ends the UI (otherwise retry later).
+- **Protection**: the one-time key URL (`/auth?key=…`) is exchanged once for a session cookie (`HttpOnly; SameSite=Strict`; else 401). Host must be `127.0.0.1:<port>` or `localhost:<port>`; a POST needs same-origin plus a CSRF token. Secret values are never shown. Cookies are not isolated by port, so other local services of the same PC can receive it.
+- **Conflicts**: a save is rejected with a reload request if the file changed elsewhere.
+- **Confirmation screen**: enabling a repository, permission `bypass`, enrollment policy `all` / `remote-owner`, a custom kind's target path, removing a registration, `run-now`, and restoring history to a version containing these first list the changes and need one confirmation (valid 10 minutes).
+- **Screens**: Overview / Repositories / History / Settings. Settings tabs: General (exclusions, shared additional instructions, enrollment policy) / Documents (default targets; kinds and `templates/`) / Worker (model and effort from lists; with `ANTHROPIC_API_KEY` set, "Refresh model list" fetches the newest models; the key is never stored or shown) / Settings history (diffs, restore) / Diagnostics. `run-now` runs in the background.
+- **Maintenance history**: each run that started the worker, and each attempt that failed before it could, is recorded in the state DB (`maintenance_runs`) and shown under "History": trigger, kinds, result (committed / no changes / rejected / held / failed / outcome unknown), documents with line counts, commit, and reason; no contents or diffs. Up to 200 runs per repository and 2,000 overall are kept.

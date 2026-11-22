@@ -1,0 +1,10 @@
+# データフロー
+
+1. Claude Code の hook が `scriptura hook` を呼ぶ。呼ばれるのは、Bash・PowerShell ツールで `push` を含むコマンドが成功した直後（PostToolUse。push のあとに後段が失敗したコマンドは PostToolUseFailure になるので同じ条件で登録する。`if` はツールごとに 1 ルール `Bash(* push*)`・`PowerShell(* push*)`。末尾の `*` は空文字にも一致する（実機で確認済み）ので、引数あり・なし、`bash -lc 'git push'` のような引用の終端、`rtk git push`・`git -C <path> push`・`FOO=1 git push`・`&&` でつないだ push も 1 本で拾う）と、セッション開始時（SessionStart の `startup` / `resume`。取りこぼしの回収）。毎ターン発火する旧登録の Stop（と UserPromptSubmit）も、移行までの互換で受け付ける。Codex の hooks（同じイベント名・`cwd`・`tool_input.command`）からも呼べる。Codex には `if` が無いので、`handle_hook` が PostToolUse（PostToolUseFailure も同じ扱い）の `tool_input.command` を `payload_may_push` で見て、`push` の語（`pushd` は除く。`git` の語は要求しない）が無い・ファイル編集や MCP のツールなら、状態 DB・ロックに触れずに終える（判定できない形は処理側に倒す）。push の有無は従来どおり Git から検出するので、誤発火は害がない。重複して呼ばれても poll ロックで直列になる。ロックは全リポジトリ共通で worker の終了まで保持されるので、非同期の新しい登録（PostToolUse・SessionStart）はロックを最長 25 分（`HOOK_LOCK_WAIT`。worker の期限の上限 1500 秒に収まる）待って処理し、保守中の push を見送らない。同期の UserPromptSubmit と旧登録の Stop は待たず、従来どおり見送って次の呼び出しに任せる。旧登録の Stop で呼ばれたときは、保守の前に `connect::migrate_old_stop_registration` がユーザー単位の settings.json の旧登録を新しい登録へ移行する（実行中の本体を完全パス一致で指す Stop hook がそのファイルにあるときだけ。登録には実行中のパスを使う。`connect --apply` と同じ結果・移行直前の内容を別名の新しい退避 `settings.json.scriptura-migration-backup[-N]` へ残し・rename 直前に再読込みして変わっていたら次の Stop に任せる（窓を狭めるだけ）・他ツールの hook は残す・プラグイン有効時は外すだけ・Setup 版は対象外。ベストエフォートで、移行できたときだけ 1 回 `systemMessage` で知らせる。状態フォルダーは作らない）。保守が失敗して処理済み位置を進めなかった回は、次の push（PostToolUse）か次のセッション開始（SessionStart）で再試行される。`git -C <別のリポジトリ> push` はセッションの `cwd` のリポジトリを見るため、そのリポジトリで次にセッションを始めたときに回収される。
+2. 利用者の設定ファイルを `config::resolve` で判定する。未登録・停止中（旧設定の移行で止めたものを含む）・壊れた設定は何もしない。
+3. push の範囲を検知し、種類ごとの期限（`timing::due_kinds`）で処理する文書を絞る。期限前だけなら worker を起動せず、処理済み位置だけを進める。
+4. 未信頼の資料（コミット件名など）を枠に入れたプロンプトで worker を起動する。権限は `restricted`（許可規則と事後検査）または `bypass`。
+5. Rust が保守後検査（対象外変更・サイズ上限・必須見出し・CHANGELOG のリリース済み節の不変）を行う。違反は commit しない。
+6. 問題が無ければ commit と push までを自動で行う。
+
+管理画面と CLI はいずれも `ops` を通して設定を書き換え、保守エンジンの内部は直接動かさない。
