@@ -8,21 +8,21 @@
 
 ## 主要コンポーネントと責務
 
-設定・種類・タイミング、保守の本体、保守履歴、CHANGELOG、`ops`、`cli` / `ui`、`connect` / `app_update`、`locale` の責務を表にまとめています。詳細は [docs/design/section-01.md](docs/design/section-01.md) を参照してください。
+設定・種類・タイミング、保守の本体、保守履歴、CHANGELOG、`ops`、`cli` / `ui`、`connect` / `app_update`、`locale` の責務を表にまとめています。詳細は [docs/design/components-and-responsibilities.md](docs/design/components-and-responsibilities.md) を参照してください。
 
 ## データフロー
 
-hook の起動から、期限判定、worker、保守後検査、commit と push までの流れです。詳細は [docs/design/section-02.md](docs/design/section-02.md) を参照してください。
+hook の起動から、期限判定、worker、保守後検査、commit と push までの流れです。詳細は [docs/design/data-flow.md](docs/design/data-flow.md) を参照してください。
 
 ## 重要な不変条件
 
-設定の読み込み元、設定の書き込み経路、検査の主体、秘密値、状態 DB の版、Velopack 管理外での無作用を定めています。詳細は [docs/design/section-03.md](docs/design/section-03.md) を参照してください。
+設定の読み込み元、設定の書き込み経路、検査の主体、秘密値、状態 DB の版、Velopack 管理外での無作用を定めています。詳細は [docs/design/key-invariants.md](docs/design/key-invariants.md) を参照してください。
 
 ## 設計判断
 
-同意と propose の廃止、旧設定の変換、hook 経路で tokio を使わないこと、Setup 版の適用タイミング、上限違反の扱い、保守履歴、管理画面の常駐などを、理由とトレードオフとともに記録しています。詳細は [docs/design/section-04.md](docs/design/section-04.md) を参照してください。
+同意と propose の廃止、旧設定の変換、hook 経路で tokio を使わないこと、Setup 版の適用タイミング、上限違反の扱い、保守履歴、管理画面の常駐などを、理由とトレードオフとともに記録しています。詳細は [docs/design/design-decisions.md](docs/design/design-decisions.md) を参照してください。
 
 ## ローカライズ
 
-- 目的・言語の決め方: [docs/design/section-05.md](docs/design/section-05.md)
-- 辞書・状態との互換: [docs/design/section-06.md](docs/design/section-06.md)
+- 目的・言語の決め方: [docs/design/localization-purpose-and-language-choice.md](docs/design/localization-purpose-and-language-choice.md)
+- 辞書・状態との互換: [docs/design/localization-dictionary-and-state-compatibility.md](docs/design/localization-dictionary-and-state-compatibility.md)

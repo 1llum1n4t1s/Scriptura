@@ -20,11 +20,11 @@ Scriptura は、利用者が登録したリポジトリへの push 後に `AGENT
 
 次の詳細は、対象を変える前に該当ファイルを読みます。
 
-- モジュールの構成と責務（`src/`・`plugins/`・`xtask/`）: [docs/agents/section-01.md](docs/agents/section-01.md)
-- 設定の書き込み・schema・保守の検査・CHANGELOG・タイミング・保守履歴: [docs/agents/section-02.md](docs/agents/section-02.md)
-- hook・Claude Code の `settings.json`・管理画面・プラグインのスキル: [docs/agents/section-05.md](docs/agents/section-05.md)
+- モジュールの構成と責務（`src/`・`plugins/`・`xtask/`）: [docs/agents/modules-and-responsibilities.md](docs/agents/modules-and-responsibilities.md)
+- 設定の書き込み・schema・保守の検査・CHANGELOG・タイミング・保守履歴: [docs/agents/settings-and-maintenance-contracts.md](docs/agents/settings-and-maintenance-contracts.md)
+- hook・Claude Code の `settings.json`・管理画面・プラグインのスキル: [docs/agents/hooks-settings-ui-and-plugin.md](docs/agents/hooks-settings-ui-and-plugin.md)
 - Setup 版（Velopack）の配信・自動更新・登録: [docs/agents/setup-installer-velopack.md](docs/agents/setup-installer-velopack.md)
-- 9 言語の表示とローカライズの決め方: [docs/agents/section-04.md](docs/agents/section-04.md)
+- 9 言語の表示とローカライズの決め方: [docs/agents/localization.md](docs/agents/localization.md)
 
 ## 検証
 
