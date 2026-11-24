@@ -1,6 +1,6 @@
 [package]
 name = "scriptura"
-version = "1.0.13"
+version = "1.0.14"
 edition = "2024"
 rust-version = "1.100"
 description = "Keeps AGENTS.md, DESIGN.md and README.md of your own repositories up to date after each push."
