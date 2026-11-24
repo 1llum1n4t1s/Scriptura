@@ -978,6 +978,10 @@ pub fn fit_material(json: &mut Value, max_bytes: usize) {
     }
 }
 
+/// 既存の CHANGELOG への追記で、利用者から見える変更だけを確かめて書かせる指示（新規作成・遡りには足さない）。
+/// restricted では git を実行できず、前回のコミットが空のこともあるので、前の版が読めないときの代わりの確かめ方を含める。
+pub const VERIFY_BEHAVIOR_RULE: &str = "Write an entry only for a behavior change you have verified: trace the code from the entry point users reach (command, API, UI, setting) to the result they observe, in the pushed version and, when you can read it, in the previous version (use Git at the previously processed commit if you can run Git and it exists). When the previous version is unavailable, judge from the callers in the current code together with the push's diff and the material. If the observable result is the same, for example because a later step or a caller already produced the same error, it is not a user-visible change; do not write it. Commit subjects, code comments, test names and a difference inside a single function are clues, not evidence. If you cannot confirm the change in behavior, leave it out. If the commits in this push edited CHANGELOG.md themselves, treat their entries as the author's record for those commits: leave them as written, and add an entry only for a clearly verified omission. ";
+
 /// CHANGELOG のプロンプト断片を作る（I/O。CHANGELOG の種類が有効なときだけ呼ぶ）。
 /// 戻り値は（Rust が決めた指示文, 未信頼の資料の枠）。指示文は「記載指針」の後ろ、資料の枠はプロンプトの末尾に置く。
 /// 指示文はリポジトリ由来の文字列（タグ名・件名）を含めない。タグ名などは資料の JSON の中にだけ置き、
@@ -1012,6 +1016,7 @@ pub fn prompt_parts(
         rules.push_str("The current CHANGELOG.md has no `## ` sections. Keep the existing text unchanged as one continuous block, and put additions before or after the whole existing text. ");
     }
     if !material.creating {
+        rules.push_str(VERIFY_BEHAVIOR_RULE);
         match settings.on_release {
             OnRelease::Promote if material.has_pending => rules.push_str(
                 "The tags listed in pending_releases in the material do not have version sections yet. For each tag, move the changes up to that tag from Unreleased into a version section for that tag (match the heading to the existing format and use the tag's date from the material). Do nothing for tags that already have a version section. ",
