@@ -1,0 +1,22 @@
+<div data-activity-body data-now="{{ activity.now }}" data-count="{{ activity.items.len() }}" data-runs-latest="{{ activity.runs_latest }}">
+  <h3>{{ crate::locale::tr("ui.activity.maintenance") }}</h3>
+  {% if activity.items.is_empty() %}<p class="note">{{ crate::locale::tr("ui.activity.none") }}</p>
+  {% else %}<ul class="activity-list">{% for a in activity.items %}<li class="activity-item">
+    <div class="activity-head"><span class="live-dot" aria-hidden="true"></span>{% if let Some(i) = a.repo_index %}<a href="/repos/{{ i }}" title="{{ a.repo_root }}">{{ a.repo_name }}</a>{% else %}<span title="{{ a.repo_root }}">{{ a.repo_name }}</span>{% endif %} <span class="badge">{{ a.phase }}</span></div>
+    <dl class="activity-meta">
+      <div><dt>{{ crate::locale::tr("ui.activity.origin") }}</dt><dd>{{ a.origin }}</dd></div>
+      <div><dt>{{ crate::locale::tr("ui.activity.elapsed") }}</dt><dd><time data-since="{{ a.started_at }}">{{ a.elapsed }}</time></dd></div>
+      {% if let Some(d) = a.deadline_at %}<div><dt>{{ crate::locale::tr("ui.activity.remaining") }}</dt><dd><time data-until="{{ d }}">{{ a.remaining }}</time></dd></div>{% endif %}
+      <div><dt>{{ crate::locale::tr("ui.activity.pid") }}</dt><dd>{{ a.pid }}</dd></div>
+      {% if let Some(w) = a.worker_pid %}<div><dt>{{ crate::locale::tr("ui.activity.worker_pid") }}</dt><dd>{{ w }}</dd></div>{% endif %}
+    </dl>
+  </li>{% endfor %}</ul>
+  {% endif %}
+  <h3>{{ crate::locale::tr("ui.activity.processes") }}</h3>
+  {% if activity.process_error %}<p class="note">{{ crate::locale::tr("ui.activity.processes_error") }}</p>
+  {% else if activity.processes.is_empty() %}<p class="note">{{ crate::locale::tr("ui.activity.processes_none") }}</p>
+  {% else %}<ul class="proc-list">{% for p in activity.processes %}<li>
+    <span>PID {{ p.pid }}</span><span class="muted">{{ crate::locale::tr("ui.activity.process_started") }} {% let t = p.started %}{% include "ui/time_secs.html" %}</span><span class="muted">{{ p.kind }}</span>
+  </li>{% endfor %}</ul>
+  {% endif %}
+</div>

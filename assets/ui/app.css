@@ -214,6 +214,32 @@ td a, td .path, .repo-list .path { overflow-wrap: anywhere; }
 .filter-form label { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; max-width: 100%; }
 .filter-form select { width: min(360px, 100%); }
 /* 詳細は文書の列に入れると潰れるため、行の下に全幅の行を足して、本体の行とは線を引かずにつなげる。 */
+/* 保守履歴の表: 列幅を固定する（自動の列幅だと、長い理由や詳細の行に押されて「文書」の列が 1 文字幅まで潰れる）。 */
+.runs-table { table-layout: fixed; min-width: 720px; }
+.runs-table th:nth-child(1) { width: 170px; }
+.runs-table th:nth-child(2) { width: 18%; }
+.runs-table th:nth-child(3) { width: 32%; }
+.runs-table.no-repo th:nth-child(2) { width: 38%; }
+.runs-table.no-repo th:nth-child(3) { width: auto; }
+/* 概要の「最近の保守」: 520px 未満の器でだけ .table-wrap 内で横スクロールにする（時刻 150px・リポジトリ 20%・結果 30%・残りが文書）。 */
+.runs-table.runs-overview { min-width: 520px; }
+.runs-table.runs-overview th:nth-child(1) { width: 150px; }
+.runs-table td { overflow-wrap: anywhere; }
+.runs-table td .badge { max-width: 100%; white-space: normal; }
+/* 概要の「実行中」パネル: 表ではなくカードと折り返す行で並べ、狭い画面でも横にあふれさせない。 */
+.activity-panel h3 { margin: 14px 0 8px; font-size: 13px; color: var(--muted); }
+.activity-panel h2 + [data-activity-body] > h3:first-child { margin-top: 0; }
+.activity-list, .proc-list { list-style: none; margin: 0 0 8px; padding: 0; display: grid; gap: 10px; }
+.activity-item { min-width: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper); }
+.activity-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; font-weight: 600; overflow-wrap: anywhere; }
+.activity-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 6px 14px; margin: 8px 0 0; }
+.activity-meta > div { min-width: 0; }
+.activity-meta dt { color: var(--muted); font-size: 11px; }
+.activity-meta dd { margin: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.proc-list li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 14px; min-width: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.live-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); animation: live-pulse 1.6s ease-in-out infinite; }
+@keyframes live-pulse { 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
 tr:has(+ .run-detail-row) > td { border-bottom: 0; padding-bottom: 4px; }
 .run-detail-row > td { padding-top: 0; }
 .run-details > summary { cursor: pointer; color: var(--accent); font-size: 12px; font-weight: 600; }

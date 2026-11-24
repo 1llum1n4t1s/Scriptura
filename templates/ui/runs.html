@@ -8,7 +8,7 @@
 </div>
 <section class="panel">
   {% if rows.is_empty() %}<p class="note">{{ crate::locale::tr("ui.runs.none") }}</p>{% else %}
-  <div class="table-wrap"><table>
+  <div class="table-wrap"><table class="runs-table">
     <thead><tr><th>{{ crate::locale::tr("ui.runs.time") }}</th><th>{{ crate::locale::tr("ui.common.repository") }}</th><th>{{ crate::locale::tr("ui.runs.outcome") }}</th><th>{{ crate::locale::tr("ui.runs.documents") }}</th></tr></thead>
     <tbody>
     {% for r in rows %}<tr>

@@ -54,6 +54,10 @@ pub fn capture(
     let mut job = if managed { Some(Job::new()?) } else { None };
     let deadline = Instant::now() + timeout;
     let mut child = cmd.spawn()?;
+    if managed {
+        // 保守の記録へ worker の PID を残す（best-effort。記録を持たないスレッドでは何もしない）。
+        crate::activity::worker_spawned(child.id());
+    }
     #[cfg(windows)]
     if let Some(job) = &job
         && let Err(e) = job.attach(&child)

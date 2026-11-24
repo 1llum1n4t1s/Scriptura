@@ -3,6 +3,12 @@
 <div class="heading"><h1>{{ crate::locale::tr("ui.nav.overview") }}</h1>{% if repos.is_empty() %}<a class="button primary" href="/repos">{{ crate::locale::tr("ui.overview.register") }}</a>{% endif %}</div>
 {% for w in warnings %}<p class="notice warning">{{ w }}</p>
 {% endfor %}
+<section class="panel activity-panel" id="overview-activity" data-activity data-stale="{{ crate::locale::tr("ui.activity.stale") }}" data-expired="{{ crate::locale::tr("ui.activity.expired") }}">
+  <h2>{{ crate::locale::tr("ui.activity.title") }}</h2>
+  {% include "ui/activity_body.html" %}
+  <p class="note" role="status" data-activity-stale hidden></p>
+  <noscript><p class="note">{{ crate::locale::tr("ui.activity.noscript") }}</p></noscript>
+</section>
 <div class="overview-grid">
 <section class="panel" id="overview-repos">
   <h2>{{ crate::locale::tr("ui.overview.repos") }} <span class="count">{{ repos.len() }}</span></h2>
@@ -20,17 +26,7 @@
 </section>
 <section class="panel" id="overview-runs">
   <h2>{{ crate::locale::tr("ui.runs.recent") }}</h2>
-  {% if recent_runs.is_empty() %}<p class="note">{{ crate::locale::tr("ui.runs.none") }}</p>{% else %}
-  <div class="table-wrap"><table>
-    <thead><tr><th>{{ crate::locale::tr("ui.runs.time") }}</th><th>{{ crate::locale::tr("ui.common.repository") }}</th><th>{{ crate::locale::tr("ui.runs.outcome") }}</th><th>{{ crate::locale::tr("ui.runs.documents") }}</th></tr></thead>
-    <tbody>{% for r in recent_runs %}<tr>
-      <td class="nowrap">{% let t = r.time %}{% include "ui/time_secs.html" %}{% if r.attempts > 1 %} <span class="badge">&times;{{ r.attempts }}</span>{% endif %}</td>
-      <td>{% if let Some(i) = r.repo_index %}<a href="/repos/{{ i }}" title="{{ r.repo_label }}">{{ r.repo_name }}</a>{% else %}<span title="{{ r.repo_label }}">{{ r.repo_name }}</span>{% endif %}</td>
-      <td><span class="badge{% if !r.outcome_class.is_empty() %} {{ r.outcome_class }}{% endif %}">{{ r.outcome }}</span>{% if !r.message.is_empty() %}<div class="error-text">{{ r.message }}</div>{% endif %}</td>
-      <td>{% for d in r.documents %}<div class="path">{{ d }}</div>{% endfor %}</td>
-    </tr>{% endfor %}</tbody>
-  </table></div>
-  {% endif %}
+  <div data-activity-runs>{% include "ui/recent_runs.html" %}</div>
   <p><a href="/history">{{ crate::locale::tr("ui.overview.runs_all") }}</a></p>
 </section>
 </div>

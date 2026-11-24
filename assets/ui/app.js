@@ -1,6 +1,6 @@
 "use strict";
 // Scriptura 管理画面の少量の JS（CSP で同一オリジンのファイルだけを許可。インライン script は使わない）。
-// 役割は文字数カウンター・選択欄とチェックボックスの自動送信・「アプリ」画面の「アプリの更新」パネルの操作だけ。送信内容の検査はすべてサーバー側で行う（ここでの表示は目安）。
+// 役割は文字数カウンター・選択欄とチェックボックスの自動送信・「アプリ」画面の「アプリの更新」パネルの操作・概要の「実行中」パネルの自動更新だけ。送信内容の検査はすべてサーバー側で行う（ここでの表示は目安）。
 // 単位の文言は表示言語に合わせてサーバーが body の data 属性に入れる（CSP のためインライン script は使わない）。
 (() => {
   const encoder = new TextEncoder();
@@ -41,7 +41,151 @@
     }
     const panel = document.querySelector("[data-updates]");
     if (panel) setupUpdates(panel);
+    const activity = document.querySelector("[data-activity]");
+    if (activity) setupActivity(activity);
   });
+
+  // 概要の「実行中」パネル。2 秒ごとに GET /activity（サーバーが作る HTML の断片）を取り、パネルの中身だけを置き換える。
+  // 経過・残りの秒は取得の間も 1 秒ごとにここで進める（サーバー時刻との差を補正）。JS が無い環境では、開いた時点の表示のまま。
+  function setupActivity(panel) {
+    const POLL_MS = 2000;
+    const text = name => panel.dataset[name] || "";
+    const note = panel.querySelector("[data-activity-stale]");
+    const body = () => panel.querySelector("[data-activity-body]");
+    let skew = 0; // サーバー時刻 - ブラウザー時刻（ミリ秒）
+    let inflight = false;
+    let stopped = false;
+    const pad = n => String(n).padStart(2, "0");
+    // サーバーの `views::clock` と同じ形（1 時間以上は H:MM:SS、未満は M:SS）。
+    const clock = total => {
+      const s = Math.max(0, Math.floor(total));
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      return h > 0 ? `${h}:${pad(m)}:${pad(s % 60)}` : `${m}:${pad(s % 60)}`;
+    };
+    const tick = () => {
+      const now = Math.floor((Date.now() + skew) / 1000);
+      for (const el of panel.querySelectorAll("[data-since]")) {
+        const next = clock(now - Number(el.dataset.since));
+        if (el.textContent !== next) el.textContent = next;
+      }
+      for (const el of panel.querySelectorAll("[data-until]")) {
+        const next = clock(Number(el.dataset.until) - now);
+        if (el.textContent !== next) el.textContent = next;
+      }
+    };
+    // 秒だけが違う断片を「同じ」とみなすための比較用の文字列。
+    const signature = element => {
+      const copy = element.cloneNode(true);
+      copy.removeAttribute("data-now");
+      copy.removeAttribute("data-runs-latest");
+      for (const el of copy.querySelectorAll("[data-since],[data-until]")) el.textContent = "";
+      return copy.outerHTML;
+    };
+    // フォーカスやテキスト選択がパネルの中にあるあいだは、置き換えを次の回へ延ばす。
+    const holding = element => {
+      const active = document.activeElement;
+      if (active && active !== document.body && element.contains(active)) return true;
+      const selection = document.getSelection();
+      return !!selection && !selection.isCollapsed &&
+        (element.contains(selection.anchorNode) || element.contains(selection.focusNode));
+    };
+    const showNote = message => {
+      if (!note) return;
+      note.textContent = message || "";
+      note.hidden = !message;
+    };
+    // 置き換えを延ばす最大の回数（2 秒おきなので約 10 秒）。超えたら、選択やフォーカスがあっても置き換える。
+    const MAX_HOLDS = 5;
+    let bodyHolds = 0;
+    let runsHolds = 0;
+    let held = false; // 保守の部分の置き換えを延ばしている間は、古い行の経過を進めない。
+    // 「最近の保守」を取り直す必要があるか。成功して反映するまで覚える。
+    let runsPending = false;
+    const latestOf = element => (element && element.dataset.runsLatest) || "";
+    const initialBody = body();
+    let reflectedLatest = latestOf(initialBody);
+    // 置き換えたとき、フォーカスしていたリンクと同じ href があれば、フォーカスを戻す。
+    const replaceKeepingFocus = (current, next) => {
+      const active = document.activeElement;
+      const href = active && active !== document.body && current.contains(active) && active.tagName === "A"
+        ? active.getAttribute("href") : null;
+      const imported = document.importNode(next, true);
+      current.replaceWith(imported);
+      if (href === null) return;
+      for (const link of imported.querySelectorAll("a[href]")) {
+        if (link.getAttribute("href") === href) { link.focus(); break; }
+      }
+    };
+    // 保守の部分を反映する。
+    const applyBody = doc => {
+      const next = doc.querySelector("[data-activity-body]");
+      if (!next) throw new Error("fragment");
+      const current = body();
+      if (!current) return;
+      if (Number(next.dataset.count) < Number(current.dataset.count)) runsPending = true;
+      if (latestOf(next) !== reflectedLatest) runsPending = true;
+      if (signature(next) === signature(current)) {
+        skew = Number(next.dataset.now) * 1000 - Date.now();
+        bodyHolds = 0; held = false; tick();
+        return;
+      }
+      if (holding(current) && bodyHolds < MAX_HOLDS) { bodyHolds += 1; held = true; return; }
+      bodyHolds = 0; held = false;
+      skew = Number(next.dataset.now) * 1000 - Date.now();
+      replaceKeepingFocus(current, next);
+      tick();
+    };
+    // 「最近の保守」を反映できたら true。延ばしたときは false（次の回で再試行する）。
+    const applyRuns = doc => {
+      const next = doc.querySelector("[data-activity-runs]");
+      const current = document.querySelector("[data-activity-runs]");
+      if (!next || !current) throw new Error("fragment");
+      const latest = latestOf(doc.querySelector("[data-activity-body]"));
+      if (next.outerHTML !== current.outerHTML) {
+        if (holding(current) && runsHolds < MAX_HOLDS) { runsHolds += 1; return false; }
+        replaceKeepingFocus(current, next);
+      }
+      runsHolds = 0;
+      reflectedLatest = latest;
+      return true;
+    };
+    const load = async withRuns => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10000);
+      try {
+        const response = await fetch(withRuns ? "/activity?runs=1" : "/activity", {
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "Accept": "text/html" },
+          signal: controller.signal,
+        });
+        if (response.status === 401) { const error = new Error("401"); error.unauthorized = true; throw error; }
+        if (!response.ok) throw new Error(String(response.status));
+        return new DOMParser().parseFromString(await response.text(), "text/html");
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    const poll = async () => {
+      if (inflight || stopped || document.hidden) return;
+      inflight = true;
+      try {
+        applyBody(await load(false));
+        if (runsPending && applyRuns(await load(true))) runsPending = false;
+        showNote("");
+      } catch (error) {
+        if (error && error.unauthorized) { stopped = true; showNote(text("expired")); } else showNote(text("stale"));
+      } finally {
+        inflight = false;
+      }
+    };
+    if (initialBody) skew = Number(initialBody.dataset.now) * 1000 - Date.now();
+    tick();
+    setInterval(() => { if (!document.hidden && !held) tick(); }, 1000);
+    setInterval(poll, POLL_MS);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) { tick(); poll(); } });
+  }
 
   // 「アプリの更新」パネル。サーバーは Accept: application/json の POST に JSON（status・message）で答える。
   // JS が無い環境では、同じフォームが HTML の結果画面を返す（インストールの form も最初から見えている）。
@@ -75,16 +219,27 @@
         clearTimeout(timer);
       }
     };
-    // 更新を適用して再起動すると、セッションの秘密が新しくなり古い Cookie は 401 になる。自動で入り直さず、
-    // 401 を見たら「トレイ（メニューバー）のアイコンから開き直してください」へ切り替える（最大 180 秒）。
-    const waitForRestart = async () => {
+    // 更新を適用して再起動すると、セッションの秘密が新しくなり古い Cookie は 401 になる。再起動を検知したら
+    // （サーバーが一度つながらなくなった後に応答した、または 401）、サーバーが返した引き継ぎ鍵（この変数だけに持ち、
+    // 保存しない）で /auth へ入り直す。旧サーバーがまだ 200 で応答している間は鍵を使わない。鍵が無い、または
+    // 最大 180 秒待っても再起動を検知できないときは、「トレイ（メニューバー）のアイコンから開き直してください」へ切り替える。
+    const waitForRestart = async handoffKey => {
+      let wasDown = false;
       for (let i = 0; i < 90; i += 1) {
         await new Promise(resolve => setTimeout(resolve, 2000));
         try {
           const response = await fetch("/", { cache: "no-store", credentials: "same-origin" });
-          if (response.status === 401) { show(text("msgDone")); return; }
-        } catch (_) { /* 停止中・起動中。待ち続ける */ }
+          if (response.status === 401 || (response.status === 200 && wasDown)) {
+            if (handoffKey) {
+              location.replace(`/auth?key=${encodeURIComponent(handoffKey)}&next=updated`);
+            } else {
+              show(text("msgDone"));
+            }
+            return;
+          }
+        } catch (_) { wasDown = true; /* 停止中・起動中。待ち続ける */ }
       }
+      show(text("msgDone"));
     };
     installForm.hidden = true;
     const check = async () => {
@@ -148,7 +303,7 @@
         show(data.message);
         if (data.status === "applying") {
           installForm.hidden = true;
-          if (data.restarts) { show(text("msgWaiting")); await waitForRestart(); }
+          if (data.restarts) { show(text("msgWaiting")); await waitForRestart(typeof data.handoff_key === "string" ? data.handoff_key : ""); }
           return;
         }
       } catch (_) {

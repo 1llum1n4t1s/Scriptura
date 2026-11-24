@@ -242,6 +242,69 @@ pub struct OverviewPage {
     pub active_note: String,
     /// 最近の保守（保守履歴の新しい順 5 件）。
     pub recent_runs: Vec<RunView>,
+    /// 「実行中」パネル（ページを開いた時点の状態）。
+    pub activity: ActivityView,
+}
+
+/// 「実行中」の保守 1 件の表示用の行（コマンド行・ヘッド・リモートなどは持たない）。
+#[derive(Clone, Debug)]
+pub struct ActivityItem {
+    pub repo_name: String,
+    /// title に出す絶対パス。
+    pub repo_root: String,
+    /// 登録済みならそのリポジトリの番号。
+    pub repo_index: Option<usize>,
+    pub origin: String,
+    pub phase: String,
+    pub started_at: u64,
+    pub deadline_at: Option<u64>,
+    /// 取得時点の経過（`H:MM:SS` / `M:SS`）。JS が 1 秒ごとに進める。
+    pub elapsed: String,
+    /// worker の期限までの残り（期限があるときだけ意味を持つ）。
+    pub remaining: String,
+    pub pid: u32,
+    pub worker_pid: Option<u32>,
+}
+
+/// Scriptura のプロセス 1 件。
+#[derive(Clone, Debug)]
+pub struct ProcItem {
+    pub pid: u32,
+    /// 開始時刻（RFC 3339。`time_secs.html` が整形する）。
+    pub started: String,
+    pub kind: String,
+}
+
+/// 「実行中」パネルの内容。`/` と `/activity` が同じ include で描く。
+#[derive(Clone, Debug, Default)]
+pub struct ActivityView {
+    /// サーバーの現在時刻（UNIX 秒。JS が経過・残りの補正に使う）。
+    pub now: u64,
+    pub items: Vec<ActivityItem>,
+    pub processes: Vec<ProcItem>,
+    /// プロセスの列挙に失敗したか。
+    pub process_error: bool,
+    /// 最新の保守履歴の識別値（変われば履歴が増えた・更新された。無ければ空）。JS が「最近の保守」の取り直しに使う。
+    pub runs_latest: String,
+}
+
+/// 経過・残りの表示（1 時間以上は `H:MM:SS`、それ未満は `M:SS`）。assets/ui/app.js の `clock` と同じ形。
+pub fn clock(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, secs % 3600 / 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// `GET /activity` の断片（`runs` があるときは「最近の保守」も載せる）。
+#[derive(Template)]
+#[template(path = "ui/activity.html")]
+pub struct ActivityFragment {
+    pub activity: ActivityView,
+    pub show_runs: bool,
+    pub recent_runs: Vec<RunView>,
 }
 
 /// 設定 › アプリ: アプリの更新・版と導入の形・設定ファイルの場所と状態。

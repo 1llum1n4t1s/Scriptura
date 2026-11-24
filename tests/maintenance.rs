@@ -3449,6 +3449,8 @@ fn changelog_prompt_carries_rules_and_history_and_promote_is_committed() {
         "CHANGELOG maintenance rules",
         "The tags listed in pending_releases",
         "Keep version references in README and CHANGELOG consistent",
+        // 既存の CHANGELOG への追記は、入口から結果まで確かめた変更だけを書く（restricted でも前の版が読めない代替つき）。
+        scriptura::changelog::VERIFY_BEHAVIOR_RULE,
     ] {
         assert!(prompt.contains(needle), "{needle}: {prompt}");
     }
@@ -3508,6 +3510,10 @@ fn new_changelog_is_backfilled_from_tags_with_the_builtin_template() {
         "{prompt}"
     );
     assert!(prompt.contains("<<<TEMPLATE>>>\n# Changelog"), "{prompt}");
+    assert!(
+        !prompt.contains("Write an entry only for a behavior change you have verified"),
+        "新規作成には入れない: {prompt}"
+    );
     assert!(
         prompt.contains("\"releases\":[{\"tag\":\"v0.1.0\""),
         "{prompt}"
@@ -5017,4 +5023,360 @@ fn restoring_a_checkpoint_only_touches_paths_unchanged_since_the_measurement() {
     assert_eq!(fs::read_to_string(&design).unwrap(), "the user's edit");
     assert!(!fresh.exists());
     assert!(!f.root.join("docs").exists());
+}
+
+// ---------------------------------------------------------------------------
+// 実行中の保守の記録（`activity`）
+// ---------------------------------------------------------------------------
+fn activity_json_files() -> Vec<PathBuf> {
+    fs::read_dir(scriptura::activity::dir())
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+impl Fixture {
+    /// 新しい push を 1 つ作り、run-now で保守できる状態にする。
+    fn ready_for_run_now(&self) {
+        self.hook("UserPromptSubmit");
+        self.push_change("activity");
+    }
+}
+#[test]
+fn activity_is_visible_while_the_worker_runs_and_removed_afterwards() {
+    let f = Fixture::new();
+    f.ready_for_run_now();
+    unsafe { env::set_var("HOOK_STUB_SLEEP", "4") };
+    let root = f.root.to_string_lossy().into_owned();
+    let result = std::thread::scope(|scope| {
+        let run = scope.spawn(|| run_now(&f.root, MaintenanceOptions::default()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let seen = loop {
+            let found = scriptura::activity::list()
+                .into_iter()
+                .find(|a| a.repo_root == root && a.phase == "worker" && a.worker_pid.is_some());
+            if let Some(found) = found {
+                break found;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no running activity was observed"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(seen.pid, std::process::id());
+        assert_eq!(seen.origin, "run_now");
+        assert_eq!(seen.fixup, 0);
+        assert!(seen.deadline_at.is_some_and(|at| at >= seen.phase_at));
+        let me: Vec<_> = scriptura::activity::processes()
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.is_self)
+            .collect();
+        assert_eq!(me.len(), 1);
+        assert_eq!(me[0].pid, std::process::id());
+        run.join().unwrap()
+    });
+    assert_eq!(result.unwrap(), None);
+    assert!(scriptura::activity::list().is_empty());
+    assert!(activity_json_files().is_empty());
+}
+#[test]
+fn activity_is_removed_when_the_worker_fails_or_times_out() {
+    let f = Fixture::new();
+    f.ready_for_run_now();
+    unsafe { env::set_var("HOOK_STUB_EXIT", "7") };
+    assert!(
+        run_now(&f.root, MaintenanceOptions::default())
+            .unwrap()
+            .is_some()
+    );
+    assert!(scriptura::activity::list().is_empty());
+    assert!(activity_json_files().is_empty());
+    unsafe {
+        env::remove_var("HOOK_STUB_EXIT");
+        env::set_var("HOOK_STUB_SLEEP", "30");
+        env::set_var("SCRIPTURA_TEST_WORKER_TIMEOUT_SECS", "1");
+    }
+    assert!(
+        run_now(&f.root, MaintenanceOptions::default())
+            .unwrap()
+            .is_some()
+    );
+    assert!(scriptura::activity::list().is_empty());
+    assert!(activity_json_files().is_empty());
+}
+#[test]
+fn activity_list_ignores_dead_mismatched_and_broken_records() {
+    let f = Fixture::new();
+    let dir = scriptura::activity::dir();
+    let guard = scriptura::activity::begin("hook", &f.root);
+    let mine = activity_json_files();
+    assert_eq!(mine.len(), 1);
+    let valid: Value = serde_json::from_slice(&fs::read(&mine[0]).unwrap()).unwrap();
+    assert_eq!(scriptura::activity::list().len(), 1);
+    drop(guard);
+    assert!(activity_json_files().is_empty());
+    // 終了済みの PID。
+    let mut child = Command::new("git")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let dead_pid = child.id();
+    child.wait().unwrap();
+    let mut dead = valid.clone();
+    dead["pid"] = json!(dead_pid);
+    let mut mismatched = valid.clone();
+    mismatched["process_started"] = json!(valid["process_started"].as_u64().unwrap() + 1);
+    let mut future = valid.clone();
+    future["version"] = json!(2);
+    fs::create_dir_all(&dir).unwrap();
+    for (name, body) in [
+        ("dead.json", dead.to_string()),
+        ("mismatched.json", mismatched.to_string()),
+        ("future.json", future.to_string()),
+        ("broken.json", "{not json".to_owned()),
+        ("huge.json", " ".repeat(64 * 1024)),
+        ("ignored.txt", valid.to_string()),
+    ] {
+        fs::write(dir.join(name), body).unwrap();
+    }
+    // 読み取りは削除しない。確認できた記録がないので空。
+    assert!(scriptura::activity::list().is_empty());
+    assert_eq!(activity_json_files().len(), 5);
+    // 保守の開始時の掃除は、生存していないと確認できたものだけを消す（壊れた・未知の版・大きすぎるものは残す）。
+    let guard = scriptura::activity::begin("hook", &f.root);
+    let mut names: Vec<_> = activity_json_files()
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 4, "{names:?}");
+    assert!(
+        names
+            .iter()
+            .all(|n| n != "dead.json" && n != "mismatched.json")
+    );
+    assert_eq!(scriptura::activity::list().len(), 1);
+    drop(guard);
+}
+#[test]
+fn maintenance_succeeds_when_the_activity_folder_cannot_be_written() {
+    let f = Fixture::new();
+    f.ready_for_run_now();
+    // `activity` が通常のファイルなら、フォルダーも記録も作れない。
+    let blocked = scriptura::activity::dir();
+    fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+    fs::write(&blocked, "not a folder").unwrap();
+    assert_eq!(
+        run_now(&f.root, MaintenanceOptions::default()).unwrap(),
+        None
+    );
+    assert_eq!(f.state()["phase"], "complete");
+    assert_eq!(fs::read_to_string(&blocked).unwrap(), "not a folder");
+}
+/// 更新時刻を `age` だけ過去にする。
+fn age_file(path: &std::path::Path, age: Duration) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(SystemTime::now() - age)
+        .unwrap();
+}
+#[test]
+fn activity_sweep_removes_dead_temp_files_and_stale_unreadable_records_only() {
+    let f = Fixture::new();
+    let dir = scriptura::activity::dir();
+    fs::create_dir_all(&dir).unwrap();
+    let mut child = Command::new("git")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    let me = std::process::id();
+    let day = Duration::from_secs(25 * 60 * 60);
+    let future = json!({"version": 2, "pid": dead}).to_string();
+    // (名前, 中身, 更新を古くするか, 消えるべきか)
+    let cases: Vec<(String, String, bool, bool)> = vec![
+        // 書きかけの一時ファイル: PID の死亡を確認できたものだけ消す（更新時刻は問わない）。
+        (format!("{dead}-a.tmp"), "{".into(), false, true),
+        (format!("{me}-a.tmp"), "{".into(), false, false),
+        ("nopid.tmp".into(), "{".into(), true, false),
+        // 読めない・壊れた・未知の版・大きすぎる記録: PID の死亡を確認でき、24 時間以上たったものだけ。
+        (
+            format!("{dead}-broken-old.json"),
+            "{not json".into(),
+            true,
+            true,
+        ),
+        (
+            format!("{dead}-future-old.json"),
+            future.clone(),
+            true,
+            true,
+        ),
+        (
+            format!("{dead}-huge-old.json"),
+            " ".repeat(64 * 1024),
+            true,
+            true,
+        ),
+        (
+            format!("{dead}-broken-new.json"),
+            "{not json".into(),
+            false,
+            false,
+        ),
+        (
+            format!("{me}-broken-old.json"),
+            "{not json".into(),
+            true,
+            false,
+        ),
+        (
+            "nopid-broken-old.json".into(),
+            "{not json".into(),
+            true,
+            false,
+        ),
+        ("broken-old.json".into(), "{not json".into(), true, false),
+    ];
+    for (name, body, old, _) in &cases {
+        fs::write(dir.join(name), body).unwrap();
+        if *old {
+            age_file(&dir.join(name), day);
+        }
+    }
+    let guard = scriptura::activity::begin("hook", &f.root);
+    for (name, _, _, removed) in &cases {
+        assert_eq!(!dir.join(name).exists(), *removed, "{name}");
+    }
+    drop(guard);
+}
+#[test]
+fn threads_in_one_process_keep_separate_activity_records() {
+    // 保守本体は poll lock で 1 件ずつ（後の run-now は busy を返す）ので、同じプロセスで同時に記録を持つのは
+    // 記録を直接開く 2 スレッドになる。記録はスレッドごとに別のファイルで、段階の更新・終了も互いに触れない。
+    let f = Fixture::new();
+    let (ready, release) = (std::sync::Barrier::new(3), std::sync::Barrier::new(3));
+    let first = f.root.join("one");
+    let second = f.root.join("two");
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            let guard = scriptura::activity::begin("run_now", &first);
+            scriptura::activity::phase("checking");
+            ready.wait();
+            release.wait();
+            drop(guard);
+        });
+        let b = scope.spawn(|| {
+            let guard = scriptura::activity::begin("run_now", &second);
+            scriptura::activity::worker(1, Duration::from_secs(600));
+            ready.wait();
+            release.wait();
+            // 相手が終わっても、自分の記録は残って更新できる。
+            scriptura::activity::phase("pushing");
+            drop(guard);
+        });
+        ready.wait();
+        let found = scriptura::activity::list();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(activity_json_files().len(), 2);
+        let of = |root: &std::path::Path| {
+            found
+                .iter()
+                .find(|a| a.repo_root == root.to_string_lossy())
+                .unwrap()
+        };
+        assert_eq!(
+            (of(&first).phase.as_str(), of(&first).fixup),
+            ("checking", 0)
+        );
+        assert_eq!(
+            (of(&second).phase.as_str(), of(&second).fixup),
+            ("fixup", 1)
+        );
+        release.wait();
+        a.join().unwrap();
+        b.join().unwrap();
+    });
+    assert!(scriptura::activity::list().is_empty());
+    assert!(activity_json_files().is_empty());
+}
+#[test]
+fn a_second_run_now_while_one_runs_is_busy_and_leaves_one_record() {
+    let f = Fixture::new();
+    f.ready_for_run_now();
+    unsafe { env::set_var("HOOK_STUB_SLEEP", "4") };
+    let root = f.root.to_string_lossy().into_owned();
+    std::thread::scope(|scope| {
+        let run = scope.spawn(|| run_now(&f.root, MaintenanceOptions::default()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !scriptura::activity::list()
+            .iter()
+            .any(|a| a.repo_root == root && a.worker_pid.is_some())
+        {
+            assert!(std::time::Instant::now() < deadline && !run.is_finished());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // 同じプロセスの別スレッドからの run-now は、保守を始めず（記録を増やさず）見送る。
+        let second = run_now(&f.root, MaintenanceOptions::default()).unwrap();
+        assert!(second.is_some(), "busy の説明が返るはず");
+        assert_eq!(activity_json_files().len(), 1);
+        assert_eq!(run.join().unwrap().unwrap(), None);
+    });
+    assert!(activity_json_files().is_empty());
+}
+#[test]
+fn a_fixup_run_is_visible_as_fixup_one_in_the_real_loop() {
+    let config = kinds_config(|c| arch(c).max_chars = Some(10));
+    let f = Fixture::with_config(Some(config));
+    f.commit_push_file("docs/ARCHITECTURE.md", "short");
+    f.hook("UserPromptSubmit");
+    f.push_change("limit");
+    // 1 回目は 20 文字（超過）、2 回目（追い修正）で 8 文字に収め、書いた後で居座る。
+    f.writes(json!([
+        {f.arch_path(): "x".repeat(20)},
+        {f.arch_path(): "x".repeat(8)},
+    ]));
+    unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "2:4") };
+    let root = f.root.to_string_lossy().into_owned();
+    std::thread::scope(|scope| {
+        let run = scope.spawn(|| f.hook("Stop"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut phases = Vec::new();
+        let seen = loop {
+            let all = scriptura::activity::list();
+            for a in &all {
+                let item = (a.phase.clone(), a.fixup, a.worker_pid.is_some());
+                if !phases.contains(&item) {
+                    phases.push(item);
+                }
+            }
+            let found = all
+                .into_iter()
+                .find(|a| a.repo_root == root && a.phase == "fixup" && a.worker_pid.is_some());
+            if let Some(found) = found {
+                break found;
+            }
+            assert!(
+                std::time::Instant::now() < deadline && !run.is_finished(),
+                "no fixup activity was observed: {phases:?} runs={}",
+                f.worker_runs()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(seen.fixup, 1);
+        assert!(seen.deadline_at.is_some());
+        assert_eq!(run.join().unwrap(), None);
+    });
+    assert!(scriptura::activity::list().is_empty());
 }

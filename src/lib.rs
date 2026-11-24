@@ -1,3 +1,5 @@
+// 実行中の保守の記録と読み取り（管理画面の「いま動いている保守とプロセス」の根拠。feature `ui` に依存しない）。
+pub mod activity;
 pub mod app;
 // Setup（Velopack）導入版の更新・登録（ログオン時の適用・settings.json への登録・自動更新）。
 pub mod app_update;

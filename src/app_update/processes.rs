@@ -91,12 +91,13 @@ fn list_processes() -> std::io::Result<Vec<(u32, PathBuf)>> {
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
         let mut found = Vec::new();
+        // パスの受け皿は全プロセスで使い回す（毎回 64KB を確保しない）。
+        let mut buffer = vec![0u16; 32 * 1024];
         let mut more = Process32FirstW(snapshot, &mut entry) != 0;
         while more {
             let pid = entry.th32ProcessID;
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if !handle.is_null() {
-                let mut buffer = vec![0u16; 32 * 1024];
                 let mut length = buffer.len() as u32;
                 if QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) != 0 {
                     found.push((
@@ -249,6 +250,245 @@ fn list_processes() -> std::io::Result<Vec<(u32, PathBuf)>> {
         }
     }
     Ok(found)
+}
+
+/// プロセスの開始時刻。`id` は同じプロセスを見分けるための識別値（OS ごとに単位が違うので、
+/// 比較にだけ使う。再利用された PID は別の値になる）、`unix_secs` は表示用の UNIX 秒。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Started {
+    pub id: u64,
+    pub unix_secs: u64,
+}
+
+/// PID の生存の確認結果。確認できないとき（権限不足など）は `Unknown`（呼び出し側は残す・消さない側へ倒す）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Probe {
+    Running(Started),
+    Gone,
+    Unknown,
+}
+
+/// 導入先に関係なく、自分と同じ実行ファイルから動いている Scriptura プロセスの ID（自分を含む）。
+/// Linux の AppImage は起動のたびに exe のパスが変わるため、`APPIMAGE` の一致（`others_in` と同じ手掛かり）で
+/// 同じ導入のプロセスを集め、実行名が自分と同じものだけに絞る（子の git・worker を数えない）。
+/// 列挙できなければ Err。個々のプロセスの失敗は読み飛ばす。
+pub(crate) fn same_image_pids() -> std::io::Result<Vec<u32>> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let own = std::env::current_exe()?;
+        #[cfg(target_os = "macos")]
+        let own = std::fs::canonicalize(&own).unwrap_or(own);
+        let own = normalize(&own);
+        Ok(list_processes()?
+            .into_iter()
+            .filter(|(_, image)| normalize(image) == own)
+            .map(|(pid, _)| pid)
+            .collect())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let own_pid = std::process::id();
+        let own_exe = std::fs::read_link("/proc/self/exe")?;
+        let name = own_exe.file_name().map(ToOwned::to_owned);
+        let same_name = |pid: u32| {
+            std::fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .is_some_and(|exe| exe.file_name().map(ToOwned::to_owned) == name)
+        };
+        let appimage = std::env::var_os("APPIMAGE").filter(|v| !v.is_empty());
+        let mut found: Vec<u32> = match appimage {
+            Some(appimage) => others_in(Path::new(&appimage), own_pid)?
+                .into_iter()
+                .filter(|pid| same_name(*pid))
+                .collect(),
+            None => {
+                let mut found = Vec::new();
+                for entry in std::fs::read_dir("/proc")? {
+                    let Ok(entry) = entry else { continue };
+                    let Some(pid) = entry
+                        .file_name()
+                        .to_str()
+                        .and_then(|n| n.parse::<u32>().ok())
+                    else {
+                        continue;
+                    };
+                    if std::fs::read_link(entry.path().join("exe")).is_ok_and(|exe| exe == own_exe)
+                    {
+                        found.push(pid);
+                    }
+                }
+                found
+            }
+        };
+        if !found.contains(&own_pid) {
+            found.push(own_pid);
+        }
+        Ok(found)
+    }
+}
+
+/// `pid` の生存と開始時刻を調べる（読み取りだけ。終了済みのプロセスのゾンビは `Gone` とする）。
+#[cfg(windows)]
+pub(crate) fn probe(pid: u32) -> Probe {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, FILETIME},
+        System::Threading::{
+            GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        },
+    };
+    /// GetExitCodeProcess が実行中のプロセスに返す値（STILL_ACTIVE）。
+    const STILL_ACTIVE: u32 = 259;
+    /// ERROR_INVALID_PARAMETER。存在しない PID を OpenProcess に渡したときのエラー。
+    const NO_SUCH_PROCESS: i32 = 87;
+    // SAFETY: ハンドルは取得できたときだけ使い、必ず閉じる。出力は初期化済みの構造体へ書かせる。
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return if std::io::Error::last_os_error().raw_os_error() == Some(NO_SUCH_PROCESS) {
+                Probe::Gone
+            } else {
+                Probe::Unknown
+            };
+        }
+        let mut code = 0u32;
+        let alive = GetExitCodeProcess(handle, &mut code) != 0;
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        let timed = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) != 0;
+        CloseHandle(handle);
+        if !alive || !timed {
+            return Probe::Unknown;
+        }
+        if code != STILL_ACTIVE {
+            return Probe::Gone;
+        }
+        // FILETIME は 1601-01-01 からの 100ns 単位。UNIX 時刻へは 11,644,473,600 秒ずらす。
+        let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        Probe::Running(Started {
+            id: ticks,
+            unix_secs: (ticks / 10_000_000).saturating_sub(11_644_473_600),
+        })
+    }
+}
+
+/// Linux の `/proc/<pid>/stat` から、状態（1 文字）と開始時刻（起動からのクロック刻み。22 番目の項目）を取り出す。
+/// 実行名（2 番目）は括弧で囲まれ空白や括弧を含みうるため、最後の `)` の後ろから数える。
+#[cfg(target_os = "linux")]
+fn stat_state_and_start(stat: &[u8]) -> Option<(char, u64)> {
+    let close = stat.iter().rposition(|byte| *byte == b')')?;
+    let rest = std::str::from_utf8(&stat[close + 1..]).ok()?;
+    let mut fields = rest.split_ascii_whitespace();
+    let state = fields.next()?.chars().next()?;
+    // 状態は 3 番目の項目。開始時刻の 22 番目までは、さらに 18 個先。
+    Some((state, fields.nth(18)?.parse().ok()?))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn probe(pid: u32) -> Probe {
+    /// Linux のクロック刻み（USER_HZ）は、実用上すべての構成で 100。
+    const TICKS_PER_SEC: u64 = 100;
+    let stat = match std::fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Probe::Gone,
+        Err(_) => return Probe::Unknown,
+    };
+    let Some((state, ticks)) = stat_state_and_start(&stat) else {
+        return Probe::Unknown;
+    };
+    if matches!(state, 'Z' | 'X') {
+        return Probe::Gone;
+    }
+    let boot = std::fs::read_to_string("/proc/stat").ok().and_then(|text| {
+        text.lines()
+            .find_map(|line| line.strip_prefix("btime "))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    });
+    match boot {
+        Some(boot) => Probe::Running(Started {
+            id: ticks,
+            unix_secs: boot + ticks / TICKS_PER_SEC,
+        }),
+        None => Probe::Unknown,
+    }
+}
+
+/// macOS は `proc_pidinfo(PROC_PIDTBSDINFO)` の開始時刻（秒・マイクロ秒）を使う。
+#[cfg(target_os = "macos")]
+pub(crate) fn probe(pid: u32) -> Probe {
+    use std::os::raw::{c_int, c_void};
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: c_int,
+            flavor: c_int,
+            arg: u64,
+            buffer: *mut c_void,
+            buffersize: c_int,
+        ) -> c_int;
+    }
+    /// <sys/proc_info.h> の `struct proc_bsdinfo`（136 バイト）。
+    #[repr(C)]
+    struct ProcBsdInfo {
+        flags: u32,
+        status: u32,
+        xstatus: u32,
+        pid: u32,
+        ppid: u32,
+        uid: u32,
+        gid: u32,
+        ruid: u32,
+        rgid: u32,
+        svuid: u32,
+        svgid: u32,
+        rfu_1: u32,
+        comm: [u8; 16],
+        name: [u8; 32],
+        nfiles: u32,
+        pgid: u32,
+        pjobc: u32,
+        e_tdev: u32,
+        e_tpgid: u32,
+        nice: i32,
+        start_tvsec: u64,
+        start_tvusec: u64,
+    }
+    const PROC_PIDTBSDINFO: c_int = 3;
+    /// <sys/proc.h> の SZOMB。
+    const SZOMB: u32 = 5;
+    /// <errno.h> の ESRCH。
+    const ESRCH: i32 = 3;
+    const _: () = assert!(std::mem::size_of::<ProcBsdInfo>() == 136);
+    // SAFETY: 0 で初期化した構造体へ、そのバイト数を上限に書かせる。戻り値は書いたバイト数（0 以下は失敗）。
+    let mut info: ProcBsdInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<ProcBsdInfo>() as c_int;
+    let written = unsafe {
+        proc_pidinfo(
+            pid as c_int,
+            PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut ProcBsdInfo).cast(),
+            size,
+        )
+    };
+    if written != size {
+        return if written <= 0 && std::io::Error::last_os_error().raw_os_error() == Some(ESRCH) {
+            Probe::Gone
+        } else {
+            Probe::Unknown
+        };
+    }
+    if info.status == SZOMB {
+        return Probe::Gone;
+    }
+    Probe::Running(Started {
+        id: info
+            .start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.start_tvusec),
+        unix_secs: info.start_tvsec,
+    })
 }
 
 #[cfg(test)]

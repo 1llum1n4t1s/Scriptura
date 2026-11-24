@@ -183,7 +183,11 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
                 message,
             );
         }
-        state.touch();
+        // 概要の「実行中」の自動更新（GET /activity の完全一致だけ）は操作ではない。数えると、開いたままの
+        // タブが 60 分無操作の自動終了を妨げる。
+        if !(req.method() == Method::GET && path == "/activity") {
+            state.touch();
+        }
     }
     // 4. CSRF（全 POST）。本文を上限つきで読み、解析結果を extensions へ渡す。
     if is_post {

@@ -52,7 +52,7 @@ use velopack::{
 };
 
 mod logon;
-mod processes;
+pub(crate) mod processes;
 // 登録の要否の判定と状態の読み書き（全 OS 共通）。
 pub mod registration;
 mod trust;
@@ -664,7 +664,16 @@ pub fn update_apply() -> Result<ApplyOutcome, String> {
         resident_restart_args(),
         &state_dir,
         "update-apply",
+        None,
     )
+}
+
+/// 適用の依頼の前後に呼び出し元が行う処理（管理画面の引き継ぎ鍵の発行と撤回）。値は持たない。
+pub struct ApplyHooks<'a> {
+    /// 取得・検証・他プロセスの確認が済み、適用を依頼する直前に 1 回呼ぶ。
+    pub before: &'a dyn Fn(),
+    /// 適用の依頼が失敗したときに呼ぶ（`before` を呼んだ後だけ）。
+    pub failed: &'a dyn Fn(),
 }
 
 /// 取得済みの更新を、安全な場合だけ適用する共通の処理（ログオン時の `update-apply` と管理画面の
@@ -678,6 +687,7 @@ fn apply_pending(
     restart_args: Option<Vec<String>>,
     state_dir: &Path,
     label: &str,
+    hooks: Option<&ApplyHooks>,
 ) -> Result<ApplyOutcome, String> {
     // 導入先から動いている自分以外のプロセスが 1 つでもあれば、適用しない。Windows の適用はそれらを強制終了する。
     #[cfg(not(target_os = "linux"))]
@@ -703,15 +713,22 @@ fn apply_pending(
         log_line(state_dir, &format!("{label}: refused: {error}"));
         return Ok(ApplyOutcome::Untrusted(error.to_string()));
     }
-    manager
-        .unsafe_apply_updates(
-            pending,
-            true,
-            ApplyWaitMode::WaitPid(std::process::id()),
-            restart_args.is_some(),
-            restart_args.unwrap_or_default(),
-        )
-        .map_err(|error| format!("update apply failed: {error}"))?;
+    // 検証まで済み、適用を依頼する直前。ここで呼び出し元の用意（引き継ぎ鍵の発行など）を行う。
+    if let Some(hooks) = hooks {
+        (hooks.before)();
+    }
+    if let Err(error) = manager.unsafe_apply_updates(
+        pending,
+        true,
+        ApplyWaitMode::WaitPid(std::process::id()),
+        restart_args.is_some(),
+        restart_args.unwrap_or_default(),
+    ) {
+        if let Some(hooks) = hooks {
+            (hooks.failed)();
+        }
+        return Err(format!("update apply failed: {error}"));
+    }
     log_line(state_dir, &format!("{label}: applying {}", pending.Version));
     Ok(ApplyOutcome::Applied(pending.Version.clone()))
 }
@@ -793,7 +810,10 @@ pub enum PanelInstall {
 /// 確認 → 取得 → 署名者検証 → 他プロセスの確認 → 適用の依頼、を 1 回行う。取得済みの更新があれば、確認に失敗しても
 /// それを適用する。`restart_args` が Some のときだけ、入れ替えの後に更新器がその引数で再起動する（常駐の再起動）。
 /// ロックは依頼が済むまで持つ。呼び出し元（管理画面）は、`Applying` を返した後に自分のサーバーを終了させる。
-pub fn panel_install(restart_args: Option<Vec<String>>) -> PanelInstall {
+pub fn panel_install(
+    restart_args: Option<Vec<String>>,
+    hooks: Option<&ApplyHooks>,
+) -> PanelInstall {
     let Some(locator) = locate() else {
         return PanelInstall::Unmanaged;
     };
@@ -840,6 +860,7 @@ pub fn panel_install(restart_args: Option<Vec<String>>) -> PanelInstall {
         restart_args,
         &state_dir,
         "panel-install",
+        hooks,
     ) {
         Ok(ApplyOutcome::Applied(version)) => PanelInstall::Applying(version),
         Ok(ApplyOutcome::Busy(_)) => PanelInstall::OthersRunning,

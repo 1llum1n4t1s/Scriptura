@@ -152,6 +152,9 @@ impl Fx {
                 "HOOK_STUB_AUTH_LOG",
                 // モデル一覧の取得に使う環境変数のキー。実在の API へ繋がないよう、既定では無い状態にする。
                 "ANTHROPIC_API_KEY",
+                // 更新のインストールの結果の差し替え口（各テストが必要なときだけ設定する）。
+                "SCRIPTURA_TEST_PANEL_INSTALL",
+                "SCRIPTURA_TEST_PANEL_INSTALL_HOLD",
             ] {
                 env::remove_var(key);
             }
@@ -2610,6 +2613,8 @@ async fn auth_next_is_an_allow_list_of_names_not_urls() {
     let app = ui::router(state.clone());
     for (next, expected) in [
         ("&next=updates", "/settings/app?check_updates=1#updates"),
+        ("&next=updated", "/settings/app#updates"),
+        ("&next=Updated", "/"),
         ("", "/"),
         ("&next=unknown", "/"),
         ("&next=https%3A%2F%2Fevil.example%2F", "/"),
@@ -2778,6 +2783,379 @@ async fn update_panel_is_unsupported_outside_setup_and_touches_no_state() {
     assert!(!fx.base.join("state").exists());
     // インストールの要求は、サーバーを止めない（非対応のときは shutdown を通知しない）。
     assert_eq!(fx.get("/").await.status, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// 更新のインストール後の自動ログイン（引き継ぎ鍵）
+// ---------------------------------------------------------------------------
+
+fn handoff_file(fx: &Fx) -> PathBuf {
+    fx.store.state_dir.join("ui-handoff.json")
+}
+
+/// 鍵の SHA-256（16 進小文字）。引き継ぎのファイルに載る値。
+fn key_digest(key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(key.as_bytes());
+    scriptura::maintenance::hex_lower(&h.finalize())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// 常駐の状態で画面へ入り、`fx` の画面をそれに差し替える（`update_install` が常駐で再起動する経路を通すため）。
+async fn login_as_resident(fx: &mut Fx) -> AppState {
+    let (state, key) = AppState::new(fx.store.clone(), PORT);
+    state.set_resident();
+    fx.app = ui::router(state.clone());
+    let r = fx.raw(get(&format!("/auth?key={key}"))).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    fx.cookie = r.headers[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let page = fx.get("/").await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    fx.csrf = Regex::new(r#"name="csrf" value="([0-9a-f]{64})""#)
+        .unwrap()
+        .captures(&page.body)
+        .unwrap()[1]
+        .to_string();
+    state
+}
+
+/// JSON（fetch と同じ Accept）で「更新をインストール」を送る。更新器へは触れず、結果は環境変数の差し替え口で決める。
+async fn install_json(fx: &Fx, outcome: &str) -> (Resp, serde_json::Value) {
+    // SAFETY: テストは LOCK で直列化している。
+    unsafe { env::set_var("SCRIPTURA_TEST_PANEL_INSTALL", outcome) };
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("csrf", &fx.csrf)
+        .finish();
+    let req = Request::post("/updates/install")
+        .header(header::HOST, HOST)
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::COOKIE, &fx.cookie)
+        .header(header::ACCEPT, "application/json")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap();
+    let r = fx.raw(req).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let v = serde_json::from_str(&r.body).unwrap();
+    (r, v)
+}
+
+/// 新しい版の常駐（同じ状態フォルダー）。起動時に引き継ぎのファイルを読む。
+fn restarted(fx: &Fx) -> (AppState, Router) {
+    let (state, _startup_key) = AppState::new(fx.store.clone(), PORT);
+    state.set_resident();
+    state.adopt_handoff();
+    let app = ui::router(state.clone());
+    (state, app)
+}
+
+async fn auth_status(app: &Router, query: &str) -> (StatusCode, String) {
+    let res = app
+        .clone()
+        .oneshot(get(&format!("/auth?{query}")))
+        .await
+        .unwrap();
+    let location = res
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    (res.status(), location)
+}
+
+/// 常駐で適用に進んだときだけ引き継ぎ鍵を返し、新しい版が起動時に引き継いで一度だけ画面へ入れる。
+/// ディスクにあるのは鍵のハッシュだけで、起動時に読んだら消え、トレイの鍵とは互いに無効化しない。
+#[cfg(any(windows, target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_install_hands_a_one_time_key_to_the_restarted_version() {
+    let mut fx = Fx::new().await;
+    fs::create_dir_all(&fx.store.state_dir).unwrap();
+    login_as_resident(&mut fx).await;
+    let (r, v) = install_json(&fx, "applying").await;
+    assert_eq!(v["status"], "applying");
+    assert_eq!(v["restarts"], true);
+    assert_eq!(r.headers[header::CACHE_CONTROL], "no-store");
+    let key = v["handoff_key"].as_str().unwrap().to_string();
+    assert!(key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()));
+    // ディスクにあるのはハッシュ・ポート・期限だけ。鍵・セッション・CSRF は載らない。
+    let text = fs::read_to_string(handoff_file(&fx)).unwrap();
+    assert!(!text.contains(&key), "{text}");
+    assert!(
+        !text.contains(&fx.csrf) && !text.contains(&fx.cookie),
+        "{text}"
+    );
+    let file: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(file["sha256"], key_digest(&key));
+    assert_eq!(file["port"], PORT);
+    assert_eq!(
+        file["expires_at"].as_u64().unwrap() - file["issued_at"].as_u64().unwrap(),
+        600
+    );
+    // 状態フォルダーにはほかに何も残さない（一時ファイルなど）。
+    let names: Vec<_> = fs::read_dir(&fx.store.state_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["ui-handoff.json"]);
+
+    // 新しい版の起動: ファイルは読んだ時点で消える。
+    let (state, app) = restarted(&fx);
+    assert!(!handoff_file(&fx).exists());
+    // トレイの鍵（別の枠）を先に発行しても、引き継ぎは無効にならない。
+    let tray_key = state.issue_key();
+    // 違う鍵は拒否され、引き継ぎを消費しない。
+    let (status, _) = auth_status(&app, &format!("key={}", "0".repeat(64))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, location) = auth_status(&app, &format!("key={key}&next=updated")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location, "/settings/app#updates");
+    // 一度だけ。
+    let (status, _) = auth_status(&app, &format!("key={key}&next=updated")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // 引き継ぎの交換は、トレイの鍵を消費しない。
+    let (status, location) = auth_status(&app, &format!("key={tray_key}")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location, "/");
+}
+
+/// 引き継ぎのファイルが無効なら使えない。どの場合も、起動時に読んだ時点でファイルは消える。
+#[cfg(any(windows, target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_handoff_files_are_deleted_and_never_log_in() {
+    let fx = Fx::new().await;
+    fs::create_dir_all(&fx.store.state_dir).unwrap();
+    let key = "ab".repeat(32);
+    let now = unix_now();
+    let record = |sha: &str, port: u16, issued: u64, expires: u64| {
+        serde_json::json!({"sha256": sha, "port": port, "issued_at": issued, "expires_at": expires})
+            .to_string()
+    };
+    let sha = key_digest(&key);
+    let cases = [
+        ("expired", record(&sha, PORT, now - 700, now - 100)),
+        ("port mismatch", record(&sha, PORT + 1, now, now + 600)),
+        (
+            "issued in the future",
+            record(&sha, PORT, now + 1000, now + 1600),
+        ),
+        ("window too long", record(&sha, PORT, now, now + 3600)),
+        ("not a digest", record("zz", PORT, now, now + 600)),
+        ("broken", "{".to_string()),
+        (
+            "unknown field",
+            format!(
+                r#"{{"sha256":"{sha}","port":{PORT},"issued_at":{now},"expires_at":{},"extra":1}}"#,
+                now + 600
+            ),
+        ),
+    ];
+    for (label, content) in cases {
+        fs::write(handoff_file(&fx), content).unwrap();
+        let (_, app) = restarted(&fx);
+        assert!(!handoff_file(&fx).exists(), "{label}: file must be deleted");
+        let (status, _) = auth_status(&app, &format!("key={key}&next=updated")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{label}");
+    }
+    // 対照: 有効なファイルなら入れる。
+    fs::write(handoff_file(&fx), record(&sha, PORT, now, now + 600)).unwrap();
+    let (_, app) = restarted(&fx);
+    let (status, _) = auth_status(&app, &format!("key={key}")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    // 起動後に期限が過ぎたら使えない（残り 1 秒のファイルを、期限の後に使う）。
+    let soon = unix_now();
+    fs::write(handoff_file(&fx), record(&sha, PORT, soon - 599, soon + 1)).unwrap();
+    let (_, app) = restarted(&fx);
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let (status, _) = auth_status(&app, &format!("key={key}")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// 適用に進まなかったとき（busy・失敗・署名の不一致）は、鍵もファイルも残さない。HTML のフォーム送信（JSON でない）、
+/// 状態フォルダーが無い（書けない）ときも鍵を返さない。
+#[cfg(any(windows, target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_install_leaves_no_handoff_unless_it_applies() {
+    let mut fx = Fx::new().await;
+    fs::create_dir_all(&fx.store.state_dir).unwrap();
+    login_as_resident(&mut fx).await;
+    for outcome in ["busy", "failed", "untrusted"] {
+        let (_, v) = install_json(&fx, outcome).await;
+        assert_ne!(v["status"], "applying", "{outcome}");
+        assert_eq!(v["restarts"], false, "{outcome}");
+        assert!(v.get("handoff_key").is_none(), "{outcome}: {v}");
+        assert!(!handoff_file(&fx).exists(), "{outcome}");
+    }
+    // JSON でない送信（JavaScript が無い環境）は、鍵を受け取る側が無いので書かない。
+    // SAFETY: テストは LOCK で直列化している。
+    unsafe { env::set_var("SCRIPTURA_TEST_PANEL_INSTALL", "applying") };
+    let r = fx.post("/updates/install", &[]).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(!handoff_file(&fx).exists());
+    // 状態フォルダーが無ければ作らず、鍵も返さない（従来のトレイから開き直す案内）。
+    fs::remove_dir_all(&fx.store.state_dir).unwrap();
+    let (_, v) = install_json(&fx, "applying").await;
+    assert_eq!(v["status"], "applying");
+    assert_eq!(v["restarts"], true);
+    assert!(v.get("handoff_key").is_none(), "{v}");
+    assert!(!fx.store.state_dir.exists());
+}
+
+/// 並行の要求を作るため、画面（Router の複製）から JSON で「更新をインストール」を送る。
+async fn install_request(app: Router, cookie: String, csrf: String) -> serde_json::Value {
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("csrf", &csrf)
+        .finish();
+    let req = Request::post("/updates/install")
+        .header(header::HOST, HOST)
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::COOKIE, cookie)
+        .header(header::ACCEPT, "application/json")
+        .header(header::ACCEPT_LANGUAGE, "ja")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// 保持の印（`SCRIPTURA_TEST_PANEL_INSTALL_HOLD`）のファイルができるまで、差し替えの更新器は結果を返さない。
+fn hold_install(outcome: &str, hold: &Path) {
+    // SAFETY: テストは LOCK で直列化している。
+    unsafe {
+        env::set_var("SCRIPTURA_TEST_PANEL_INSTALL", outcome);
+        env::set_var("SCRIPTURA_TEST_PANEL_INSTALL_HOLD", hold);
+    }
+}
+
+/// `path` ができる（または消える）まで待つ。
+async fn wait_for(path: &Path, exists: bool) {
+    for _ in 0..250 {
+        if path.exists() == exists {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{} が {exists} にならない", path.display());
+}
+
+/// 二重のインストール: 進行中の間に来た後の要求は鍵を発行せず busy を返し、先の引き継ぎのファイルを上書き・削除しない。
+/// 先の要求が終われば排他は解放され、次の要求は受け付けられる。
+#[cfg(any(windows, target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_install_does_not_touch_the_first_installs_handoff() {
+    let mut fx = Fx::new().await;
+    fs::create_dir_all(&fx.store.state_dir).unwrap();
+    login_as_resident(&mut fx).await;
+    let hold = fx.base.join("hold-first");
+    hold_install("applying", &hold);
+    let first = tokio::spawn(install_request(
+        fx.app.clone(),
+        fx.cookie.clone(),
+        fx.csrf.clone(),
+    ));
+    wait_for(&handoff_file(&fx), true).await;
+    let written = fs::read_to_string(handoff_file(&fx)).unwrap();
+    // 先の要求が進行中のところへ、後の要求が来る。
+    let second = install_request(fx.app.clone(), fx.cookie.clone(), fx.csrf.clone()).await;
+    assert_eq!(second["status"], "busy", "{second}");
+    assert!(second.get("handoff_key").is_none(), "{second}");
+    assert_eq!(
+        fs::read_to_string(handoff_file(&fx)).unwrap(),
+        written,
+        "後の要求が先のファイルを書き換えた"
+    );
+    // 先の要求が終わる。鍵は、残っているファイルのハッシュと一致する。
+    fs::write(&hold, "").unwrap();
+    let first = first.await.unwrap();
+    assert_eq!(first["status"], "applying", "{first}");
+    let key = first["handoff_key"].as_str().unwrap();
+    let file: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(handoff_file(&fx)).unwrap()).unwrap();
+    assert_eq!(file["sha256"], key_digest(key));
+    // 排他は解放されている（保持の印は残っているので待たない）。
+    let third = install_request(fx.app.clone(), fx.cookie.clone(), fx.csrf.clone()).await;
+    assert_eq!(third["status"], "applying", "{third}");
+}
+
+/// 引き継ぎのファイルは、取得・検証が済んで適用を依頼する直前にだけ書かれる。適用に進まない結果（busy・失敗・署名の
+/// 不一致）では、結果が返る前の途中でも一度も書かれない。適用の依頼が失敗したら撤回するが、撤回は自分が書いたものだけ。
+#[cfg(any(windows, target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_handoff_is_written_just_before_applying_and_only_withdrawn_by_its_owner() {
+    let mut fx = Fx::new().await;
+    fs::create_dir_all(&fx.store.state_dir).unwrap();
+    login_as_resident(&mut fx).await;
+    let send = |fx: &Fx| {
+        tokio::spawn(install_request(
+            fx.app.clone(),
+            fx.cookie.clone(),
+            fx.csrf.clone(),
+        ))
+    };
+    // 適用に進まない結果は、返る前（保持の間）にもファイルが無い。
+    for outcome in ["busy", "failed", "untrusted"] {
+        let hold = fx.base.join(format!("hold-{outcome}"));
+        hold_install(outcome, &hold);
+        let task = send(&fx);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!handoff_file(&fx).exists(), "{outcome}: 書かれている");
+        fs::write(&hold, "").unwrap();
+        let v = task.await.unwrap();
+        assert!(v.get("handoff_key").is_none(), "{outcome}: {v}");
+        assert!(!handoff_file(&fx).exists(), "{outcome}");
+    }
+    // 適用の依頼の失敗: 保持の間はファイルがあり（依頼の前に書かれている）、失敗すると撤回される。
+    let hold = fx.base.join("hold-apply-failed");
+    hold_install("apply_failed", &hold);
+    let task = send(&fx);
+    wait_for(&handoff_file(&fx), true).await;
+    fs::write(&hold, "").unwrap();
+    let v = task.await.unwrap();
+    assert_eq!(v["status"], "failed", "{v}");
+    assert!(v.get("handoff_key").is_none(), "{v}");
+    assert!(!handoff_file(&fx).exists(), "失敗したのに撤回されない");
+    // 撤回は自分のファイルだけ: 保持の間に別のものに置き換わっていたら、消さない。
+    let hold = fx.base.join("hold-foreign");
+    hold_install("apply_failed", &hold);
+    let task = send(&fx);
+    wait_for(&handoff_file(&fx), true).await;
+    let now = unix_now();
+    let foreign = serde_json::json!({
+        "sha256": key_digest("another"), "port": PORT, "issued_at": now, "expires_at": now + 600
+    })
+    .to_string();
+    fs::write(handoff_file(&fx), &foreign).unwrap();
+    fs::write(&hold, "").unwrap();
+    task.await.unwrap();
+    assert_eq!(fs::read_to_string(handoff_file(&fx)).unwrap(), foreign);
+}
+
+/// 常駐でない起動（再起動しない）は、適用に進んでも鍵を作らず、ファイルも書かない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_resident_update_install_creates_no_handoff() {
+    let fx = Fx::new().await;
+    fs::create_dir_all(&fx.store.state_dir).unwrap();
+    let (_, v) = install_json(&fx, "applying").await;
+    assert_eq!(v["status"], "applying");
+    assert_eq!(v["restarts"], false);
+    assert!(v.get("handoff_key").is_none(), "{v}");
+    assert!(!handoff_file(&fx).exists());
 }
 
 /// 「アプリ」画面と自動登録の保存は、他の画面と同じ保護を通り、利用者の文面はエスケープされ、秘密値を出さない。
@@ -3476,4 +3854,150 @@ fn stylesheet_keeps_layout_rules() {
     ] {
         assert!(css.contains(needle), "{needle}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// 概要の「実行中」（GET /activity）
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activity_fragment_needs_the_cookie_and_follows_the_records() {
+    let fx = Fx::new().await;
+    // Cookie なしは 401（no-store）。
+    let r = fx.raw(get("/activity")).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+    assert_eq!(r.headers[header::CACHE_CONTROL], "no-store");
+    // 記録が無ければ「実行中の保守はありません」。閲覧は状態フォルダーを作らない。
+    let r = fx.get("/activity").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.headers[header::CACHE_CONTROL], "no-store");
+    assert!(r.body.contains("実行中の保守はありません"), "{}", r.body);
+    assert!(r.body.contains("data-activity-body"), "{}", r.body);
+    assert!(!r.body.contains("<html"), "断片に枠を含めない");
+    assert!(!r.body.contains("data-activity-runs"), "{}", r.body);
+    assert!(!fx.base.join("state").exists());
+    assert!(!fx.store.config_file.exists());
+    // 概要は同じ部品を使い、JS が無い環境向けの案内を持つ。自動の読み込み直しは使わない。
+    let page = fx.get("/").await;
+    assert!(page.body.contains("data-activity-body"), "{}", page.body);
+    assert!(page.body.contains("<noscript>"), "{}", page.body);
+    assert!(!page.body.to_lowercase().contains("http-equiv=\"refresh\""));
+    assert!(!fx.base.join("state").exists());
+
+    // 生きている自プロセスの PID で記録を作る。リポジトリ名は特殊文字を含め、エスケープを確かめる。
+    let nasty = fx.base.join("<b>x&y'z\"");
+    let guard = scriptura::activity::begin("run_now", &nasty);
+    let r = fx.get("/activity").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(!r.body.contains("実行中の保守はありません"), "{}", r.body);
+    assert!(r.body.contains(&std::process::id().to_string()));
+    assert!(r.body.contains("今すぐ保守"), "{}", r.body);
+    assert!(r.body.contains("準備中"), "{}", r.body);
+    assert!(r.body.contains("data-since="), "{}", r.body);
+    assert!(!r.body.contains("<b>x"), "{}", r.body);
+    assert!(
+        r.body.contains("&lt;b&gt;x&amp;y&#39;z&quot;")
+            || r.body.contains("&#60;b&#62;x&#38;y&#39;z&#34;"),
+        "{}",
+        r.body
+    );
+    // 自分自身のプロセスは「この管理画面」として並ぶ（保守の PID とも一致するが、自分を優先する）。
+    assert!(r.body.contains("この管理画面"), "{}", r.body);
+    // 秘密・セッション・コマンド行らしいものは出さない。
+    let session = fx.cookie.split_once('=').unwrap().1.to_string();
+    for secret in [
+        fx.csrf.as_str(),
+        session.as_str(),
+        "remote.git",
+        "ANTHROPIC",
+        "--",
+    ] {
+        assert!(!r.body.contains(secret), "{secret}");
+    }
+    // 未知の段階・起動元は汎用の文言になり、記録の文字列を出さない。
+    scriptura::activity::phase("bogus<phase>");
+    let r = fx.get("/activity").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(r.body.contains("処理中"), "{}", r.body);
+    assert!(!r.body.contains("bogus"), "{}", r.body);
+    // worker と追い修正: 番号つきの段階と、期限までの残り。
+    scriptura::activity::worker(2, Duration::from_secs(600));
+    let r = fx.get("/activity").await;
+    assert!(r.body.contains("追い修正 2"), "{}", r.body);
+    assert!(r.body.contains("worker の期限まで"), "{}", r.body);
+    assert!(r.body.contains("data-until="), "{}", r.body);
+    // `?runs=1` は「最近の保守」も返す。
+    let r = fx.get("/activity?runs=1").await;
+    assert!(r.body.contains("data-activity-runs"), "{}", r.body);
+    // 終われば消える。
+    drop(guard);
+    let r = fx.get("/activity").await;
+    assert!(r.body.contains("実行中の保守はありません"), "{}", r.body);
+    assert!(!r.body.contains("追い修正"), "{}", r.body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_origin_is_generic_and_activity_polling_keeps_the_idle_clock() {
+    let mut fx = Fx::new().await;
+    let state = login_as_resident(&mut fx).await;
+    let guard = scriptura::activity::begin("weird<origin>", &fx.repo);
+    let r = fx.get("/activity").await;
+    assert!(r.body.contains("不明"), "{}", r.body);
+    assert!(!r.body.contains("weird"), "{}", r.body);
+    drop(guard);
+    // /activity（GET の完全一致）は無操作の時間を延ばさず、ほかの GET は延ばす。
+    // 待たずに最後の操作を 1 時間前へ動かし、「触れたか」を大きな差で比べる（負荷が高くても揺れない）。
+    let old = Duration::from_secs(3600);
+    let touched = Duration::from_secs(1800);
+    state.set_idle_for_tests(old);
+    assert!(state.idle_for() >= old);
+    for path in ["/activity", "/activity?runs=1"] {
+        assert_eq!(fx.get(path).await.status, StatusCode::OK);
+        assert!(state.idle_for() >= old, "{path} が操作として数えられた");
+    }
+    // Cookie なしの要求は操作ではない（従来どおり）。
+    assert_eq!(
+        fx.raw(get("/activity")).await.status,
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(state.idle_for() >= old);
+    assert_eq!(fx.get("/history").await.status, StatusCode::OK);
+    assert!(state.idle_for() < touched, "ほかの GET は操作として数える");
+    state.set_idle_for_tests(old);
+    assert_eq!(fx.get("/activity/").await.status, StatusCode::NOT_FOUND);
+    assert!(state.idle_for() < touched, "完全一致以外は除外しない");
+}
+
+/// `data-runs-latest` は、最新の保守履歴が変わると変わる（読み取り専用で、履歴が無ければ空）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn activity_fragment_marks_the_latest_run_so_the_page_can_refresh_history() {
+    let fx = Fx::new().await;
+    let latest = |body: &str| {
+        Regex::new(r#"data-runs-latest="([^"]*)""#)
+            .unwrap()
+            .captures(body)
+            .unwrap_or_else(|| panic!("data-runs-latest が無い: {body}"))[1]
+            .to_string()
+    };
+    let r = fx.get("/activity").await;
+    assert_eq!(latest(&r.body), "");
+    assert!(!fx.base.join("state").exists(), "閲覧は DB を作らない");
+    let page = fx.get("/").await;
+    assert_eq!(latest(&page.body), "");
+
+    // 履歴が付くと値が入り、新しい履歴が付くたびに変わる。概要の初期表示も同じ値。
+    let db = scriptura::maintenance::open_state_db().unwrap();
+    scriptura::runlog::record(&db, &sample_run("D:/any/repo", "unchanged", None)).unwrap();
+    let first = latest(&fx.get("/activity").await.body);
+    assert!(!first.is_empty());
+    assert_eq!(latest(&fx.get("/").await.body), first);
+    scriptura::runlog::record(&db, &sample_run("D:/any/repo", "proposed", None)).unwrap();
+    let second = latest(&fx.get("/activity").await.body);
+    assert!(!second.is_empty() && second != first, "{first} {second}");
+    // 同じ失敗が繰り返されて試行が増えるだけでも変わる。
+    scriptura::runlog::record(&db, &sample_run("D:/any/repo", "failed", Some("x"))).unwrap();
+    let third = latest(&fx.get("/activity").await.body);
+    scriptura::runlog::record(&db, &sample_run("D:/any/repo", "failed", Some("x"))).unwrap();
+    let fourth = latest(&fx.get("/activity").await.body);
+    assert_ne!(third, fourth, "試行の増加で変わる");
 }

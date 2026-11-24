@@ -7,7 +7,12 @@
 //   ④ `confirm::dangers(before, after)` ＋固定の危険操作があれば二段階確認（1 回目は書き込まない）
 //   ⑤ ops の関数を spawn_blocking で呼ぶ（ロック・版の照合・変更履歴・アトミック保存は ops／config 側）
 // 閲覧（GET）は副作用なし: 設定・状態 DB は読むだけで、無いものを作らない（旧形式の設定も保存し直さない）。
-use std::{collections::BTreeMap, path::Path as FsPath};
+use std::{
+    collections::BTreeMap,
+    path::Path as FsPath,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use askama::Template;
 use axum::{
@@ -402,6 +407,8 @@ pub struct AuthQuery {
 fn auth_destination(next: Option<&str>) -> &'static str {
     match next {
         Some("updates") => "/settings/app?check_updates=1#updates",
+        // 更新のインストールの後に、画面が自動で入り直した先（自動で確認は始めない）。
+        Some("updated") => "/settings/app#updates",
         _ => "/",
     }
 }
@@ -411,7 +418,7 @@ pub async fn auth(State(state): State<AppState>, Query(q): Query<AuthQuery>) -> 
     let accepted = q
         .key
         .as_deref()
-        .is_some_and(|given| state.redeem_key(given));
+        .is_some_and(|given| state.redeem_key(given) || state.redeem_handoff(given));
     if !accepted {
         // 常駐（`--tray`）にはコンソールに表示された URL が無く、鍵は「開く」のたびに置き換わって 5 分で失効する。
         // 起動し直す案内ではなく、アイコンから開き直す案内にする。
@@ -541,10 +548,18 @@ pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Re
             warnings(&cur.config, cur.legacy.as_ref())
         };
         let recent_runs = run_views(&cur.config, &crate::runlog::load(None, None, OVERVIEW_RUNS));
-        (cur.broken, repos, warnings, active_note, recent_runs)
+        let activity = activity_view(&cur.config);
+        (
+            cur.broken,
+            repos,
+            warnings,
+            active_note,
+            recent_runs,
+            activity,
+        )
     })
     .await;
-    let Ok((broken, repos, warnings, active_note, recent_runs)) = built else {
+    let Ok((broken, repos, warnings, active_note, recent_runs, activity)) = built else {
         return internal(&state, "/");
     };
     html(OverviewPage {
@@ -558,6 +573,149 @@ pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Re
         repos,
         warnings,
         active_note,
+        recent_runs,
+        activity,
+    })
+}
+
+/// 「実行中」の段階の表示名。知らない段階は汎用の文言にする（記録の文字列は画面に出さない）。
+fn activity_phase_label(phase: &str, fixup: u32) -> String {
+    match phase {
+        "preparing" => crate::t!("ui.activity.phase.preparing").into(),
+        "worker" => crate::t!("ui.activity.phase.worker").into(),
+        "fixup" => crate::t!("ui.activity.phase.fixup", n = fixup),
+        "checking" => crate::t!("ui.activity.phase.checking").into(),
+        "committing" => crate::t!("ui.activity.phase.committing").into(),
+        "pushing" => crate::t!("ui.activity.phase.pushing").into(),
+        _ => crate::t!("ui.activity.phase.unknown").into(),
+    }
+}
+
+/// 「実行中」パネルの内容（読み取りだけ。状態フォルダー・DB・ロックを作らない）。
+fn activity_view(config: &Config) -> ActivityView {
+    let now = crate::timing::now_secs() as u64;
+    let records = crate::activity::list();
+    // 登録リポジトリの実体パスの解決は、記録があるときだけ行う（ポーリングのたびに全件を引かない）。
+    let keys: Vec<Option<String>> = if records.is_empty() {
+        Vec::new()
+    } else {
+        config
+            .repository
+            .iter()
+            .map(|r| crate::timing::repo_key(FsPath::new(&r.root)))
+            .collect()
+    };
+    let items = records
+        .iter()
+        .map(|a| {
+            let key = crate::timing::repo_key(FsPath::new(&a.repo_root));
+            let index = keys
+                .iter()
+                .position(|k| k.is_some() && *k == key)
+                .or_else(|| config.repository.iter().position(|r| r.root == a.repo_root));
+            ActivityItem {
+                repo_name: views::folder_name(&a.repo_root),
+                repo_root: a.repo_root.clone(),
+                repo_index: index,
+                origin: match a.origin.as_str() {
+                    "hook" => crate::t!("ui.runs.origin.hook").into(),
+                    "run_now" => crate::t!("ui.runs.origin.run_now").into(),
+                    _ => crate::t!("ui.activity.origin_unknown").into(),
+                },
+                phase: activity_phase_label(&a.phase, a.fixup),
+                started_at: a.started_at,
+                deadline_at: a.deadline_at,
+                elapsed: views::clock(now.saturating_sub(a.started_at)),
+                remaining: views::clock(a.deadline_at.unwrap_or(0).saturating_sub(now)),
+                pid: a.pid,
+                worker_pid: a.worker_pid,
+            }
+        })
+        .collect();
+    let (processes, process_error) = match cached_processes() {
+        Ok(found) => (
+            found
+                .iter()
+                .map(|p| ProcItem {
+                    pid: p.pid,
+                    started: read::unix_text(p.started_at as f64),
+                    kind: if p.is_self {
+                        crate::t!("ui.activity.kind.ui").into()
+                    } else if records.iter().any(|a| a.pid == p.pid) {
+                        crate::t!("ui.activity.kind.maintenance").into()
+                    } else {
+                        crate::t!("ui.activity.kind.other").into()
+                    },
+                })
+                .collect(),
+            false,
+        ),
+        Err(_) => (Vec::new(), true),
+    };
+    ActivityView {
+        now,
+        items,
+        processes,
+        process_error,
+        runs_latest: runs_latest(),
+    }
+}
+
+/// プロセス一覧を使い回す時間（複数タブのポーリングで OS の列挙を繰り返さない）。
+const PROCESS_CACHE: Duration = Duration::from_secs(2);
+
+type ProcessSnapshot = Option<(Instant, Result<Vec<crate::activity::ProcInfo>, ()>)>;
+
+/// プロセス一覧。直近 [`PROCESS_CACHE`] 以内に列挙した結果があれば、それを返す（プロセス全体で共有）。
+fn cached_processes() -> Result<Vec<crate::activity::ProcInfo>, ()> {
+    static CACHE: Mutex<ProcessSnapshot> = Mutex::new(None);
+    let mut slot = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((at, found)) = slot.as_ref()
+        && at.elapsed() < PROCESS_CACHE
+    {
+        return found.clone();
+    }
+    let found = crate::activity::processes().map_err(|_| ());
+    *slot = Some((Instant::now(), found.clone()));
+    found
+}
+
+/// 最新の保守履歴の識別値（新しい履歴が付くか、同じ履歴の試行が増えれば変わる。無ければ空）。
+/// 読み取り専用で、DB を作らない。
+fn runs_latest() -> String {
+    crate::runlog::load(None, None, 1)
+        .rows
+        .first()
+        .map(|row| format!("{}-{}-{}", row.id, row.attempts, row.run.finished_at))
+        .unwrap_or_default()
+}
+
+/// `?runs=1` で「最近の保守」も返す（保守が終わったときに JS が取り直す）。
+#[derive(Deserialize, Default)]
+pub struct ActivityQuery {
+    runs: Option<String>,
+}
+
+/// 概要の「実行中」パネルの断片。ポーリング用で、無操作の自動終了の時間を延ばさない（guard.rs）。
+pub async fn activity(State(state): State<AppState>, Query(q): Query<ActivityQuery>) -> Response {
+    let show_runs = q.runs.as_deref() == Some("1");
+    let s = state.clone();
+    let built = blocking(move || {
+        let cur = current(&s);
+        let recent_runs = if show_runs {
+            run_views(&cur.config, &crate::runlog::load(None, None, OVERVIEW_RUNS))
+        } else {
+            Vec::new()
+        };
+        (activity_view(&cur.config), recent_runs)
+    })
+    .await;
+    let Ok((activity, recent_runs)) = built else {
+        return internal(&state, "/");
+    };
+    html(ActivityFragment {
+        activity,
+        show_runs,
         recent_runs,
     })
 }
@@ -718,11 +876,71 @@ fn restart_args(state: &AppState) -> Option<Vec<String>> {
     None
 }
 
+/// パネルのインストール本体。テスト用の機能（`test-support`）では、環境変数 `SCRIPTURA_TEST_PANEL_INSTALL`
+/// （`applying` / `busy` / `failed` / `untrusted`）で結果を差し替えられる（実環境の更新器に触れずに応答を確かめるため）。
+///
+/// 差し替えでも本物と同じ順序で適用の前後の処理（`hooks`）を呼ぶ。`applying` は適用の直前に `before` を呼び、
+/// `apply_failed` は `before` の後に依頼が失敗した形（`failed` を呼んで `Failed`）。環境変数
+/// `SCRIPTURA_TEST_PANEL_INSTALL_HOLD` にファイルのパスがあれば、結果を返す直前に、そのファイルができるまで待つ
+/// （最大 10 秒。進行中の状態を外から確かめるため）。
+#[cfg(feature = "test-support")]
+fn run_panel_install(
+    restart: Option<Vec<String>>,
+    hooks: Option<&crate::app_update::ApplyHooks>,
+) -> crate::app_update::PanelInstall {
+    use crate::app_update::PanelInstall;
+    let before = || hooks.iter().for_each(|h| (h.before)());
+    let hold = || {
+        if let Some(path) = std::env::var_os("SCRIPTURA_TEST_PANEL_INSTALL_HOLD") {
+            let until = Instant::now() + Duration::from_secs(10);
+            while !FsPath::new(&path).exists() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    };
+    let simulated = match std::env::var("SCRIPTURA_TEST_PANEL_INSTALL").as_deref() {
+        Ok("applying") => {
+            before();
+            PanelInstall::Applying("9.9.9".into())
+        }
+        Ok("apply_failed") => {
+            before();
+            hold();
+            hooks.iter().for_each(|h| (h.failed)());
+            return PanelInstall::Failed;
+        }
+        Ok("busy") => PanelInstall::Busy,
+        Ok("failed") => PanelInstall::Failed,
+        Ok("untrusted") => PanelInstall::Untrusted,
+        _ => return crate::app_update::panel_install(restart, hooks),
+    };
+    hold();
+    simulated
+}
+
+#[cfg(not(feature = "test-support"))]
+fn run_panel_install(
+    restart: Option<Vec<String>>,
+    hooks: Option<&crate::app_update::ApplyHooks>,
+) -> crate::app_update::PanelInstall {
+    crate::app_update::panel_install(restart, hooks)
+}
+
 /// 「更新をインストール」。確認 → 取得 → 署名者の検証 → 導入先の他プロセスの確認 → 適用の依頼。他のプロセスが動いて
 /// いるときと保守の実行中は適用せずに見送る（強制終了しない）。適用を依頼できたら、応答を返した後にこのサーバーを
 /// 終える（更新器はこのプロセスの終了を待って入れ替える）。常駐なら更新器が新しい版を起動する。
 pub async fn update_install(State(state): State<AppState>, headers: HeaderMap) -> Response {
     use crate::app_update::PanelInstall;
+    // 二重のインストールは受けない（後の要求が、先の引き継ぎのファイルを上書き・削除しないため）。
+    let Some(install) = state.begin_install() else {
+        return update_reply(
+            &state,
+            &headers,
+            "busy",
+            crate::t!("ui.updates.busy").to_string(),
+            serde_json::json!({}),
+        );
+    };
     if state.has_running_jobs() {
         return update_reply(
             &state,
@@ -734,7 +952,39 @@ pub async fn update_install(State(state): State<AppState>, headers: HeaderMap) -
     }
     let restart = restart_args(&state);
     let restarts = restart.is_some();
-    let Ok(outcome) = blocking(move || crate::app_update::panel_install(restart)).await else {
+    // 常駐で再起動するときだけ、適用の依頼の直前（取得・検証の後）に引き継ぎ鍵を発行する（JSON 応答にだけ載せる）。
+    let wants_handoff = restarts && wants_json(&headers);
+    let issued: std::sync::Arc<Mutex<Option<String>>> = std::sync::Arc::default();
+    let (worker_state, worker_issued) = (state.clone(), issued.clone());
+    let outcome = blocking(move || {
+        // 排他は、このクロージャが終わる（失敗・panic の巻き戻しを含む）まで持つ。
+        let _install = install;
+        let issue = || {
+            *worker_issued.lock().unwrap_or_else(|p| p.into_inner()) = worker_state.issue_handoff();
+        };
+        let withdraw = || {
+            if let Some(key) = worker_issued
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                worker_state.withdraw_handoff(&key);
+            }
+        };
+        let hooks = crate::app_update::ApplyHooks {
+            before: &issue,
+            failed: &withdraw,
+        };
+        run_panel_install(restart, wants_handoff.then_some(&hooks))
+    })
+    .await;
+    let mut handoff_key = issued.lock().unwrap_or_else(|p| p.into_inner()).take();
+    let applying = matches!(outcome, Ok(PanelInstall::Applying(_)));
+    if !applying && let Some(key) = handoff_key.take() {
+        // 適用に進まなかった（失敗・panic を含む）。自分が書いたファイルだけを消し、鍵も返さない。
+        state.withdraw_handoff(&key);
+    }
+    let Ok(outcome) = outcome else {
         return internal(&state, "/settings/app");
     };
     let (status, message) = match outcome {
@@ -749,7 +999,9 @@ pub async fn update_install(State(state): State<AppState>, headers: HeaderMap) -
             state.shutdown.notify_one();
             (
                 "applying",
-                if restarts {
+                if handoff_key.is_some() {
+                    crate::t!("ui.updates.applied_handoff").to_string()
+                } else if restarts {
                     crate::t!("ui.updates.applied_resident").to_string()
                 } else {
                     crate::t!("ui.updates.applied_once").to_string()
@@ -757,7 +1009,10 @@ pub async fn update_install(State(state): State<AppState>, headers: HeaderMap) -
             )
         }
     };
-    let fields = serde_json::json!({ "restarts": restarts && status == "applying" });
+    let mut fields = serde_json::json!({ "restarts": restarts && status == "applying" });
+    if let (Some(key), Some(map)) = (handoff_key, fields.as_object_mut()) {
+        map.insert("handoff_key".into(), serde_json::Value::String(key));
+    }
     update_reply(&state, &headers, status, message, fields)
 }
 

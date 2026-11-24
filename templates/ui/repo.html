@@ -35,7 +35,7 @@
 <section class="panel" id="repo-runs">
   <h2>{{ crate::locale::tr("ui.runs.recent") }}</h2>
   {% if recent_runs.is_empty() %}<p class="note">{{ crate::locale::tr("ui.runs.none") }}</p>{% else %}
-  <div class="table-wrap"><table>
+  <div class="table-wrap"><table class="runs-table no-repo">
     <thead><tr><th>{{ crate::locale::tr("ui.runs.time") }}</th><th>{{ crate::locale::tr("ui.runs.outcome") }}</th><th>{{ crate::locale::tr("ui.runs.documents") }}</th></tr></thead>
     <tbody>{% for r in recent_runs %}<tr><td class="nowrap">{% let t = r.time %}{% include "ui/time_secs.html" %}{% if r.attempts > 1 %} <span class="badge">&times;{{ r.attempts }}</span>{% endif %}</td><td><span class="badge{% if !r.outcome_class.is_empty() %} {{ r.outcome_class }}{% endif %}">{{ r.outcome }}</span>{% if !r.message.is_empty() %}<div class="error-text">{{ r.message }}</div>{% endif %}</td><td>{% for d in r.documents %}<div class="path">{{ d }}</div>{% endfor %}</td></tr>{% endfor %}</tbody>
   </table></div>

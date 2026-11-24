@@ -1953,6 +1953,8 @@ fn poll_repository_inner(
     notes: &RefCell<Vec<String>>,
 ) -> Result<Option<String>> {
     let initialize = opts.initialize;
+    // 保守履歴（`poll_repository_reported`）と同じ契機の値。実行中の記録（`activity`）にも使う。
+    let origin = if opts.force { "run_now" } else { "hook" };
     let Some(snapshot) = push_snapshot(root) else {
         return Ok(None);
     };
@@ -2122,7 +2124,11 @@ fn poll_repository_inner(
         && head == pushed
         && s(&state, "commit") != pushed
     {
-        if let Some(e) = maintain_and_publish_with(root, "", &[], Some(&fingerprint), &[], run) {
+        let resumed = {
+            let _activity = crate::activity::begin(origin, root);
+            maintain_and_publish_with(root, "", &[], Some(&fingerprint), &[], run)
+        };
+        if let Some(e) = resumed {
             return save_error(e, &prior_fingerprint, &prior_commit);
         }
         let resumed_commit = s(&state, "commit");
@@ -2355,14 +2361,18 @@ fn poll_repository_inner(
     {
         return Ok(Some(message));
     }
-    if let Some(e) = maintain_and_publish_with(
-        root,
-        &reason,
-        &docs,
-        Some(&fingerprint),
-        &validation_dirs,
-        run,
-    ) {
+    let published = {
+        let _activity = crate::activity::begin(origin, root);
+        maintain_and_publish_with(
+            root,
+            &reason,
+            &docs,
+            Some(&fingerprint),
+            &validation_dirs,
+            run,
+        )
+    };
+    if let Some(e) = published {
         return save_error(e, &prior_fingerprint, &prior_commit);
     }
     let processed = if own_pending {
@@ -4336,7 +4346,9 @@ pub fn publish_locked_with(
         );
         let mut prev_after = state["after"].clone();
         let error = loop {
+            crate::activity::worker(fixups, timeout);
             let outcome = run_worker_outcome(root, &prompt, &allowed, options, timeout);
+            crate::activity::phase("checking");
             // 終了を確認できないタイムアウトは、何も戻さず従来どおり停止する（子孫がまだ書くかもしれない）。
             if let Some(failure) = outcome.as_ref().filter(|f| f.timed_out && !f.confirmed) {
                 return fail(
@@ -4625,6 +4637,7 @@ pub fn publish_locked_with(
         return fail(path, &mut state, crate::t!("maint.staged_elsewhere"));
     }
     let mut operation = "ls-remote";
+    crate::activity::phase("checking");
     let publish = (|| -> Result<Option<String>> {
         let remote_head = gt(root, &["ls-remote", "--exit-code", &remote, &reference])?
             .split_whitespace()
@@ -4668,6 +4681,7 @@ pub fn publish_locked_with(
             git(root, &a)?;
             if s(&state, "phase") != "staged" {
                 operation = "add";
+                crate::activity::phase("committing");
                 state["phase"] = json!("committing");
                 save_publication(path, &mut state)?;
                 let mut a = vec!["add", "--"];
@@ -4685,6 +4699,7 @@ pub fn publish_locked_with(
                 );
             }
             operation = "commit";
+            crate::activity::phase("committing");
             let mut a = vec![
                 "commit",
                 "--only",
@@ -4742,6 +4757,7 @@ pub fn publish_locked_with(
             save_publication(path, &mut state)?;
         }
         operation = "push";
+        crate::activity::phase("pushing");
         if let Some(e) = agents_size_error(root, &size_dirs, true)
             .or_else(|| agents_tree_size_error(root, &s(&state, "commit"), &size_dirs))
         {

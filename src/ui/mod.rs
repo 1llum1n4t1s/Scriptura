@@ -4,6 +4,7 @@
 // 既定は常駐しない: `scriptura ui` で起動し、Ctrl+C／画面の「終了」（POST + CSRF）／60 分無操作で終わる。
 // `--tray` を付けると、タスクトレイ（Windows）・メニューバー（macOS）に常駐する（`tray`）。常駐は無操作で
 // 終了せず、セッションも失効させない（開いたままのタブのログインが切れない）。アイコンの「開く」のたびに使い捨て鍵を発行し直す。
+// 更新のインストールで常駐が再起動するときは、`handoff` の引き継ぎ鍵（ハッシュだけをファイルに置く）で新しい版へ自動で入り直す。
 //
 // 設計上の要点:
 // - hook の経路とは独立。hook は画面の有無を一切見ない。画面が触るのは設定ファイル（ops 経由の書き込み）、
@@ -36,6 +37,7 @@ use crate::config::Store;
 mod confirm;
 mod guard;
 mod handlers;
+mod handoff;
 pub mod locale;
 pub mod models;
 mod read;
@@ -72,6 +74,9 @@ pub struct Inner {
     creds: Mutex<Creds>,
     /// 使い捨て鍵。一度交換したら None になり、二度目は無効。常駐ではトレイの「開く」のたびに置き換える。
     auth_key: Mutex<Option<AuthKey>>,
+    /// 更新のインストールの後、新しい版が起動時に引き継ぐ鍵（ハッシュだけ）。`auth_key` とは別の枠で、
+    /// トレイの「開く」が発行する鍵と互いに無効化しない。一度交換したら None。
+    handoff: Mutex<Option<Handoff>>,
     /// 二段階確認の nonce（nonce → 結び付けた内容の SHA-256 と期限）。
     pub(crate) nonces: Mutex<HashMap<String, confirm::Pending>>,
     /// run-now のバックグラウンドジョブ。
@@ -83,6 +88,8 @@ pub struct Inner {
     /// 常駐（`--tray`）か。常駐は無操作でも終了せずログインが失効するだけで、コンソールの URL も無いため、
     /// 401 画面とフッターの文言を常駐用に切り替える。通常起動では false のまま。
     resident: AtomicBool,
+    /// 更新のインストールが進行中か（二重の要求が、先の引き継ぎのファイルを上書き・削除しないための排他）。
+    installing: AtomicBool,
 }
 
 /// セッション Cookie の値と CSRF トークン（どちらも乱数。全フォームに CSRF を埋め込み、全 POST で定数時間比較する）。
@@ -96,6 +103,21 @@ struct Creds {
 struct AuthKey {
     value: String,
     expires: Option<Instant>,
+}
+
+/// 引き継ぎ鍵のハッシュ（SHA-256 の 16 進）と期限。
+struct Handoff {
+    sha256: String,
+    expires: Instant,
+}
+
+/// 更新のインストールの排他。破棄すると解放される。
+pub(crate) struct InstallGuard(AppState);
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        self.0.installing.store(false, Ordering::SeqCst);
+    }
 }
 
 impl std::ops::Deref for AppState {
@@ -127,11 +149,13 @@ impl AppState {
                 value: key.clone(),
                 expires: None,
             })),
+            handoff: Mutex::new(None),
             nonces: Mutex::new(HashMap::new()),
             jobs: Mutex::new(handlers::Jobs::default()),
             last_activity: Mutex::new(Instant::now()),
             shutdown: tokio::sync::Notify::new(),
             resident: AtomicBool::new(false),
+            installing: AtomicBool::new(false),
         };
         (Self(Arc::new(inner)), key)
     }
@@ -207,10 +231,80 @@ impl AppState {
         value
     }
 
+    /// 更新のインストールの前に、引き継ぎ鍵を作ってハッシュだけをファイルへ書く。鍵は呼び出し元が JSON 応答にだけ載せる。
+    /// 書けなければ None（従来どおりトレイから開き直す）。
+    pub(crate) fn issue_handoff(&self) -> Option<String> {
+        let key = guard::random_token();
+        handoff::write(
+            &self.store.state_dir,
+            &key,
+            self.port(),
+            handoff::now_unix(),
+        )
+        .is_ok()
+        .then_some(key)
+    }
+
+    /// 自分が書いた引き継ぎのファイルを消す（適用に進まなかったとき）。ハッシュが `key` と一致するものだけを消す。
+    pub(crate) fn withdraw_handoff(&self, key: &str) {
+        handoff::remove_owned(&self.store.state_dir, key);
+    }
+
+    /// 更新のインストールの排他を取る。進行中なら None（鍵もファイルも触らない）。戻り値を手放すと
+    /// （失敗・panic の巻き戻しでも）解放される。
+    pub(crate) fn begin_install(&self) -> Option<InstallGuard> {
+        self.installing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+            .then(|| InstallGuard(self.clone()))
+    }
+
+    /// 常駐の起動時に、前の版が残した引き継ぎのファイルを読む。読んだ時点で必ず消し、期限内でポートが一致する
+    /// ときだけ引き継ぎ枠に持つ。常駐でなければ何もしない。
+    pub fn adopt_handoff(&self) {
+        if !self.is_resident() {
+            return;
+        }
+        let taken = handoff::take(&self.store.state_dir, self.port(), handoff::now_unix());
+        *self.handoff.lock().unwrap_or_else(|p| p.into_inner()) =
+            taken.map(|(sha256, remaining)| Handoff {
+                sha256,
+                expires: Instant::now() + remaining,
+            });
+    }
+
+    /// 引き継ぎ鍵を照合する。一致して期限内なら枠を空にして true（一度だけ有効）。不一致では何も消費しない
+    /// （`auth_key` にも触れない）。期限切れの枠は消す。
+    pub(crate) fn redeem_handoff(&self, given: &str) -> bool {
+        let mut slot = self.handoff.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(held) = slot.as_ref() else {
+            return false;
+        };
+        if Instant::now() >= held.expires {
+            *slot = None;
+            return false;
+        }
+        if guard::same(&held.sha256, &handoff::digest(given)) {
+            *slot = None;
+            return true;
+        }
+        false
+    }
+
     /// 操作があったことを記録する。
     pub(crate) fn touch(&self) {
         if let Ok(mut at) = self.last_activity.lock() {
             *at = Instant::now();
+        }
+    }
+
+    /// 最後の操作を `idle` だけ過去へ動かす（テストが、待たずに「無操作の時間が延びたか」を確かめるため）。
+    #[cfg(feature = "test-support")]
+    pub fn set_idle_for_tests(&self, idle: Duration) {
+        if let Ok(mut at) = self.last_activity.lock() {
+            *at = Instant::now()
+                .checked_sub(idle)
+                .unwrap_or_else(Instant::now);
         }
     }
 
@@ -242,6 +336,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/app.js", get(handlers::asset_js))
         .route("/assets/icon.png", get(handlers::asset_icon))
         .route("/", get(handlers::overview))
+        .route("/activity", get(handlers::activity))
         .route("/repos", get(handlers::repos))
         .route("/repos/enable", post(handlers::repo_enable))
         .route("/repos/enrollment", post(handlers::repos_enrollment_save))
@@ -549,6 +644,7 @@ fn run_resident(runtime: tokio::runtime::Runtime, args: Args) -> i32 {
     };
     let (state, key) = AppState::new(Store::current(), port);
     state.set_resident();
+    state.adopt_handoff();
     announce(port, &key, args.open, true);
     let stopped = Arc::new(AtomicBool::new(false));
     let guard = StopOnDrop(stopped.clone());
