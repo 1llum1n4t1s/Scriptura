@@ -25,6 +25,8 @@ Scriptura は、利用者が登録したリポジトリへの push 後に `AGENT
 - hook からの保守の起動・タイミング・worker の期限切れ: [docs/agents/workflow.md](docs/agents/workflow.md)
 - hook・Claude Code の `settings.json`・管理画面・プラグインのスキル: [docs/agents/hooks-settings-ui-and-plugin.md](docs/agents/hooks-settings-ui-and-plugin.md)
 - Setup 版（Velopack）の配信・自動更新・登録: [docs/agents/setup-installer-velopack.md](docs/agents/setup-installer-velopack.md)
+- Setup 版の検証の隔離: [docs/agents/testing.md](docs/agents/testing.md)
+- 配信 CI の起動・やり直し: [docs/agents/release-process.md](docs/agents/release-process.md)
 - 9 言語の表示とローカライズの決め方: [docs/agents/localization.md](docs/agents/localization.md)
 
 ## 検証

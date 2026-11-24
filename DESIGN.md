@@ -8,7 +8,7 @@
 
 ## 主要コンポーネントと責務
 
-設定・種類・タイミング、保守の本体、保守履歴、CHANGELOG、`ops`、`cli` / `ui`、`connect` / `app_update`、`locale` の責務を表にまとめています。詳細は [docs/design/components-and-responsibilities.md](docs/design/components-and-responsibilities.md) を参照してください。
+設定・種類・タイミング、保守の本体、保守履歴、実行中の記録、CHANGELOG、`ops`、`cli` / `ui`、`connect` / `app_update`、`locale` の責務を表にまとめています。詳細は [docs/design/components-and-responsibilities.md](docs/design/components-and-responsibilities.md) を参照してください。
 
 ## データフロー
 
@@ -23,6 +23,8 @@ worker が期限切れになったときの復元と再試行は [docs/design/wo
 ## 設計判断
 
 同意と propose の廃止、旧設定の変換、hook 経路で tokio を使わないこと、Setup 版の適用タイミング、上限違反の扱い、保守履歴、管理画面の常駐などを、理由とトレードオフとともに記録しています。詳細は [docs/design/design-decisions.md](docs/design/design-decisions.md) を参照してください。
+
+管理画面の更新後の再ログイン（引き継ぎ鍵）と「実行中」表示の判断は [docs/design/security.md](docs/design/security.md) を参照してください。
 
 ## ローカライズ
 
