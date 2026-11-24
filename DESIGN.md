@@ -14,6 +14,8 @@
 
 hook の起動から、期限判定、worker、保守後検査、commit と push までの流れです。詳細は [docs/design/data-flow.md](docs/design/data-flow.md) を参照してください。
 
+worker が期限切れになったときの復元と再試行は [docs/design/workflow.md](docs/design/workflow.md) を参照してください。
+
 ## 重要な不変条件
 
 設定の読み込み元、設定の書き込み経路、検査の主体、秘密値、状態 DB の版、Velopack 管理外での無作用を定めています。詳細は [docs/design/key-invariants.md](docs/design/key-invariants.md) を参照してください。
