@@ -16,3 +16,9 @@
 - `src/app_update.rs` と `src/app_update/` … Setup（Velopack）版の起動処理・確認と取得・`update-apply`・登録（`registration.rs`）・ログオンエントリ（`logon.rs`）・プロセス検出（`processes.rs`）・署名者検証（`trust.rs`）。
 - `src/locale.rs` と `src/locales/` … 表示言語の判定と 9 言語の辞書（下のローカライズの節）。`src/ui/locale.rs` … 管理画面の言語（Cookie・Accept-Language・選択欄）。
 - `plugins/scriptura/` と `.claude-plugin/` … Claude Code プラグイン（hook とスキル）。`xtask/` … プラグイン配布物の梱包（本体の同梱・`SHA256SUMS`・zip）。
+
+## 管理画面（`src/ui/`）の決まり
+
+- hook から独立させ、tokio は `ui::run` の中だけで初期化する。feature `ui` なしのビルドが通ること。
+- サーバーはワーカー側、OS のメッセージループはメインスレッドで動かす。トレイは `tray::Control` 越しにだけサーバーへ触れる。
+- 画面とルートは [api-reference.md](api-reference.md)、保護は [security.md](security.md)。
