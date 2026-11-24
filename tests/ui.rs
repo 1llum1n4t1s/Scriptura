@@ -2410,7 +2410,7 @@ async fn worker_model_and_effort_are_selects_with_server_side_checks() {
     let efforts = option_values(&page.body, "effort");
     let ids: Vec<&str> = efforts.iter().map(|(v, _)| v.as_str()).collect();
     assert_eq!(ids, ["low", "medium", "high", "xhigh", "max"]);
-    assert!(efforts.iter().any(|(v, s)| v == "high" && *s));
+    assert!(efforts.iter().any(|(v, s)| v == "medium" && *s));
     // 一覧にない値は、新たには保存できない（1 文字違い・改ざん）。設定は変わらない。
     let rev = fx.revision();
     let r = fx
@@ -3356,6 +3356,13 @@ async fn history_rows_have_four_columns_and_fold_the_rest() {
     assert!(
         !b[row_start..reason].contains("run-details"),
         "理由は詳細の外"
+    );
+    // 詳細は文書の列に押し込まず、行の下に表の全幅で開く。
+    assert_eq!(
+        b.matches(r#"<tr class="run-detail-row"><td colspan="4"><details class="run-details">"#)
+            .count(),
+        2,
+        "{b}"
     );
     // 絞り込みは選ぶと反映（JS が無ければ適用ボタン）。
     assert!(

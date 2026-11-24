@@ -2,7 +2,7 @@
 
 # Scriptura
 
-Scriptura 会在你向自己的仓库 push 之后，于后台维护 `AGENTS.md` / `DESIGN.md` / `README.md`（以及作为可选项的 `CHANGELOG.md` 和用户自定义的文档）。它由 Claude Code 的 hook 启动（在通过 Bash 或 PowerShell 工具执行 `git push` 之后，以及会话开始时补处理遗漏的 push），维护工作由 Claude Code CLI 执行（默认是 `claude -p --model claude-sonnet-5-5 --effort high`），不依赖 Codex。
+Scriptura 会在你向自己的仓库 push 之后，于后台维护 `AGENTS.md` / `DESIGN.md` / `README.md`（以及作为可选项的 `CHANGELOG.md` 和用户自定义的文档）。它由 Claude Code 的 hook 启动（在通过 Bash 或 PowerShell 工具执行 `git push` 之后，以及会话开始时补处理遗漏的 push），维护工作由 Claude Code CLI 执行（默认是 `claude -p --model claude-sonnet-5-5 --effort medium`），不依赖 Codex。
 
 - **默认安全。** 在你用 `scriptura enable`（或在管理界面）注册仓库之前，什么都不会运行，而启用需要远程仓库（remote）和上游分支（upstream）。没有审核步骤：每次 push 之后，worker 会更新对象文档，Scriptura 会自动 commit 并 push；维护后的检查发现对象文档之外有改动时，不会 commit。同意记录和以前的 `propose` 模式（更新提案）已被移除（参见“旧设置的迁移”）。
 - 设置只从用户主目录下的单个文件（`config.toml`）及其同级的 `templates/` 文件夹读取。仓库内文件所做的启用或配置一律不读取（这样，仅仅 clone 了别人的仓库，也绝不会触发自动行为）。
@@ -93,7 +93,7 @@ exclude = ["private/**"]                        # 追加到默认的敏感模式
 
 [worker]
 model = "claude-sonnet-5-5"
-effort = "high"
+effort = "medium"
 timeout_secs = 1200                             # 60..=1500（比 hook 的 1800 秒短）
 permission = "restricted"                       # restricted / bypass
 claude_path = ""                                # 留空表示在 PATH 中查找（指定时为绝对路径）

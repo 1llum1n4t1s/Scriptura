@@ -2,7 +2,7 @@
 
 # Scriptura
 
-自分のリポジトリへ push したあとに、`AGENTS.md` / `DESIGN.md` / `README.md`（と、オプトインで `CHANGELOG.md` や利用者が定義したカスタムの文書）をバックグラウンドで保守するツールです。Claude Code の hook（Bash・PowerShell ツールでの `git push` の直後と、取りこぼしを回収するセッション開始時）から起動し、保守の worker には Claude Code CLI（既定は `claude -p --model claude-sonnet-5-5 --effort high`）を使います。Codex には依存しません。
+自分のリポジトリへ push したあとに、`AGENTS.md` / `DESIGN.md` / `README.md`（と、オプトインで `CHANGELOG.md` や利用者が定義したカスタムの文書）をバックグラウンドで保守するツールです。Claude Code の hook（Bash・PowerShell ツールでの `git push` の直後と、取りこぼしを回収するセッション開始時）から起動し、保守の worker には Claude Code CLI（既定は `claude -p --model claude-sonnet-5-5 --effort medium`）を使います。Codex には依存しません。
 
 - **既定は安全側**です。`scriptura enable`（または管理画面）でリポジトリを登録するまで何も動かず、有効化には remote と upstream が必要です。確認の手順はなく、push のたびに worker が対象の文書を更新し、Scriptura が自動で commit と push をします。保守後の検査で、対象の文書以外が変わっていれば commit しません。同意の記録と、以前の `propose` モード（更新案）は廃止しました（「旧設定の移行」を参照）。
 - 設定は利用者のホーム配下の 1 ファイル（`config.toml`）と、同じフォルダーの `templates/` だけから読みます。リポジトリ内のファイルからの有効化・設定は読みません（他人のリポジトリを clone しただけで自動動作が始まる経路を作らないため）。
@@ -93,7 +93,7 @@ exclude = ["private/**"]                        # 既定の機密パターンに
 
 [worker]
 model = "claude-sonnet-5-5"
-effort = "high"
+effort = "medium"
 timeout_secs = 1200                             # 60..=1500（hook の 1800 秒より短く）
 permission = "restricted"                       # restricted / bypass
 claude_path = ""                                # 空なら PATH から探す（指定は絶対パス）

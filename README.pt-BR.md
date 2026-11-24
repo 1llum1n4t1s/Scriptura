@@ -2,7 +2,7 @@
 
 # Scriptura
 
-O Scriptura mantém `AGENTS.md` / `DESIGN.md` / `README.md` (e, como opções ativadas por adesão, `CHANGELOG.md` e documentos personalizados definidos pelo usuário) em segundo plano depois que você faz push nos seus próprios repositórios. Ele é iniciado por hooks do Claude Code (logo após um `git push` executado pela ferramenta Bash ou PowerShell e ao iniciar uma sessão, para recuperar o que tenha sido perdido), e seu worker de manutenção é a CLI do Claude Code (por padrão `claude -p --model claude-sonnet-5-5 --effort high`). Ele não depende do Codex.
+O Scriptura mantém `AGENTS.md` / `DESIGN.md` / `README.md` (e, como opções ativadas por adesão, `CHANGELOG.md` e documentos personalizados definidos pelo usuário) em segundo plano depois que você faz push nos seus próprios repositórios. Ele é iniciado por hooks do Claude Code (logo após um `git push` executado pela ferramenta Bash ou PowerShell e ao iniciar uma sessão, para recuperar o que tenha sido perdido), e seu worker de manutenção é a CLI do Claude Code (por padrão `claude -p --model claude-sonnet-5-5 --effort medium`). Ele não depende do Codex.
 
 - **Seguro por padrão.** Nada é executado até que você registre um repositório com `scriptura enable` (ou na interface administrativa), e ativá-lo exige um remote e um upstream. Não há etapa de revisão: após cada push o worker atualiza os documentos alvo e o Scriptura faz commit e push automaticamente, e uma verificação posterior à manutenção se recusa a fazer commit de qualquer coisa que não sejam os documentos alvo. O registro de consentimento e o antigo modo `propose` (propostas de atualização) foram removidos; veja "Migração das configurações antigas".
 - As configurações são lidas somente de um único arquivo na pasta pessoal do usuário (`config.toml`) e da pasta `templates/` ao lado dele. Ativação ou configuração por arquivos dentro de um repositório nunca é lida (para que o simples fato de clonar o repositório de outra pessoa jamais possa iniciar um comportamento automático).
@@ -93,7 +93,7 @@ exclude = ["private/**"]                        # ADDED to the default sensitive
 
 [worker]
 model = "claude-sonnet-5-5"
-effort = "high"
+effort = "medium"
 timeout_secs = 1200                             # 60..=1500 (shorter than the hook's 1800 seconds)
 permission = "restricted"                       # restricted / bypass
 claude_path = ""                                # empty means search PATH (an absolute path if specified)

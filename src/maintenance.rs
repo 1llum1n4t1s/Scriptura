@@ -2046,6 +2046,16 @@ fn poll_repository_inner(
             .push(failure_draft(&snapshot, &path, &message, commit, &pushed));
         Ok(Some(message))
     };
+    // worker が期限切れになり、出力を戻して止まった対象コミットは、hook のたびに長い worker を繰り返し
+    // 起動しない。新しい push（HEAD が進むと下の古い記録の解消で新しい保守になる）か run-now（force）で
+    // 再試行する。処理済み位置は進めず、記録も変えない（失敗は最初の回で通知済み）。
+    if !opts.force
+        && s(&state, "phase") == "worker_failed"
+        && state["worker_timed_out"] == json!(true)
+        && s(&state, "head") == head
+    {
+        return Ok(None);
+    }
     if s(&state, "phase") == "complete"
         && !s(&state, "commit").is_empty()
         && head == pushed
@@ -3158,11 +3168,15 @@ pub fn run_maintenance_worker_with(
     .map(|f| f.message)
 }
 
-/// worker の失敗。`timed_out` は終了状態が確定しないタイムアウト（文言は表示言語で変わるため、
-/// 判定は文言ではなくこの値で行う）。
+/// worker の失敗。`timed_out` はタイムアウト（文言は表示言語で変わるため、判定は文言ではなくこの値で行う）。
+/// `confirmed` は、タイムアウトした worker（Windows では job の子孫を含む）の終了を確認できたこと
+/// （`process::capture` が `ErrorKind::TimedOut` を返すのは、終了・回収・pipe の読み切り・job の空きが
+/// すべて成功したときだけ）。`timed_out` かつ `!confirmed` は終了状態が不確定で、自動では何も戻さない。
+/// 非 Windows の managed 実行は子孫まで止めない（`empty` が固定の true）ので、終了を確認できたとは扱わない。
 struct WorkerFailure {
     message: String,
     timed_out: bool,
+    confirmed: bool,
 }
 
 fn run_worker_outcome(
@@ -3176,6 +3190,7 @@ fn run_worker_outcome(
         Some(WorkerFailure {
             message,
             timed_out: false,
+            confirmed: false,
         })
     };
     let executable = claude_executable(&options.worker);
@@ -3218,10 +3233,12 @@ fn run_worker_outcome(
         Err(e) if e.kind() == io::ErrorKind::TimedOut => Some(WorkerFailure {
             message: crate::t!("maint.worker_timeout", seconds = seconds),
             timed_out: true,
+            confirmed: cfg!(windows),
         }),
         Err(e) if e.to_string().contains("termination unconfirmed") => Some(WorkerFailure {
             message: crate::t!("maint.worker_termination_unconfirmed").into(),
             timed_out: true,
+            confirmed: false,
         }),
         Err(_) => failed(crate::t!("maint.worker_spawn_failed").into()),
     }
@@ -3604,6 +3621,105 @@ fn discard_outputs(root: &Path, state: &Value) -> Vec<String> {
     }
     kept
 }
+/// 保守ループの worker の期限（秒）。テスト用に、設定の下限（60 秒）より短い期限を環境変数で指定できる。
+fn loop_timeout_secs(options: &MaintenanceOptions) -> u64 {
+    #[cfg(feature = "test-support")]
+    if let Some(seconds) = env::var("SCRIPTURA_TEST_WORKER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return seconds;
+    }
+    options.worker.timeout_secs
+}
+/// 追い修正に使える時間（`kinds::fixup_budget`）。テスト用に、最短の残り秒数を環境変数で変えられる。
+fn fixup_budget(timeout_secs: u64, elapsed: Duration) -> Option<Duration> {
+    #[cfg(feature = "test-support")]
+    if let Some(minimum) = env::var("SCRIPTURA_TEST_FIXUP_MIN_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        let remaining = Duration::from_secs(timeout_secs).checked_sub(elapsed)?;
+        return (remaining.as_secs() >= minimum).then_some(remaining);
+    }
+    crate::kinds::fixup_budget(timeout_secs, elapsed)
+}
+/// 追い修正を起動する直前の、許可パスの生バイト列（ファイルが無いパスは None）。
+type Checkpoint = Vec<(String, Option<Vec<u8>>)>;
+/// 許可パスの現在の内容を、記録（`state[key]`: `before` か `after`）と一致することを確かめたうえで持つ。
+/// 対象が安全に扱えない・読めない・記録と違うときは None（追い修正は起動しない。最初の起動は
+/// `discard_outputs` へ退避する）。
+fn take_checkpoint(root: &Path, state: &Value, key: &str) -> Option<Checkpoint> {
+    let after = state[key].as_object()?;
+    let mut points = Vec::new();
+    for (relative, digest) in after {
+        let bytes = match document_hash(root, relative).ok()? {
+            Some(_) => Some(fs::read(root.join(relative)).ok()?),
+            None => None,
+        };
+        if json!(bytes.as_ref().map(|b| hash(b))) != *digest {
+            return None;
+        }
+        points.push((relative.clone(), bytes));
+    }
+    Some(points)
+}
+/// `restore_checkpoint` の単体テスト用の入口（`files` は (パス, 戻す内容。None は「無い」)）。
+#[cfg(feature = "test-support")]
+pub fn restore_checkpoint_for_test(
+    root: &Path,
+    files: &[(&str, Option<&[u8]>)],
+    measured: &Value,
+) -> Vec<String> {
+    let checkpoint: Checkpoint = files
+        .iter()
+        .map(|(relative, bytes)| (relative.to_string(), bytes.map(<[u8]>::to_vec)))
+        .collect();
+    restore_checkpoint(root, &checkpoint, measured)
+}
+/// 追い修正がタイムアウトしたとき、その追い修正が書いた変更だけを `checkpoint` の内容へ戻す。
+/// `measured` は終了確認の直後に測ったハッシュ。現在の内容がそれと一致するもの（利用者が触っていないもの）
+/// だけを戻し、書いた後もハッシュで確かめる。戻せなかったパスを返す。
+fn restore_checkpoint(root: &Path, checkpoint: &Checkpoint, measured: &Value) -> Vec<String> {
+    let mut failed = Vec::new();
+    for (relative, bytes) in checkpoint {
+        let wanted = json!(bytes.as_ref().map(|b| hash(b)));
+        let measured = measured.get(relative).cloned().unwrap_or(Value::Null);
+        if measured == wanted {
+            continue;
+        }
+        let current = document_hash(root, relative).map(|v| json!(v));
+        if current.as_ref().ok() != Some(&measured) {
+            failed.push(relative.clone());
+            continue;
+        }
+        let target = root.join(relative);
+        let written = match bytes {
+            Some(data) => {
+                target
+                    .parent()
+                    .is_none_or(|parent| fs::create_dir_all(parent).is_ok())
+                    && fs::write(&target, data).is_ok()
+            }
+            None => {
+                let removed = fs::remove_file(&target).is_ok();
+                if removed
+                    && let Some(parent) = target.parent()
+                    && parent != root
+                {
+                    // 追い修正が作った分割先を空のまま残さない（中身があれば消えない）。
+                    let _ = fs::remove_dir(parent);
+                }
+                removed
+            }
+        };
+        let now = document_hash(root, relative).map(|v| json!(v));
+        if !written || now.as_ref().ok() != Some(&wanted) {
+            failed.push(relative.clone());
+        }
+    }
+    failed
+}
 /// 復元後の内容が記録（変更前）のハッシュと一致しているか。
 fn matches_before(root: &Path, relative: &str, before_digest: &Value) -> bool {
     document_hash(root, relative)
@@ -3923,13 +4039,17 @@ pub fn publish_locked_with(
                 .unwrap_or_else(|| state["head"].as_str().unwrap_or(""))
     {
         let kept = discard_outputs(root, &state);
-        stale_note = Some(if kept.is_empty() {
-            crate::t!("maint.stale_output_discarded").to_string()
-        } else {
-            crate::t!(
-                "maint.stale_output_discarded_kept",
-                paths = kept.join(crate::t!("list.separator"))
-            )
+        // 期限切れで出力を戻し済みの記録は、違反の出力を破棄した旨の通知を出さない（既に戻して通知済み）。
+        let restored_on_timeout = kept.is_empty() && state["worker_timed_out"] == json!(true);
+        stale_note = (!restored_on_timeout).then(|| {
+            if kept.is_empty() {
+                crate::t!("maint.stale_output_discarded").to_string()
+            } else {
+                crate::t!(
+                    "maint.stale_output_discarded_kept",
+                    paths = kept.join(crate::t!("list.separator"))
+                )
+            }
         });
         state["phase"] = json!("complete");
         state["error"] = Value::Null;
@@ -4173,6 +4293,10 @@ pub fn publish_locked_with(
             crate::kinds::agents_required_note(&existing_agents)
         );
         state["phase"] = json!("worker_running");
+        if let Some(m) = state.as_object_mut() {
+            m.remove("worker_timed_out");
+            m.remove("timeout_note");
+        }
         save_publication(path, &mut state)?;
         // 上限・必須見出し・AGENTS の大きさに違反が残っていれば、違反だけを直す再実行を最大 `MAX_FIXUPS` 回
         // 同じ hook の中で行う。期限は最初の起動から `timeout_secs` を共有する。
@@ -4189,19 +4313,40 @@ pub fn publish_locked_with(
         } else {
             crate::kinds::fixup_prompt(&resolved_kinds, &[], &resume_fix, &allowed)
         };
-        let mut timeout = Duration::from_secs(options.worker.timeout_secs);
+        let mut timeout = Duration::from_secs(loop_timeout_secs(options));
+        // 追い修正（ready からの再開による最初の起動を含む）を起動する直前の内容と記録。その追い修正が
+        // 終了を確認できるタイムアウトになったとき、書いた変更だけをこの内容へ戻す。
+        // 通常の最初の起動は変更前（`before`）の内容、ready からの再開は直前の記録（`after`）の内容。
+        let mut checkpoint: Option<Checkpoint> = take_checkpoint(
+            root,
+            &state,
+            if resume_fix.is_empty() {
+                "before"
+            } else {
+                "after"
+            },
+        );
+        let mut prev_after = state["after"].clone();
         let error = loop {
             let outcome = run_worker_outcome(root, &prompt, &allowed, options, timeout);
-            if let Some(failure) = outcome.as_ref().filter(|f| f.timed_out) {
+            // 終了を確認できないタイムアウトは、何も戻さず従来どおり停止する（子孫がまだ書くかもしれない）。
+            if let Some(failure) = outcome.as_ref().filter(|f| f.timed_out && !f.confirmed) {
                 return fail(
                     path,
                     &mut state,
                     crate::t!("maint.timeout_stopped", error = failure.message),
                 );
             }
+            // 終了を確認できたタイムアウトは、事後検査・記録のあとで下の分岐が扱う。
+            let timed_out_message = outcome
+                .as_ref()
+                .filter(|f| f.timed_out)
+                .map(|f| f.message.clone());
             // 事後検査（Restricted のみ）: 許可文書以外が変わっていれば、commit もせず失敗扱いにする。
             // 対象外の変更は自動では戻さない（利用者の作業を損なわないため）。記録して再実行を止める。
-            let mut error = outcome.map(|f| f.message);
+            let mut error = outcome
+                .filter(|f| !f.timed_out)
+                .map(|f| f.message);
             let post_snapshot = pre_snapshot
                 .as_ref()
                 .map(|_| worktree_snapshot_with(root, false));
@@ -4238,6 +4383,66 @@ pub fn publish_locked_with(
                 after.insert(relative.clone(), json!(document_hash(root, relative)?));
             }
             state["after"] = json!(after);
+            if error.is_none()
+                && let Some(message) = timed_out_message
+            {
+                let paths = || allowed.join(crate::t!("list.separator"));
+                if fixups == 0 && resume_fix.is_empty() {
+                    // 最初の起動の期限切れ: 変更前へ戻し、同じ対象コミットでは自動で再実行しない
+                    // （新しい push か run-now まで待つ）。起動前に持った生バイト列で戻す（gitignore 済みの
+                    // 共有文書は git で戻せない）。持てなかったときだけ `discard_outputs` へ退避する。
+                    let kept = match checkpoint.take() {
+                        Some(points) => restore_checkpoint(root, &points, &state["after"]),
+                        None => discard_outputs(root, &state),
+                    };
+                    // 戻せたパスだけ記録も変更前に揃える（同じ HEAD の run-now が、戻せたパスの食い違いで
+                    // 失敗しないように）。戻せなかったパスは、worker 終了時の記録のまま残す。
+                    let mut merged = state["after"].as_object().cloned().unwrap_or_default();
+                    for (relative, digest) in state["before"].as_object().into_iter().flatten() {
+                        if !kept.contains(relative) {
+                            merged.insert(relative.clone(), digest.clone());
+                        }
+                    }
+                    state["after"] = json!(merged);
+                    state["worker_timed_out"] = json!(true);
+                    break Some(if kept.is_empty() {
+                        crate::t!("maint.timeout_restored", error = message)
+                    } else {
+                        crate::t!(
+                            "maint.timeout_restored_kept",
+                            error = message,
+                            paths = kept.join(crate::t!("list.separator"))
+                        )
+                    });
+                } else if let Some(points) = checkpoint.take() {
+                    // 追い修正の期限切れ: その追い修正が書いた変更だけを直前の内容へ戻し、追い修正を打ち切る。
+                    // 以降は「残り時間が足りず追い修正を省いた」場合と同じ経路（保守後検査）へ進む。
+                    let failed = restore_checkpoint(root, &points, &state["after"]);
+                    if !failed.is_empty() {
+                        return fail(
+                            path,
+                            &mut state,
+                            crate::t!(
+                                "maint.timeout_not_restored",
+                                error = message,
+                                paths = failed.join(crate::t!("list.separator"))
+                            ),
+                        );
+                    }
+                    state["after"] = prev_after.clone();
+                    state["timeout_note"] = json!(crate::t!(
+                        "maint.fixup_timeout_warning",
+                        seconds = timeout.as_secs()
+                    ));
+                    break None;
+                }
+                // 追い修正の直前の内容を持てていない（ready からの再開）: 戻せないので停止する。
+                return fail(
+                    path,
+                    &mut state,
+                    crate::t!("maint.timeout_not_restored", error = message, paths = paths()),
+                );
+            }
             if error.is_some() {
                 break error;
             }
@@ -4258,11 +4463,15 @@ pub fn publish_locked_with(
             if (violations.is_empty() && agents.is_empty()) || fixups >= max_fixups {
                 break None;
             }
-            let Some(budget) =
-                crate::kinds::fixup_budget(options.worker.timeout_secs, started.elapsed())
-            else {
+            let Some(budget) = fixup_budget(loop_timeout_secs(options), started.elapsed()) else {
                 break None;
             };
+            // 直前の内容を持てない（読めない・記録と違う）なら、書きかけを戻せないので追い修正は起動しない。
+            let Some(points) = take_checkpoint(root, &state, "after") else {
+                break None;
+            };
+            checkpoint = Some(points);
+            prev_after = state["after"].clone();
             fixups += 1;
             state["fixups"] = json!(fixups);
             save_publication(path, &mut state)?;
@@ -4298,6 +4507,8 @@ pub fn publish_locked_with(
         .cloned()
         .collect();
     let (hard, violations) = hard_violation(root, &state, &size_dirs, options, &editable);
+    // 追い修正が期限切れになり、書きかけを取り消して進んだときの警告（`worker` の節で記録）。
+    let timeout_note = s(&state, "timeout_note");
     if let Some(e) = hard {
         let kept = discard_outputs(root, &state);
         if kept.is_empty() {
@@ -4305,6 +4516,13 @@ pub fn publish_locked_with(
             state["after"] = state["before"].clone();
         }
         let mut message = crate::t!("maint.output_discarded", error = e);
+        if !timeout_note.is_empty() {
+            message = crate::t!(
+                "maint.join_sentences",
+                first = timeout_note,
+                second = message
+            );
+        }
         // AGENTS の大きさが原因なら、利用者が直すために、どのファイルを何バイト削る必要があるかを添える。
         if let Some(shortfall) = agents_shortfall_note(root, &size_dirs, &editable) {
             message = crate::t!("maint.join_sentences", first = message, second = shortfall);
@@ -4326,15 +4544,23 @@ pub fn publish_locked_with(
         save_publication(path, &mut state)?;
         return Ok(None);
     }
-    if !violations.is_empty() {
-        let message = crate::t!(
-            "maint.limit_committed_over",
-            problems = violations
-                .iter()
-                .map(crate::kinds::Violation::message)
-                .collect::<Vec<_>>()
-                .join(crate::t!("list.separator"))
-        );
+    if !violations.is_empty() || !timeout_note.is_empty() {
+        let mut message = timeout_note.clone();
+        if !violations.is_empty() {
+            let limits = crate::t!(
+                "maint.limit_committed_over",
+                problems = violations
+                    .iter()
+                    .map(crate::kinds::Violation::message)
+                    .collect::<Vec<_>>()
+                    .join(crate::t!("list.separator"))
+            );
+            message = if message.is_empty() {
+                limits
+            } else {
+                crate::t!("maint.join_sentences", first = message, second = limits)
+            };
+        }
         state["limit_warning"] = json!(message);
         state["warning"] = json!(message);
         push_note(&mut state, message);

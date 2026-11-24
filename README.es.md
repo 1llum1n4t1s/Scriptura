@@ -2,7 +2,7 @@
 
 # Scriptura
 
-Scriptura mantiene en segundo plano `AGENTS.md` / `DESIGN.md` / `README.md` (y, de forma opcional, `CHANGELOG.md` y documentos personalizados definidos por el usuario) después de hacer push a sus propios repositorios. Se inicia desde hooks de Claude Code (justo después de un `git push` ejecutado con la herramienta Bash o PowerShell y al iniciar una sesión, para recuperar lo que se haya pasado por alto), y su worker de mantenimiento es la CLI de Claude Code (por defecto `claude -p --model claude-sonnet-5-5 --effort high`). No depende de Codex.
+Scriptura mantiene en segundo plano `AGENTS.md` / `DESIGN.md` / `README.md` (y, de forma opcional, `CHANGELOG.md` y documentos personalizados definidos por el usuario) después de hacer push a sus propios repositorios. Se inicia desde hooks de Claude Code (justo después de un `git push` ejecutado con la herramienta Bash o PowerShell y al iniciar una sesión, para recuperar lo que se haya pasado por alto), y su worker de mantenimiento es la CLI de Claude Code (por defecto `claude -p --model claude-sonnet-5-5 --effort medium`). No depende de Codex.
 
 - **Seguro por defecto.** No se ejecuta nada hasta que registre un repositorio con `scriptura enable` (o en la interfaz de administración), y activarlo exige un remote y un upstream. No hay paso de revisión: tras cada push el worker actualiza los documentos de destino y Scriptura hace commit y push automáticamente, y una comprobación posterior al mantenimiento se niega a hacer commit de cualquier cosa que no sean los documentos de destino. El registro de consentimiento y el antiguo modo `propose` (propuestas de actualización) se han eliminado; consulte «Migración de la configuración antigua».
 - La configuración se lee únicamente de un único archivo bajo el directorio personal del usuario (`config.toml`) y de la carpeta `templates/` contigua. Nunca se lee una activación o configuración procedente de archivos dentro de un repositorio (de modo que el simple hecho de clonar un repositorio ajeno nunca pueda iniciar un comportamiento automático).
@@ -93,7 +93,7 @@ exclude = ["private/**"]                        # SE AÑADE a los patrones sensi
 
 [worker]
 model = "claude-sonnet-5-5"
-effort = "high"
+effort = "medium"
 timeout_secs = 1200                             # 60..=1500 (más corto que los 1800 segundos del hook)
 permission = "restricted"                       # restricted / bypass
 claude_path = ""                                # vacío significa buscar en el PATH (una ruta absoluta si se especifica)

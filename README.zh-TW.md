@@ -2,7 +2,7 @@
 
 # Scriptura
 
-Scriptura 會在你 push 到自己的儲存庫之後，於背景維護 `AGENTS.md` / `DESIGN.md` / `README.md`（以及可選擇啟用的 `CHANGELOG.md` 和使用者自訂文件）。它由 Claude Code 的 hook 啟動（在透過 Bash 或 PowerShell 工具執行 `git push` 之後，以及工作階段開始時補處理遺漏的 push），負責維護的 worker 是 Claude Code CLI（預設為 `claude -p --model claude-sonnet-5-5 --effort high`）。它不依賴 Codex。
+Scriptura 會在你 push 到自己的儲存庫之後，於背景維護 `AGENTS.md` / `DESIGN.md` / `README.md`（以及可選擇啟用的 `CHANGELOG.md` 和使用者自訂文件）。它由 Claude Code 的 hook 啟動（在透過 Bash 或 PowerShell 工具執行 `git push` 之後，以及工作階段開始時補處理遺漏的 push），負責維護的 worker 是 Claude Code CLI（預設為 `claude -p --model claude-sonnet-5-5 --effort medium`）。它不依賴 Codex。
 
 - **預設即安全。** 在你用 `scriptura enable`（或在管理介面）註冊儲存庫之前，什麼都不會執行，而啟用需要 remote 與 upstream。沒有審核步驟：每次 push 之後，worker 會更新目標文件，Scriptura 會自動 commit 並 push；維護後檢查發現目標文件以外有變更時，不會 commit。同意紀錄與先前的 `propose` 模式（更新提案）已被移除（請見「舊設定的遷移」）。
 - 設定只會從使用者家目錄下的單一檔案（`config.toml`）及其旁邊的 `templates/` 資料夾讀取。儲存庫內的檔案一律不會被當作啟用或設定的來源（因此只是 clone 他人的儲存庫，也絕不會觸發自動行為）。
@@ -93,7 +93,7 @@ exclude = ["private/**"]                        # 會「追加」到預設的敏
 
 [worker]
 model = "claude-sonnet-5-5"
-effort = "high"
+effort = "medium"
 timeout_secs = 1200                             # 60..=1500（比 hook 的 1800 秒短）
 permission = "restricted"                       # restricted / bypass
 claude_path = ""                                # 空字串表示搜尋 PATH（若有指定則為絕對路徑）

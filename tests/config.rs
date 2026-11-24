@@ -61,7 +61,7 @@ fn defaults_are_safe() {
     assert_eq!(c.schema, CURRENT_SCHEMA);
     assert_eq!(c.defaults.documents, Document::ALL.to_vec());
     assert_eq!(c.worker.model, "claude-sonnet-5-5");
-    assert_eq!(c.worker.effort, "high");
+    assert_eq!(c.worker.effort, "medium");
     assert_eq!(c.worker.timeout_secs, 1200);
     assert_eq!(c.worker.permission, Permission::Restricted);
     assert_eq!(c.enrollment.policy, Policy::Explicit);

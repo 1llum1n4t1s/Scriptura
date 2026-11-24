@@ -15,8 +15,8 @@
       <td class="nowrap">{% let t = r.time %}{% include "ui/time_secs.html" %}{% if r.attempts > 1 %} <span class="badge">&times;{{ r.attempts }}</span>{% endif %}</td>
       <td>{% if let Some(i) = r.repo_index %}<a href="/repos/{{ i }}" title="{{ r.repo_label }}">{{ r.repo_name }}</a>{% else %}<span title="{{ r.repo_label }}">{{ r.repo_name }}</span>{% endif %}</td>
       <td><span class="badge{% if !r.outcome_class.is_empty() %} {{ r.outcome_class }}{% endif %}">{{ r.outcome }}</span>{% if !r.message.is_empty() %}<div class="error-text">{{ r.message }}</div>{% endif %}</td>
-      <td>{% for d in r.documents %}<div class="path">{{ d }}</div>{% endfor %}
-        <details class="run-details"><summary>{{ crate::locale::tr("ui.runs.details") }}</summary>
+      <td>{% for d in r.documents %}<div class="path">{{ d }}</div>{% endfor %}</td>
+    </tr><tr class="run-detail-row"><td colspan="4"><details class="run-details"><summary>{{ crate::locale::tr("ui.runs.details") }}</summary>
           <dl class="facts">
             <dt>{{ crate::locale::tr("ui.common.repository") }}</dt><dd><code>{{ r.repo_label }}</code></dd>
             <dt>{{ crate::locale::tr("ui.runs.origin") }}</dt><dd>{{ r.origin }}</dd>

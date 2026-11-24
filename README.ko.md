@@ -2,7 +2,7 @@
 
 # Scriptura
 
-Scriptura는 본인 저장소에 push한 뒤 백그라운드에서 `AGENTS.md` / `DESIGN.md` / `README.md`(그리고 옵트인으로 `CHANGELOG.md`와 사용자 정의 커스텀 문서)를 유지 관리합니다. Claude Code의 hook(Bash 또는 PowerShell 도구로 `git push`를 실행한 직후와, 놓친 push를 처리하는 세션 시작 시)에서 실행되며, 유지 관리 worker는 Claude Code CLI(기본값은 `claude -p --model claude-sonnet-5-5 --effort high`)입니다. Codex에는 의존하지 않습니다.
+Scriptura는 본인 저장소에 push한 뒤 백그라운드에서 `AGENTS.md` / `DESIGN.md` / `README.md`(그리고 옵트인으로 `CHANGELOG.md`와 사용자 정의 커스텀 문서)를 유지 관리합니다. Claude Code의 hook(Bash 또는 PowerShell 도구로 `git push`를 실행한 직후와, 놓친 push를 처리하는 세션 시작 시)에서 실행되며, 유지 관리 worker는 Claude Code CLI(기본값은 `claude -p --model claude-sonnet-5-5 --effort medium`)입니다. Codex에는 의존하지 않습니다.
 
 - **기본값이 안전합니다.** `scriptura enable`(또는 관리 화면)로 저장소를 등록하기 전에는 아무것도 실행되지 않으며, 활성화에는 remote와 upstream이 필요합니다. 검토 단계는 없습니다. push할 때마다 worker가 대상 문서를 업데이트하고 Scriptura가 자동으로 commit과 push를 하며, 유지 관리 후 검사에서 대상 문서 외의 변경이 발견되면 commit하지 않습니다. 동의 기록과 이전의 `propose` 모드(업데이트 제안)는 제거되었습니다(「이전 설정의 마이그레이션」 참조).
 - 설정은 사용자 홈 디렉터리 아래의 파일 하나(`config.toml`)와 그 옆의 `templates/` 폴더에서만 읽습니다. 저장소 안의 파일을 통한 활성화나 설정은 읽지 않습니다(다른 사람의 저장소를 clone하기만 해도 자동 동작이 시작되는 일이 없도록 하기 위해서입니다).
@@ -93,7 +93,7 @@ exclude = ["private/**"]                        # 기본 민감 패턴에 추가
 
 [worker]
 model = "claude-sonnet-5-5"
-effort = "high"
+effort = "medium"
 timeout_secs = 1200                             # 60..=1500 (hook의 1800초보다 짧게)
 permission = "restricted"                       # restricted / bypass
 claude_path = ""                                # 비어 있으면 PATH를 검색 (지정하면 절대 경로)

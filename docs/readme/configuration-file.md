@@ -19,7 +19,7 @@ exclude = ["private/**"]                        # ADDED to the default sensitive
 
 [worker]
 model = "claude-sonnet-5-5"
-effort = "high"
+effort = "medium"
 timeout_secs = 1200                             # 60..=1500 (shorter than the hook's 1800 seconds)
 permission = "restricted"                       # restricted / bypass
 claude_path = ""                                # empty means search PATH (an absolute path if specified)

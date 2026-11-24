@@ -379,6 +379,9 @@ impl Fixture {
                 "HOOK_STUB_WRITES",
                 "HOOK_STUB_EXIT",
                 "HOOK_STUB_SLEEP",
+                "HOOK_STUB_SLEEP_AFTER_WRITE",
+                "SCRIPTURA_TEST_FIXUP_MIN_SECS",
+                "SCRIPTURA_TEST_WORKER_TIMEOUT_SECS",
                 "HOOK_STUB_GH_JSON",
                 "HOOK_STUB_GH_EXIT",
                 "HOOK_STUB_GITHUB_AFTER_WORKER",
@@ -574,6 +577,9 @@ impl Drop for Fixture {
                 "SCRIPTURA_DB",
                 "SCRIPTURA_CONFIG",
                 "HOOK_STUB_SLEEP",
+                "HOOK_STUB_SLEEP_AFTER_WRITE",
+                "SCRIPTURA_TEST_FIXUP_MIN_SECS",
+                "SCRIPTURA_TEST_WORKER_TIMEOUT_SECS",
                 "HOOK_STUB_PROMPT",
                 "HOOK_REAL_GIT",
                 "HOOK_STUB_WRITES",
@@ -642,7 +648,7 @@ fn worker_nochange_and_argument_contract() {
         "-p",
         "claude-sonnet-5-5",
         "--effort",
-        "high",
+        "medium",
         "--dangerously-skip-permissions",
         "--no-session-persistence",
     ] {
@@ -4714,4 +4720,300 @@ fn a_stuck_state_never_touches_files_that_no_longer_match_the_record() {
         fs::read_to_string(f.root.join("README.md")).unwrap(),
         "the user's own edit"
     );
+}
+
+// ---------------------------------------------------------------------------
+// worker の期限切れ（終了を確認できたタイムアウト）: 追い修正は書きかけを戻して先へ進み、
+// 最初の起動は変更前へ戻して同じ対象コミットでは自動で再実行しない。Windows だけ（非 Windows は
+// 子孫の終了を確認できないので、従来どおり停止する）。
+// ---------------------------------------------------------------------------
+
+/// 保守ループの期限を短くする（設定の下限は 60 秒）。追い修正は残り 1 秒から始められる。
+fn short_worker_deadline(seconds: u64) {
+    unsafe {
+        env::set_var("SCRIPTURA_TEST_WORKER_TIMEOUT_SECS", seconds.to_string());
+        env::set_var("SCRIPTURA_TEST_FIXUP_MIN_SECS", "1");
+    }
+}
+
+/// 期限の上書きを外す（再試行は通常の期限で行う）。
+fn normal_worker_deadline() {
+    unsafe {
+        env::remove_var("SCRIPTURA_TEST_WORKER_TIMEOUT_SECS");
+        env::remove_var("SCRIPTURA_TEST_FIXUP_MIN_SECS");
+        env::remove_var("HOOK_STUB_SLEEP_AFTER_WRITE");
+    }
+}
+
+impl Fixture {
+    /// 期限切れにするスタブが、書き込みを済ませた起動の番号（期限より前に書けたことの確認用）。
+    fn written_run(&self) -> String {
+        fs::read_to_string(self.base.join("prompt.written")).unwrap_or_default()
+    }
+}
+
+fn readme_over_limit_fixture(permission: Permission) -> Fixture {
+    // 見出しのある README（分割先 `docs/readme/section-01.md` が許可パスに入る）。上限は 40 文字。
+    let f = Fixture::with_config(Some(readme_limit_config(permission, 40)));
+    f.commit_push_file("README.md", "# 題\n## 概要\n本文\n");
+    f.hook("UserPromptSubmit");
+    f.push_change("limit");
+    f
+}
+
+#[cfg(windows)]
+#[test]
+fn a_timed_out_fixup_is_reverted_and_the_first_run_is_committed_with_a_warning() {
+    let f = readme_over_limit_fixture(Permission::Bypass);
+    short_worker_deadline(10);
+    unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "2:60") };
+    let head = f.head();
+    let new_file = f.root.join("docs/readme/section-01.md");
+    let first =format!("# 題\n## 概要\n{}", "r".repeat(60));
+    // 1 回目は上限（40 文字）超過。追い修正は書きかけ（README の別内容と分割先の新規ファイル）のまま期限切れになる。
+    f.writes(json!([
+        {f.readme_path(): first},
+        {f.readme_path(): "p".repeat(80), new_file.to_str().unwrap(): "partial"},
+    ]));
+    let message = f.hook("Stop").expect("警告の通知があるはず");
+    assert!(
+        message.contains("追い修正に残っていた時間") && message.contains("上限"),
+        "{message}"
+    );
+    assert_eq!(f.worker_runs(), 2);
+    assert_eq!(f.written_run(), "2", "追い修正は書いたあとで期限切れになった");
+    assert_ne!(f.head(), head, "最初の起動の内容を commit する");
+    assert_eq!(f.git(&["rev-parse", "origin/main"]).trim(), f.head());
+    assert_eq!(fs::read_to_string(f.root.join("README.md")).unwrap(), first);
+    assert!(!new_file.exists(), "追い修正が作ったファイルは残さない");
+    assert!(
+        !f.root.join("docs/readme").exists(),
+        "空の親フォルダーは残さない"
+    );
+    assert_eq!(f.git(&["status", "--porcelain"]), "", "作業ツリーは clean");
+    let state = f.state();
+    assert_eq!(state["phase"], "complete");
+    assert_eq!(state["fixups"], 1);
+    let last = f.runs().pop().unwrap().run;
+    assert_eq!(last.outcome, "committed");
+    assert!(last.message.unwrap().contains("追い修正に残っていた時間"));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_timed_out_fixup_with_an_out_of_scope_change_still_stops_as_a_violation() {
+    let f = readme_over_limit_fixture(Permission::Restricted);
+    short_worker_deadline(10);
+    unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "2:60") };
+    let head = f.head();
+    let outside = f.root.join("outside.txt");
+    f.writes(json!([
+        {f.readme_path(): format!("# 題\n## 概要\n{}", "r".repeat(60))},
+        {f.readme_path(): "p".repeat(80), outside.to_str().unwrap(): "x"},
+    ]));
+    let message = f.hook("Stop").expect("違反の通知があるはず");
+    assert!(message.contains("outside.txt"), "{message}");
+    assert_eq!(f.written_run(), "2");
+    assert_eq!(f.head(), head, "commit しない");
+    assert_eq!(f.state()["phase"], "worker_failed");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_timed_out_first_run_is_reverted_and_not_retried_until_a_new_push_or_run_now() {
+    let f = readme_over_limit_fixture(Permission::Bypass);
+    short_worker_deadline(10);
+    unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "1:60") };
+    let head = f.head();
+    let new_file = f.root.join("docs/readme/section-01.md");
+    f.writes(json!({f.readme_path(): "partial", new_file.to_str().unwrap(): "partial"}));
+    let message = f.hook("Stop").expect("失敗の通知があるはず");
+    assert!(message.contains("戻しました"), "{message}");
+    assert_eq!(f.written_run(), "1", "書いたあとで期限切れになった");
+    assert_eq!(f.worker_runs(), 1);
+    assert_eq!(f.head(), head, "commit しない");
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "# 題\n## 概要\n本文\n"
+    );
+    assert!(!new_file.exists());
+    assert_eq!(f.git(&["status", "--porcelain"]), "");
+    let state = f.state();
+    assert_eq!(state["phase"], "worker_failed");
+    assert_eq!(state["after"], state["before"]);
+    // 同じ対象コミットでは、hook が何度来ても worker を起動しない。
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.worker_runs(), 1);
+    // run-now（force）は再試行できる。通常の期限で成功させる。
+    normal_worker_deadline();
+    f.writes(json!({f.readme_path(): "retried"}));
+    assert_eq!(
+        run_now(&f.root, MaintenanceOptions::default()).unwrap(),
+        None
+    );
+    assert_eq!(f.worker_runs(), 2);
+    assert_eq!(fs::read_to_string(f.root.join("README.md")).unwrap(), "retried");
+    assert_eq!(f.state()["phase"], "complete");
+}
+
+#[cfg(windows)]
+#[test]
+fn after_a_timeout_a_new_push_is_maintained_over_the_whole_range() {
+    let f = Fixture::new();
+    f.hook("UserPromptSubmit");
+    let base = f.head();
+    f.push_change("first");
+    short_worker_deadline(10);
+    unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "1:60") };
+    f.writes(json!({f.readme_path(): "partial"}));
+    assert!(f.hook("Stop").is_some());
+    assert_eq!(f.written_run(), "1");
+    assert_eq!(f.worker_runs(), 1);
+    // 新しい push では、期限切れだった対象も含めて保守される（対象文書は編集対象に残る）。
+    normal_worker_deadline();
+    f.push_change("second");
+    f.writes(json!({f.readme_path(): "second maintenance"}));
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.worker_runs(), 2);
+    let prompt = f.prompt_of_run(2);
+    assert!(prompt.contains("README.md"), "{prompt}");
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "second maintenance"
+    );
+    assert_eq!(f.state()["phase"], "complete");
+    assert_eq!(f.git(&["rev-parse", "origin/main"]).trim(), f.head());
+    assert_eq!(f.git(&["status", "--porcelain"]), "");
+    // 処理済み位置は進めていないので、1 回目の push も含む範囲（最初の push の手前から）を処理する。
+    let last = f.runs().pop().unwrap().run;
+    assert_eq!(last.outcome, "committed");
+    assert_eq!(last.base_commit, base);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_timed_out_first_run_is_reverted_when_restricted() {
+    let f = readme_over_limit_fixture(Permission::Restricted);
+    short_worker_deadline(10);
+    unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "1:60") };
+    let head = f.head();
+    let new_file = f.root.join("docs/readme/section-01.md");
+    f.writes(json!({f.readme_path(): "partial", new_file.to_str().unwrap(): "partial"}));
+    let message = f.hook("Stop").expect("失敗の通知があるはず");
+    assert!(message.contains("戻しました"), "{message}");
+    assert_eq!(f.written_run(), "1");
+    assert_eq!(f.head(), head);
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "# 題\n## 概要\n本文\n"
+    );
+    assert!(!new_file.exists());
+    assert_eq!(f.git(&["status", "--porcelain"]), "");
+    let state = f.state();
+    assert_eq!(state["phase"], "worker_failed");
+    assert_eq!(state["after"], state["before"]);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_timed_out_first_run_restores_a_gitignored_shared_document() {
+    // 共有文書が .gitignore 済み（git では戻せない）でも、起動前の生バイト列で戻す。
+    let f = Fixture::new();
+    f.git(&["rm", "--cached", "--quiet", "README.md"]);
+    fs::write(f.root.join(".gitignore"), "README.md\n").unwrap();
+    f.git(&["add", ".gitignore"]);
+    f.git(&["commit", "-m", "ignore readme"]);
+    f.git(&["push"]);
+    f.hook("UserPromptSubmit");
+    f.push_change("later");
+    short_worker_deadline(10);
+    unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "1:60") };
+    f.writes(json!({f.readme_path(): "partial"}));
+    let message = f.hook("Stop").expect("失敗の通知があるはず");
+    assert!(message.contains("戻しました"), "{message}");
+    assert_eq!(f.written_run(), "1");
+    assert!(f.state()["before"].get("README.md").is_some_and(|v| !v.is_null()));
+    assert_eq!(fs::read_to_string(f.root.join("README.md")).unwrap(), "readme");
+    assert_eq!(f.state()["phase"], "worker_failed");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_timed_out_resumed_fixup_goes_back_to_the_ready_content() {
+    // ready からの再開（AGENTS の超過を直す追い修正）が期限切れ: 直前の ready の内容へ戻して保守後検査へ進む。
+    let f = Fixture::with_config(Some(Config::legacy_all_push()));
+    f.commit_push_file("AGENTS.md", &"a".repeat(30_500));
+    let mut state = f.checkpoint("ready");
+    fs::write(f.root.join("AGENTS.md"), "a".repeat(30_200)).unwrap();
+    state["after"]["AGENTS.md"] = json!(document_hash(&f.root, "AGENTS.md").unwrap());
+    f.save(&mut state);
+    short_worker_deadline(10);
+    unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "1:60") };
+    f.writes(json!({agents_path(&f): "short"}));
+    let head = f.head();
+    assert_eq!(f.maintain(), None);
+    assert_eq!(f.written_run(), "1");
+    assert_eq!(f.head(), head);
+    // ready の内容（30,200 バイト）は 30,000 バイト以上なので、保守後検査が破棄して変更前へ戻す。
+    assert_eq!(
+        fs::read_to_string(f.root.join("AGENTS.md")).unwrap().len(),
+        30_500
+    );
+    let state = f.state();
+    assert_eq!(state["phase"], "complete");
+    assert!(
+        state["discarded"].as_str().unwrap().contains("追い修正に残っていた時間"),
+        "{state}"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_timeout_on_non_windows_reverts_nothing_and_stops() {
+    // 非 Windows は子孫の終了を確認できないので、期限切れは何も戻さず従来どおり停止する。
+    let f = Fixture::new();
+    f.hook("UserPromptSubmit");
+    f.push_change("first");
+    short_worker_deadline(3);
+    unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "1:60") };
+    f.writes(json!({f.readme_path(): "partial"}));
+    let message = f.hook("Stop").expect("停止の通知があるはず");
+    assert!(message.contains("終了状態が不確定"), "{message}");
+    assert_eq!(f.written_run(), "1");
+    assert_eq!(fs::read_to_string(f.root.join("README.md")).unwrap(), "partial");
+    assert_eq!(f.state()["phase"], "worker_running");
+}
+
+#[test]
+fn restoring_a_checkpoint_only_touches_paths_unchanged_since_the_measurement() {
+    let f = Fixture::new();
+    let readme = f.root.join("README.md");
+    let design = f.root.join("DESIGN.md");
+    let fresh = f.root.join("docs/new.md");
+    fs::create_dir_all(fresh.parent().unwrap()).unwrap();
+    // 測定時: README は worker の書きかけ、DESIGN・new.md は測定後に利用者が編集した（測定と食い違う）。
+    fs::write(&readme, "partial").unwrap();
+    fs::write(&design, "partial").unwrap();
+    fs::write(&fresh, "created").unwrap();
+    let measured = json!({
+        "README.md": hash("partial"),
+        "DESIGN.md": hash("partial"),
+        "docs/new.md": hash("created"),
+    });
+    fs::write(&design, "the user's edit").unwrap();
+    let kept = restore_checkpoint_for_test(
+        &f.root,
+        &[
+            ("README.md", Some(b"readme".as_slice())),
+            ("DESIGN.md", Some(b"design".as_slice())),
+            ("docs/new.md", None),
+        ],
+        &measured,
+    );
+    assert_eq!(kept, vec!["DESIGN.md".to_string()]);
+    assert_eq!(fs::read_to_string(&readme).unwrap(), "readme");
+    assert_eq!(fs::read_to_string(&design).unwrap(), "the user's edit");
+    assert!(!fresh.exists());
+    assert!(!f.root.join("docs").exists());
 }

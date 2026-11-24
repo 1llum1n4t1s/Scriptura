@@ -85,6 +85,15 @@ fn main() {
                 fs::write(target, value.as_str().unwrap()).unwrap();
             }
         }
+        // `<n>:<秒>` なら、n 回目の起動だけ、書いた後で指定秒数居座る（書きかけのまま期限切れにする）。
+        if let Ok(spec) = env::var("HOOK_STUB_SLEEP_AFTER_WRITE")
+            && let Some((run, seconds)) = spec.split_once(':')
+            && run.parse::<usize>().ok() == Some(run_number)
+        {
+            // 書き込みが済んだ印（期限より前に書けたことを、テストが確かめられるようにする）。
+            fs::write(prompt_path.with_extension("written"), run_number.to_string()).unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(seconds.parse().unwrap_or(0)));
+        }
         if let Ok(remote) = env::var("HOOK_STUB_GITHUB_AFTER_WORKER") {
             Command::new(env::var_os("HOOK_REAL_GIT").unwrap())
                 .args(["remote", "set-url", "--push", "origin", &remote])

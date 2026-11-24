@@ -408,9 +408,9 @@ impl Default for Worker {
     fn default() -> Self {
         Self {
             // 保守は小さな修正が中心でバックグラウンド実行のため、
-            // 精度と使用量の釣り合いから Sonnet の high を既定にする。
+            // 精度と使用量の釣り合いから Sonnet の medium を既定にする。
             model: "claude-sonnet-5-5".into(),
-            effort: "high".into(),
+            effort: "medium".into(),
             timeout_secs: 1200,
             permission: Permission::Restricted,
             claude_path: String::new(),
@@ -515,6 +515,8 @@ impl Config {
                 max_bytes: None,
             },
             worker: Worker {
+                // 既存の利用者の移行なので、新規の既定が変わっても従来の effort を保つ。
+                effort: "high".into(),
                 permission: Permission::Bypass,
                 ..Worker::default()
             },

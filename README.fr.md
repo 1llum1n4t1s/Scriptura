@@ -2,7 +2,7 @@
 
 # Scriptura
 
-Scriptura maintient `AGENTS.md` / `DESIGN.md` / `README.md` (et, en option, `CHANGELOG.md` ainsi que des documents personnalisés définis par l'utilisateur) en arrière-plan après un push vers vos propres dépôts. Il est lancé depuis des hooks de Claude Code (juste après un `git push` exécuté via l'outil Bash ou PowerShell, et au démarrage d'une session pour rattraper ce qui aurait été manqué), et son worker de maintenance est la CLI Claude Code (par défaut `claude -p --model claude-sonnet-5-5 --effort high`). Il ne dépend pas de Codex.
+Scriptura maintient `AGENTS.md` / `DESIGN.md` / `README.md` (et, en option, `CHANGELOG.md` ainsi que des documents personnalisés définis par l'utilisateur) en arrière-plan après un push vers vos propres dépôts. Il est lancé depuis des hooks de Claude Code (juste après un `git push` exécuté via l'outil Bash ou PowerShell, et au démarrage d'une session pour rattraper ce qui aurait été manqué), et son worker de maintenance est la CLI Claude Code (par défaut `claude -p --model claude-sonnet-5-5 --effort medium`). Il ne dépend pas de Codex.
 
 - **Sûr par défaut.** Rien ne s'exécute tant que vous n'avez pas enregistré un dépôt avec `scriptura enable` (ou dans l'interface d'administration), et l'activation exige un remote et un upstream. Il n'y a pas d'étape de revue : après chaque push, le worker met à jour les documents cibles et Scriptura les valide (commit) et les pousse (push) automatiquement, et une vérification après maintenance refuse de valider tout ce qui n'est pas un document cible. L'enregistrement du consentement et l'ancien mode `propose` (propositions de mise à jour) ont été supprimés ; voir « Migration des anciens paramètres ».
 - Les paramètres sont lus uniquement depuis un fichier unique situé dans le répertoire personnel de l'utilisateur (`config.toml`) et depuis le dossier `templates/` placé à côté. L'activation ou la configuration par des fichiers situés dans un dépôt n'est jamais lue (afin que le simple clonage du dépôt de quelqu'un d'autre ne puisse jamais déclencher un comportement automatique).
@@ -93,7 +93,7 @@ exclude = ["private/**"]                        # AJOUTÉ aux motifs sensibles p
 
 [worker]
 model = "claude-sonnet-5-5"
-effort = "high"
+effort = "medium"
 timeout_secs = 1200                             # 60..=1500 (plus court que les 1800 secondes du hook)
 permission = "restricted"                       # restricted / bypass
 claude_path = ""                                # vide : recherche dans le PATH (un chemin absolu si spécifié)

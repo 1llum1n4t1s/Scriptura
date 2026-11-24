@@ -213,7 +213,9 @@ td a, td .path, .repo-list .path { overflow-wrap: anywhere; }
 .filter-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0; }
 .filter-form label { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; max-width: 100%; }
 .filter-form select { width: min(360px, 100%); }
-.run-details { margin-top: 6px; }
+/* 詳細は文書の列に入れると潰れるため、行の下に全幅の行を足して、本体の行とは線を引かずにつなげる。 */
+tr:has(+ .run-detail-row) > td { border-bottom: 0; padding-bottom: 4px; }
+.run-detail-row > td { padding-top: 0; }
 .run-details > summary { cursor: pointer; color: var(--accent); font-size: 12px; font-weight: 600; }
 .run-details .facts { margin: 8px 0 0; }
 /* 折りたたみ。パネルは見出しごと、小さな折りたたみは枠つきの 1 行で、押せると分かる見た目にする。 */
