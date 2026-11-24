@@ -116,7 +116,7 @@ fn uncertain_commit_or_push_from_stop_is_never_automatically_repeated() {
         f.writes(json!({f.root.join("AGENTS.md").to_str().unwrap():"maintained"}));
         unsafe {
             env::set_var("HOOK_GIT_UNCERTAIN_OPERATION", operation);
-            env::set_var("SCRIPTURA_TEST_GIT_TIMEOUT_MS", "1500")
+            env::set_var("SCRIPTURA_TEST_GIT_TIMEOUT_MS", "10000")
         };
         let cursor_before = {
             let db = open_state_db().unwrap();
@@ -1517,8 +1517,9 @@ fn parent_death_closes_worker_job() {
         .spawn()
         .unwrap();
     let pid_path = f.base.join("child.pid");
-    for _ in 0..50 {
-        if pid_path.exists() {
+    // 孫まで起動して PID を書き終えるのを待つ（負荷が高いと 1 秒では足りない）。
+    for _ in 0..1000 {
+        if fs::read_to_string(&pid_path).is_ok_and(|pid| !pid.is_empty()) {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -3937,7 +3938,7 @@ fn uncertain_commit_is_recorded_as_unknown() {
     f.writes(json!({agents_path(&f): "maintained"}));
     unsafe {
         env::set_var("HOOK_GIT_UNCERTAIN_OPERATION", "commit");
-        env::set_var("SCRIPTURA_TEST_GIT_TIMEOUT_MS", "1500")
+        env::set_var("SCRIPTURA_TEST_GIT_TIMEOUT_MS", "10000")
     };
     assert!(f.hook("Stop").unwrap().contains("未確定"));
     let runs = f.runs();

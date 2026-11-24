@@ -214,6 +214,9 @@ pub fn publication_paths(root: &Path) -> (PathBuf, PathBuf) {
         base.with_extension("lock.sqlite3"),
     )
 }
+/// 読み取りの git（commit・push 以外）を待つ秒数。応答しない git で止まり続けないための上限で、通常は
+/// 1 秒もかからない。短すぎると、ビルド中など PC が重いときに正常な git を失敗とみなして保守を見送る。
+const GIT_READ_SECS: u64 = 30;
 fn git_output(
     root: &Path,
     args: &[&str],
@@ -250,7 +253,7 @@ pub fn run_git(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
 /// 外側 None は「確定していない」（起動失敗・期限超過・終了コードなし）、内側 None は「正常終了コードが
 /// 0 以外」（`cat-file` の blob 不在など）。結果を再利用してよいのは外側が Some のときだけ。
 pub fn run_git_settled(root: &Path, args: &[&str]) -> Option<Option<Vec<u8>>> {
-    let r = git_output(root, args, None, 2).ok()?;
+    let r = git_output(root, args, None, GIT_READ_SECS).ok()?;
     r.code?;
     Some((r.code == Some(0)).then_some(r.stdout))
 }
@@ -944,7 +947,7 @@ pub fn git_ignore_status(root: &Path, path: &Path) -> (String, String) {
             root,
             &["check-ignore", "-v", "-z", "--no-index", "--stdin"],
             Some([rel.as_bytes(), &[0]].concat()),
-            2,
+            GIT_READ_SECS,
         )
         .map_err(err)?;
         if r.code == Some(1) {
@@ -3761,7 +3764,12 @@ fn read_state(path: &Path) -> Result<Value> {
     }
 }
 fn ancestor(root: &Path, a: &str, b: &str) -> &'static str {
-    match git_output(root, &["merge-base", "--is-ancestor", a, b], None, 2) {
+    match git_output(
+        root,
+        &["merge-base", "--is-ancestor", a, b],
+        None,
+        GIT_READ_SECS,
+    ) {
         Ok(r) if r.code == Some(0) => "yes",
         Ok(r) if r.code == Some(1) => "no",
         _ => "unknown",
