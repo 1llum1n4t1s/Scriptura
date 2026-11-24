@@ -61,8 +61,8 @@ impl Control {
         crate::app_update::is_managed()
     }
 
-    /// 管理画面の概要画面の更新パネルを開く。使い捨て鍵を発行し直し、画面が自動で更新の確認を始める
-    /// （`?check_updates=1#updates`）。
+    /// 管理画面の「アプリ」画面の更新パネルを開く。使い捨て鍵を発行し直し、画面が自動で更新の確認を始める
+    /// （`/settings/app?check_updates=1#updates`）。
     pub fn check_updates(&self) {
         let key = self.state.issue_key();
         super::open_browser(&super::auth_url_updates(self.port, &key));

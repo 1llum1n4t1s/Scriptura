@@ -26,11 +26,11 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// 設定系の画面（全般・文書・worker・履歴・診断）か。ヘッダーの「設定」の強調と、サブナビの表示に使う。
+    /// 設定系の画面（文書・保守の実行・アプリ・設定の変更履歴・診断）か。ヘッダーの「設定」の強調と、サブナビの表示に使う。
     pub fn in_settings(&self) -> bool {
         matches!(
             self.nav,
-            "general" | "documents" | "worker" | "settings_history" | "doctor"
+            "documents" | "worker" | "app" | "settings_history" | "doctor"
         )
     }
 }
@@ -46,6 +46,17 @@ pub fn redact(text: &str) -> String {
     });
     let text = USERINFO.replace_all(text, "${1}***@");
     TOKENS.replace_all(&text, "***").into_owned()
+}
+
+/// パスの末尾（フォルダー名）。一覧では短い名前で見分け、フルパスは title と小字で添える。区切りは `/` と `\` の両方。
+pub fn folder_name(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path)
+        .to_string()
 }
 
 /// コミットの短縮表示（先頭 12 文字。DB の値は文字単位で切り、非 ASCII でもパニックさせない）。
@@ -106,7 +117,7 @@ pub fn flash_text(code: Option<&str>) -> Option<&'static str> {
     })
 }
 
-/// 画面上部の言語の選択欄の選択肢（先頭は「自動」。言語名はその言語自身の表記で、訳さない）。
+/// 画面下部（フッター）の言語の選択欄の選択肢（先頭は「自動」。言語名はその言語自身の表記で、訳さない）。
 pub fn language_choices() -> Vec<Choice> {
     let current = super::locale::current();
     let mut out = vec![Choice::new(
@@ -213,11 +224,30 @@ pub struct RepoRow {
     pub documents: String,
     pub branches: String,
     pub remote: String,
+    /// フォルダー名（root の末尾）。
+    pub name: String,
+    /// 状態のバッジ（稼働中・停止中・要再有効化）の文言と見た目の class。
+    pub status_label: String,
+    pub status_class: &'static str,
 }
 
+/// 概要: 警告 → 最近の保守（新しい順 5 件）+ リポジトリ一覧。
 #[derive(Template)]
 #[template(path = "ui/overview.html")]
 pub struct OverviewPage {
+    pub layout: Layout,
+    pub repos: Vec<RepoRow>,
+    pub warnings: Vec<String>,
+    /// 有効な登録があるときの注意（自動で commit・push する。無ければ空）。
+    pub active_note: String,
+    /// 最近の保守（保守履歴の新しい順 5 件）。
+    pub recent_runs: Vec<RunView>,
+}
+
+/// 設定 › アプリ: アプリの更新・版と導入の形・設定ファイルの場所と状態。
+#[derive(Template)]
+#[template(path = "ui/app.html")]
+pub struct AppPage {
     pub layout: Layout,
     pub version: String,
     /// 導入の形の表示（Setup 版・単独導入済み・プラグイン／開発ビルド）。
@@ -226,13 +256,11 @@ pub struct OverviewPage {
     pub install_hint: bool,
     pub config_path: String,
     pub config_state: String,
-    pub repos: Vec<RepoRow>,
-    pub warnings: Vec<String>,
     /// 「アプリの更新」パネル。
     pub updates: UpdatePanel,
 }
 
-/// 概要画面の「アプリの更新」パネルの表示内容（読み取りだけで作る）。
+/// 「アプリ」画面の「アプリの更新」パネルの表示内容（読み取りだけで作る）。
 #[derive(Clone, Debug)]
 pub struct UpdatePanel {
     /// Setup 版か（そうでなければ、注意の文だけを出す）。
@@ -260,6 +288,9 @@ pub struct ReposPage {
     pub revision: String,
     pub repos: Vec<RepoRow>,
     pub documents: Vec<Choice>,
+    /// 自動登録の方針の選択肢と、owner（1 行に 1 つ）。
+    pub policies: Vec<Choice>,
+    pub owners: String,
 }
 
 /// 種類 1 件のリポジトリでの状態（docs list と同じ情報）。
@@ -302,6 +333,8 @@ pub struct RepoPage {
     pub cursors: Vec<CursorRow>,
     pub publication: Option<EventRow>,
     pub events: Vec<EventRow>,
+    /// 内部情報（処理済み位置・publication）にエラー・警告があるか（あれば折りたたみを開く）。
+    pub internal_open: bool,
     /// 最近の保守（保守履歴の新しい順 5 件）。
     pub recent_runs: Vec<RunView>,
     /// このリポジトリの保守履歴への絞り込みリンク。
@@ -314,6 +347,8 @@ pub struct RunView {
     pub time: String,
     pub attempts: i64,
     pub repo_label: String,
+    /// リポジトリのフォルダー名（`repo_label` はフルパス）。
+    pub repo_name: String,
     pub repo_index: Option<usize>,
     pub origin: String,
     pub kinds: String,
@@ -360,13 +395,21 @@ pub struct KindRow {
     pub customized: bool,
 }
 
-/// 「設定 › 文書」タブ。上段は既定の対象の文書（版つきの保存）、下段は種類の一覧。
+/// 「設定 › 文書」タブ。上段は「すべての文書に共通の設定」（既定の対象・言語・上限・共通の指示・除外。
+/// 1 フォーム・版つきの 1 回の保存）、下段は種類の一覧。
 #[derive(Template)]
 #[template(path = "ui/documents.html")]
 pub struct DocumentsPage {
     pub layout: Layout,
     pub revision: String,
     pub documents: Vec<Choice>,
+    pub languages: Vec<Choice>,
+    pub max_chars: String,
+    pub max_bytes: String,
+    pub ph_no_limit: String,
+    pub instructions: String,
+    pub instructions_max: usize,
+    pub exclude: String,
     pub kinds: Vec<KindRow>,
 }
 
@@ -399,6 +442,9 @@ pub struct KindForm {
     pub ph_split_dir: String,
     pub ph_min_interval: String,
     pub ph_template_file: String,
+    pub ph_release_tag: String,
+    pub ph_backfill_releases: String,
+    pub ph_backfill_commits: String,
 }
 
 /// テンプレートファイルの編集欄。
@@ -442,28 +488,17 @@ pub struct WorkerPage {
     pub permission: Vec<Choice>,
     pub claude_path: String,
     pub claude_state: String,
-}
-
-#[derive(Template)]
-#[template(path = "ui/general.html")]
-pub struct GeneralPage {
-    pub layout: Layout,
-    pub revision: String,
-    pub exclude: String,
-    pub instructions: String,
-    pub instructions_max: usize,
-    pub languages: Vec<Choice>,
-    pub max_chars: String,
-    pub max_bytes: String,
-    pub ph_no_limit: String,
-    pub policies: Vec<Choice>,
-    pub owners: String,
+    /// 指定した claude が見つからないとき（「詳細」を開いて知らせる）。
+    pub claude_problem: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct DoctorRow {
     pub id: String,
+    /// `ok` / `warn` / `fail`（見た目の class 用）。
     pub status: String,
+    /// 表示言語の状態の文言。
+    pub status_label: String,
     pub detail: String,
 }
 
@@ -472,7 +507,10 @@ pub struct DoctorRow {
 pub struct DoctorPage {
     pub layout: Layout,
     pub ok: bool,
-    pub items: Vec<DoctorRow>,
+    /// 失敗 → 警告の順の項目。
+    pub problems: Vec<DoctorRow>,
+    /// 正常な項目（折りたたむ）。
+    pub passed: Vec<DoctorRow>,
 }
 
 #[derive(Clone, Debug)]
@@ -507,11 +545,11 @@ pub struct HistoryEntryPage {
 mod tests {
     use super::*;
 
-    fn overview(updates: UpdatePanel) -> String {
-        OverviewPage {
+    fn app_page(updates: UpdatePanel) -> String {
+        AppPage {
             layout: Layout {
                 title: "t".into(),
-                nav: "overview",
+                nav: "app",
                 csrf: "csrf-token".into(),
                 flash: None,
                 broken: None,
@@ -522,8 +560,6 @@ mod tests {
             install_hint: false,
             config_path: "c".into(),
             config_state: "s".into(),
-            repos: Vec::new(),
-            warnings: Vec::new(),
             updates,
         }
         .render()
@@ -532,7 +568,7 @@ mod tests {
 
     #[test]
     fn update_panel_shows_controls_only_for_the_setup_edition() {
-        let managed = overview(UpdatePanel {
+        let managed = app_page(UpdatePanel {
             managed: true,
             auto_update: true,
             tray_supported: true,
@@ -552,8 +588,12 @@ mod tests {
         ] {
             assert!(managed.contains(expected), "{expected}");
         }
+        // 操作（確認・インストール）を上に、自動更新などの設定を下に置く。
+        assert!(managed.find("data-update-check") < managed.find("data-update-settings"));
         // パネルの全フォームに CSRF を埋め込む（check・install・settings の 3 つ）。
         let panel = &managed[managed.find("id=\"updates\"").unwrap()..];
+        // フッター（言語の選択欄）は含めない。
+        let panel = &panel[..panel.find("</main>").unwrap()];
         assert_eq!(panel.matches("value=\"csrf-token\"").count(), 3);
         // 自動更新は ON（checked）、常駐は OFF（checked なし）で、どちらも変更で送信する。
         assert!(
@@ -572,7 +612,7 @@ mod tests {
             assert!(!panel.contains(forbidden), "{forbidden}");
         }
         // 常駐に対応しない OS では、常駐のチェックボックスを出さない。
-        let linux = overview(UpdatePanel {
+        let linux = app_page(UpdatePanel {
             managed: true,
             auto_update: false,
             tray_supported: false,
@@ -585,7 +625,7 @@ mod tests {
                 .is_match(&linux)
         );
         // Setup 版でなければ、操作は出さない。
-        let plain = overview(UpdatePanel {
+        let plain = app_page(UpdatePanel {
             managed: false,
             auto_update: true,
             tray_supported: true,

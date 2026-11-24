@@ -232,11 +232,22 @@ fn names(docs: &[Document]) -> String {
 
 /// 登録 1 件の要約。remote は正規化した host/owner/repo だけを出す（資格情報入りの URL を写さない）。
 fn repo_row(config: &Config, index: usize, repo: &Repository) -> RepoRow {
+    let migrated = repo.migrated_from.is_some();
+    let (status_label, status_class) = if migrated {
+        (crate::t!("ui.status.migrated"), "warning")
+    } else if repo.paused {
+        (crate::t!("ui.status.paused"), "")
+    } else {
+        (crate::t!("ui.status.active"), "published")
+    };
     RepoRow {
         index,
         root: repo.root.clone(),
+        name: views::folder_name(&repo.root),
+        status_label: status_label.to_string(),
+        status_class,
         paused: repo.paused,
-        migrated: repo.migrated_from.is_some(),
+        migrated,
         documents: names(
             repo.documents
                 .as_deref()
@@ -390,7 +401,7 @@ pub struct AuthQuery {
 /// （知らない語は既定の `/`）。
 fn auth_destination(next: Option<&str>) -> &'static str {
     match next {
-        Some("updates") => "/?check_updates=1#updates",
+        Some("updates") => "/settings/app?check_updates=1#updates",
         _ => "/",
     }
 }
@@ -490,10 +501,6 @@ fn warnings(c: &Config, legacy: Option<&LegacyNotice>) -> Vec<String> {
     if c.worker.permission == Permission::Bypass {
         out.push(crate::t!("ui.warn.bypass").into());
     }
-    let active = c.repository.iter().filter(|r| r.is_active()).count();
-    if active > 0 {
-        out.push(crate::t!("ui.warn.push_count", count = active));
-    }
     match c.enrollment.policy {
         Policy::All => out.push(crate::t!("ui.warn.policy_all").into()),
         Policy::RemoteOwner => out.push(crate::t!("ui.warn.policy_owner").into()),
@@ -502,11 +509,14 @@ fn warnings(c: &Config, legacy: Option<&LegacyNotice>) -> Vec<String> {
     out
 }
 
+/// 概要の「最近の保守」の件数。
+const OVERVIEW_RUNS: usize = 5;
+
+/// 概要: 警告 → 最近の保守 + リポジトリ一覧。更新・版・設定ファイルは「アプリ」（`/settings/app`）にある。
 pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
     let s = state.clone();
     let built = blocking(move || {
         let cur = current(&s);
-        let status = app::status();
         let repos: Vec<RepoRow> = cur
             .config
             .repository
@@ -514,42 +524,27 @@ pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Re
             .enumerate()
             .map(|(i, r)| repo_row(&cur.config, i, r))
             .collect();
-        let config_state = match (&cur.broken, cur.missing) {
-            (Some(reason), _) => crate::t!("ui.overview.config_broken", reason = reason),
-            (None, true) => crate::t!("ui.overview.config_missing").into(),
-            (None, false) => crate::t!("ui.overview.config_ok").into(),
+        let active = cur
+            .config
+            .repository
+            .iter()
+            .filter(|r| r.is_active())
+            .count();
+        let active_note = if active > 0 {
+            crate::t!("ui.warn.push_count", count = active)
+        } else {
+            String::new()
         };
         let warnings = if cur.broken.is_some() {
             Vec::new()
         } else {
             warnings(&cur.config, cur.legacy.as_ref())
         };
-        let updates = UpdatePanel {
-            managed: status["installForm"].as_str() == Some("setup"),
-            auto_update: status["setup"]["autoUpdate"].as_bool().unwrap_or(true),
-            tray_supported: cfg!(any(windows, target_os = "macos")),
-            tray_autostart: status["setup"]["trayAutostart"].as_bool().unwrap_or(false),
-        };
-        (
-            cur.broken,
-            OverviewPageData {
-                version: app::VERSION.to_string(),
-                install_label: match status["installForm"].as_str() {
-                    Some("setup") => crate::t!("ui.overview.form_setup"),
-                    Some("standalone") => crate::t!("ui.overview.installed"),
-                    _ => crate::t!("ui.overview.form_other"),
-                },
-                install_hint: status["installForm"].as_str() == Some("other"),
-                config_path: s.store.config_file.display().to_string(),
-                config_state,
-                repos,
-                warnings,
-                updates,
-            },
-        )
+        let recent_runs = run_views(&cur.config, &crate::runlog::load(None, None, OVERVIEW_RUNS));
+        (cur.broken, repos, warnings, active_note, recent_runs)
     })
     .await;
-    let Ok((broken, d)) = built else {
+    let Ok((broken, repos, warnings, active_note, recent_runs)) = built else {
         return internal(&state, "/");
     };
     html(OverviewPage {
@@ -560,30 +555,78 @@ pub async fn overview(State(state): State<AppState>, Query(q): Query<Msg>) -> Re
             q.msg.as_deref(),
             broken,
         ),
+        repos,
+        warnings,
+        active_note,
+        recent_runs,
+    })
+}
+
+/// 設定 › アプリ: アプリの更新・版と導入の形・設定ファイルの場所と状態。
+pub async fn app_screen(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
+    let s = state.clone();
+    let built = blocking(move || {
+        let cur = current(&s);
+        let status = app::status();
+        let config_state = match (&cur.broken, cur.missing) {
+            (Some(reason), _) => crate::t!("ui.app.config_broken", reason = reason),
+            (None, true) => crate::t!("ui.app.config_missing").into(),
+            (None, false) => crate::t!("ui.app.config_ok").into(),
+        };
+        let updates = UpdatePanel {
+            managed: status["installForm"].as_str() == Some("setup"),
+            auto_update: status["setup"]["autoUpdate"].as_bool().unwrap_or(true),
+            tray_supported: cfg!(any(windows, target_os = "macos")),
+            tray_autostart: status["setup"]["trayAutostart"].as_bool().unwrap_or(false),
+        };
+        (
+            cur.broken,
+            AppPageData {
+                version: app::VERSION.to_string(),
+                install_label: match status["installForm"].as_str() {
+                    Some("setup") => crate::t!("ui.app.form_setup"),
+                    Some("standalone") => crate::t!("ui.app.installed"),
+                    _ => crate::t!("ui.app.form_other"),
+                },
+                install_hint: status["installForm"].as_str() == Some("other"),
+                config_path: s.store.config_file.display().to_string(),
+                config_state,
+                updates,
+            },
+        )
+    })
+    .await;
+    let Ok((broken, d)) = built else {
+        return internal(&state, "/settings/app");
+    };
+    html(AppPage {
+        layout: layout(
+            &state,
+            crate::t!("ui.title.app"),
+            "app",
+            q.msg.as_deref(),
+            broken,
+        ),
         version: d.version,
         install_label: d.install_label,
         install_hint: d.install_hint,
         config_path: d.config_path,
         config_state: d.config_state,
-        repos: d.repos,
-        warnings: d.warnings,
         updates: d.updates,
     })
 }
 
-struct OverviewPageData {
+struct AppPageData {
     version: String,
     install_label: &'static str,
     install_hint: bool,
     config_path: String,
     config_state: String,
-    repos: Vec<RepoRow>,
-    warnings: Vec<String>,
     updates: UpdatePanel,
 }
 
 // ---------------------------------------------------------------------------
-// アプリの更新（概要画面のパネル）
+// アプリの更新（「アプリ」画面のパネル）
 //
 // 確認・インストールは POST（`guard` が Cookie・Origin・CSRF を検査）。JavaScript は `Accept: application/json` で
 // 呼んで状態表示を更新し、JavaScript が無いときのフォーム送信は同じ処理を HTML の結果画面で返す。
@@ -608,7 +651,7 @@ fn update_reply(
 ) -> Response {
     if !wants_json(headers) {
         return html(UpdateResultPage {
-            layout: layout(state, crate::t!("ui.updates.title"), "overview", None, None),
+            layout: layout(state, crate::t!("ui.updates.title"), "app", None, None),
             message,
         });
     }
@@ -627,7 +670,7 @@ fn update_reply(
 pub async fn update_check(State(state): State<AppState>, headers: HeaderMap) -> Response {
     use crate::app_update::PanelCheck;
     let Ok(outcome) = blocking(crate::app_update::panel_check).await else {
-        return internal(&state, "/");
+        return internal(&state, "/settings/app");
     };
     let (status, message, latest) = match outcome {
         PanelCheck::Unmanaged => (
@@ -692,7 +735,7 @@ pub async fn update_install(State(state): State<AppState>, headers: HeaderMap) -
     let restart = restart_args(&state);
     let restarts = restart.is_some();
     let Ok(outcome) = blocking(move || crate::app_update::panel_install(restart)).await else {
-        return internal(&state, "/");
+        return internal(&state, "/settings/app");
     };
     let (status, message) = match outcome {
         PanelInstall::Unmanaged => ("unsupported", crate::t!("ui.updates.unmanaged").to_string()),
@@ -739,14 +782,14 @@ pub async fn update_settings(
     })
     .await;
     match result {
-        Ok(Ok(())) => Redirect::to("/?msg=update_settings#updates").into_response(),
+        Ok(Ok(())) => Redirect::to("/settings/app?msg=update_settings#updates").into_response(),
         Ok(Err(message)) => error_page(
             &state,
             StatusCode::BAD_REQUEST,
             views::redact(&message),
-            "/#updates",
+            "/settings/app#updates",
         ),
-        Err(_) => internal(&state, "/"),
+        Err(_) => internal(&state, "/settings/app"),
     }
 }
 
@@ -782,7 +825,76 @@ pub async fn repos(State(state): State<AppState>, Query(q): Query<Msg>) -> Respo
         revision: cur.revision.to_string(),
         repos: rows,
         documents: document_choices(&cur.config, &[]),
+        policies: policy_choices(cur.config.enrollment.policy),
+        owners: cur.config.enrollment.owners.join("\n"),
     })
+}
+
+/// 自動登録の方針の選択肢（設定の値の名前は設定ファイルと同じ）。
+fn policy_choices(current: Policy) -> Vec<Choice> {
+    vec![
+        Choice::new(
+            "explicit",
+            crate::t!("ui.repos.policy_explicit"),
+            current == Policy::Explicit,
+        ),
+        Choice::new(
+            "remote-owner",
+            crate::t!("ui.repos.policy_owner"),
+            current == Policy::RemoteOwner,
+        ),
+        Choice::new(
+            "all",
+            crate::t!("ui.repos.policy_all"),
+            current == Policy::All,
+        ),
+    ]
+}
+
+/// 自動登録（方針と owner）だけを書き換える。文書の共通設定など、ほかの項目には触れない。
+fn apply_enrollment(c: &mut Config, policy: Policy, owners: Vec<String>) -> Result<(), String> {
+    c.enrollment.policy = policy;
+    c.enrollment.owners = owners;
+    Ok(())
+}
+
+/// 自動登録の保存（版の照合・変更履歴・危険な変更の二段階確認は他の設定と同じ `apply_change` を通る）。
+pub async fn repos_enrollment_save(
+    State(state): State<AppState>,
+    Extension(form): Extension<FormData>,
+) -> Response {
+    let back = "/repos";
+    let policy = match form.get("policy") {
+        Some("explicit") => Policy::Explicit,
+        Some("remote-owner") => Policy::RemoteOwner,
+        Some("all") => Policy::All,
+        _ => {
+            return error_page(
+                &state,
+                StatusCode::BAD_REQUEST,
+                crate::t!("ui.error.policy"),
+                back,
+            );
+        }
+    };
+    let owners = lines_of(form.get("owners"));
+    let preview = owners.clone();
+    apply_change(
+        &state,
+        "/repos/enrollment",
+        &form,
+        back,
+        Vec::new(),
+        |c| apply_enrollment(c, policy, preview),
+        move |s, rev| {
+            let done = ops::edit(&s.store, Some(rev), |c| apply_enrollment(c, policy, owners))?;
+            Ok(format!(
+                "/repos?msg={}",
+                if done.saved { "saved" } else { "unchanged" }
+            ))
+        },
+    )
+    .await
 }
 
 pub async fn repo_detail(
@@ -816,7 +928,7 @@ pub async fn repo_detail(
                             })
                             .collect(),
                         template: match &k.template {
-                            ops::TemplateState::None => k.template_spec.clone(),
+                            ops::TemplateState::None => "-".to_string(),
                             ops::TemplateState::Builtin => crate::t!("ui.template.builtin").into(),
                             ops::TemplateState::Ok { bytes } => crate::t!(
                                 "ui.template.bytes",
@@ -925,6 +1037,11 @@ pub async fn repo_detail(
         documents: d.documents,
         kinds: d.kinds,
         kinds_error: d.kinds_error,
+        internal_open: d.cursors.iter().any(|c| !c.error.is_empty())
+            || d.publication
+                .iter()
+                .chain(d.events.iter())
+                .any(|e| !e.error.is_empty() || !e.warning.is_empty()),
         cursors: d.cursors,
         publication: d.publication,
         events: d.events,
@@ -1258,7 +1375,7 @@ pub async fn job(State(state): State<AppState>, Path(id): Path<u64>) -> Response
     let page = {
         let jobs = state.jobs.lock().unwrap_or_else(|p| p.into_inner());
         jobs.list.get(&id).map(|j| JobPage {
-            layout: layout(&state, "run-now", "repos", None, None),
+            layout: layout(&state, crate::t!("ui.repo.run_now"), "repos", None, None),
             id,
             root: j.root.clone(),
             index: j.index,
@@ -1318,7 +1435,7 @@ fn limits_text(k: &kinds::ResolvedKind) -> String {
     }
 }
 
-/// 設定 › 文書。上段は既定の対象の文書、下段は種類の一覧（追加・編集への入口）。
+/// 設定 › 文書。上段は「すべての文書に共通の設定」、下段は種類の一覧（追加・編集への入口）。
 pub async fn documents(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
     let cur = current(&state);
     let rows = all_documents(&cur.config)
@@ -1344,11 +1461,40 @@ pub async fn documents(State(state): State<AppState>, Query(q): Query<Msg>) -> R
         ),
         revision: cur.revision.to_string(),
         documents: document_choices(&cur.config, &cur.config.defaults.documents),
+        languages: document_language_choices(cur.config.defaults.language.as_deref()),
+        max_chars: num_text(cur.config.defaults.max_chars),
+        max_bytes: num_text(cur.config.defaults.max_bytes),
+        ph_no_limit: crate::t!("ui.kind.ph.no_limit").to_string(),
+        instructions: cur.config.defaults.instructions.clone(),
+        instructions_max: kinds::INSTRUCTIONS_MAX_CHARS,
+        exclude: cur.config.defaults.exclude.join("\n"),
         kinds: rows,
     })
 }
 
-/// 既定の対象の文書の保存（版の照合・変更履歴・危険確認は他の設定と同じ `apply_change` を通る）。
+/// 「すべての文書に共通の設定」（`[defaults]`）の値。自動登録など、ほかの設定は含まない。
+#[derive(Clone)]
+struct DocumentDefaults {
+    documents: Vec<Document>,
+    language: Option<String>,
+    max_chars: Option<u64>,
+    max_bytes: Option<u64>,
+    instructions: String,
+    exclude: Vec<String>,
+}
+
+/// `[defaults]` の項目だけを書き換える（自動登録・種類・登録には触れない）。
+fn apply_document_defaults(c: &mut Config, v: DocumentDefaults) -> Result<(), String> {
+    c.defaults.documents = v.documents;
+    c.defaults.language = v.language;
+    c.defaults.max_chars = v.max_chars;
+    c.defaults.max_bytes = v.max_bytes;
+    c.defaults.instructions = v.instructions;
+    c.defaults.exclude = v.exclude;
+    Ok(())
+}
+
+/// 文書の共通設定の保存（版の照合・変更履歴・危険確認は他の設定と同じ `apply_change` を通る）。
 pub async fn documents_save(
     State(state): State<AppState>,
     Extension(form): Extension<FormData>,
@@ -1366,20 +1512,32 @@ pub async fn documents_save(
         Ok(d) => d,
         Err(e) => return error_page(&state, StatusCode::BAD_REQUEST, e, back),
     };
-    let change = |c: &mut Config, docs: Vec<Document>| {
-        c.defaults.documents = docs;
-        Ok::<(), String>(())
+    let max_chars = match parse_num(&form, "max_chars", crate::t!("ui.kind.max_chars")) {
+        Ok(v) => v,
+        Err(e) => return error_page(&state, StatusCode::BAD_REQUEST, e, back),
     };
-    let preview_docs = documents.clone();
+    let max_bytes = match parse_num(&form, "max_bytes", crate::t!("ui.kind.max_bytes")) {
+        Ok(v) => v,
+        Err(e) => return error_page(&state, StatusCode::BAD_REQUEST, e, back),
+    };
+    let values = DocumentDefaults {
+        documents,
+        language: form.text("language"),
+        max_chars,
+        max_bytes,
+        instructions: normalized(&form, "instructions").unwrap_or_default(),
+        exclude: lines_of(form.get("exclude")),
+    };
+    let preview = values.clone();
     apply_change(
         &state,
         "/settings/documents",
         &form,
         back,
         Vec::new(),
-        |c| change(c, preview_docs),
+        |c| apply_document_defaults(c, preview),
         move |s, rev| {
-            let done = ops::edit(&s.store, Some(rev), |c| change(c, documents))?;
+            let done = ops::edit(&s.store, Some(rev), |c| apply_document_defaults(c, values))?;
             Ok(format!(
                 "/settings/documents?msg={}",
                 if done.saved { "saved" } else { "unchanged" }
@@ -1389,18 +1547,67 @@ pub async fn documents_save(
     .await
 }
 
-fn opt_choices(
-    current: Option<&str>,
-    options: &[(&str, &str)],
-    default_label: &str,
-) -> Vec<Choice> {
-    let mut out = vec![Choice::new("default", default_label, current.is_none())];
-    out.extend(
-        options
-            .iter()
-            .map(|(v, l)| Choice::new(*v, *l, current == Some(*v))),
-    );
-    out
+/// 種類の設定の既定値（実効値を決める `kinds` の解決と同じ値）。画面に別の複写を持たない。
+struct KindDefaults {
+    create_if_missing: bool,
+    when: When,
+    changelog: kinds::ResolvedChangelog,
+}
+
+fn kind_defaults(id: &str) -> KindDefaults {
+    let document =
+        Document::try_from(id.to_string()).unwrap_or_else(|_| Document::Custom(id.to_string()));
+    // 設定が空の種類を解決する（組み込みは組み込みの既定、カスタムは「対象が無ければ作らない」）。
+    let mut empty = Config::default();
+    empty.kinds.insert(id.to_string(), KindSettings::default());
+    KindDefaults {
+        create_if_missing: kinds::resolve_kind(&empty, &document)
+            .is_some_and(|k| k.create_if_missing),
+        when: kinds::ResolvedTiming::default().when,
+        changelog: kinds::ResolvedChangelog::default(),
+    }
+}
+
+/// 選択肢の一覧。設定の値が無いときは既定の値を選択済みにする（「既定（…）」という選択肢は出さない）。
+fn value_choices(selected: &str, options: &[(&str, &str)]) -> Vec<Choice> {
+    options
+        .iter()
+        .map(|(v, l)| Choice::new(*v, *l, selected == *v))
+        .collect()
+}
+
+fn when_name(when: When) -> &'static str {
+    match when {
+        When::Push => "push",
+        When::Release => "release",
+        When::Manual => "manual",
+    }
+}
+
+fn format_name(format: ChangelogFormat) -> &'static str {
+    match format {
+        ChangelogFormat::Existing => "existing",
+        ChangelogFormat::KeepAChangelog => "keep-a-changelog",
+    }
+}
+
+fn on_release_name(on_release: OnRelease) -> &'static str {
+    match on_release {
+        OnRelease::Promote => "promote",
+        OnRelease::Ignore => "ignore",
+    }
+}
+
+fn backfill_name(backfill: Backfill) -> &'static str {
+    match backfill {
+        Backfill::Tags => "tags",
+        Backfill::Off => "none",
+    }
+}
+
+/// フォームの選択値が既定と同じなら未設定（None）に戻す。違う値だけを設定として残す。
+fn unless_default<T: PartialEq>(value: Option<T>, default: T) -> Option<T> {
+    value.filter(|v| *v != default)
 }
 
 fn num_text<T: ToString>(v: Option<T>) -> String {
@@ -1413,6 +1620,8 @@ fn kind_form(id: &str, s: &KindSettings, is_new: bool) -> KindForm {
     let doc = Document::try_from(id.to_string()).ok();
     let timing = s.timing.clone().unwrap_or_default();
     let cl = s.changelog.clone().unwrap_or_default();
+    let defaults = kind_defaults(id);
+    let cl_defaults = &defaults.changelog;
     KindForm {
         id: id.to_string(),
         name: doc
@@ -1424,18 +1633,16 @@ fn kind_form(id: &str, s: &KindSettings, is_new: bool) -> KindForm {
         is_changelog: id == "changelog",
         guidance: s.guidance.clone().unwrap_or_default(),
         paths: s.paths.join("\n"),
-        create_if_missing: opt_choices(
-            s.create_if_missing
-                .map(|b| if b { "true" } else { "false" }),
+        create_if_missing: value_choices(
+            if s.create_if_missing.unwrap_or(defaults.create_if_missing) {
+                "true"
+            } else {
+                "false"
+            },
             &[
                 ("true", crate::t!("ui.kind.create_yes")),
                 ("false", crate::t!("ui.kind.create_no")),
             ],
-            if builtin {
-                crate::t!("ui.kind.create_default_yes")
-            } else {
-                crate::t!("ui.kind.create_default_no")
-            },
         ),
         template_file: s
             .template
@@ -1446,64 +1653,56 @@ fn kind_form(id: &str, s: &KindSettings, is_new: bool) -> KindForm {
         instructions: s.instructions.clone().unwrap_or_default(),
         required_headings: s.required_headings.join("\n"),
         split_dir: s.split_dir.clone().unwrap_or_default(),
-        timing_when: opt_choices(
-            timing.when.map(|w| match w {
-                When::Push => "push",
-                When::Release => "release",
-                When::Manual => "manual",
-            }),
+        timing_when: value_choices(
+            when_name(timing.when.unwrap_or(defaults.when)),
             &[
                 ("push", when_label(When::Push)),
                 ("release", when_label(When::Release)),
                 ("manual", when_label(When::Manual)),
             ],
-            crate::t!("ui.kind.default_push"),
         ),
         timing_paths: timing.paths.join("\n"),
         timing_min_interval: num_text(timing.min_interval_hours),
-        cl_format: opt_choices(
-            cl.format.map(|f| match f {
-                ChangelogFormat::Existing => "existing",
-                ChangelogFormat::KeepAChangelog => "keep-a-changelog",
-            }),
+        cl_format: value_choices(
+            format_name(cl.format.unwrap_or(cl_defaults.format)),
             &[
                 ("existing", crate::t!("ui.kind.format_existing")),
                 ("keep-a-changelog", "keep-a-changelog"),
             ],
-            crate::t!("ui.kind.default_existing"),
         ),
         cl_release_tag: cl.release_tag.clone().unwrap_or_default(),
-        cl_on_release: opt_choices(
-            cl.on_release.map(|o| match o {
-                OnRelease::Promote => "promote",
-                OnRelease::Ignore => "ignore",
-            }),
+        cl_on_release: value_choices(
+            on_release_name(cl.on_release.unwrap_or(cl_defaults.on_release)),
             &[
                 ("promote", crate::t!("ui.kind.on_release_promote")),
                 ("ignore", crate::t!("ui.kind.on_release_ignore")),
             ],
-            crate::t!("ui.kind.default_promote"),
         ),
-        cl_backfill: opt_choices(
-            cl.backfill.map(|b| match b {
-                Backfill::Tags => "tags",
-                Backfill::Off => "none",
-            }),
+        cl_backfill: value_choices(
+            backfill_name(cl.backfill.unwrap_or(cl_defaults.backfill)),
             &[
                 ("tags", crate::t!("ui.kind.backfill_tags")),
                 ("none", crate::t!("ui.kind.backfill_none")),
             ],
-            crate::t!("ui.kind.default_tags"),
         ),
         cl_backfill_max_releases: num_text(cl.backfill_max_releases),
         cl_backfill_max_commits: num_text(cl.backfill_max_commits),
         ph_none: crate::t!("ui.kind.ph.none").to_string(),
         ph_split_dir: crate::t!("ui.kind.ph.split_dir", value = kinds::default_split_dir(id)),
         ph_min_interval: crate::t!(
-            "ui.kind.ph.interval",
+            "ui.kind.ph.value",
             value = kinds::ResolvedTiming::default().min_interval_hours
         ),
         ph_template_file: crate::t!("ui.kind.ph.template_example").to_string(),
+        ph_release_tag: crate::t!("ui.kind.ph.value", value = cl_defaults.release_tag),
+        ph_backfill_releases: crate::t!(
+            "ui.kind.ph.value",
+            value = cl_defaults.backfill_max_releases
+        ),
+        ph_backfill_commits: crate::t!(
+            "ui.kind.ph.value",
+            value = cl_defaults.backfill_max_commits
+        ),
     }
 }
 
@@ -1536,11 +1735,16 @@ fn parse_kind_form(form: &FormData, id: &str) -> Result<KindSettings, String> {
         s.guidance = normalized(form, "guidance");
         s.paths = lines_of(form.get("paths"));
     }
-    s.create_if_missing = match form.get("create_if_missing") {
-        Some("true") => Some(true),
-        Some("false") => Some(false),
-        _ => None,
-    };
+    // 選択欄は実際に効く値を出すので、既定と同じ値は未設定に戻す（既定を設定ファイルへ書き写さない）。
+    let defaults = kind_defaults(id);
+    s.create_if_missing = unless_default(
+        match form.get("create_if_missing") {
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => None,
+        },
+        defaults.create_if_missing,
+    );
     // テンプレートは使うファイル名だけを設定する（空欄は未設定。CHANGELOG は組み込み、それ以外は使わない）。
     s.template = form
         .text("template_file")
@@ -1553,12 +1757,15 @@ fn parse_kind_form(form: &FormData, id: &str) -> Result<KindSettings, String> {
         form.text("split_dir")
     };
     let timing = Timing {
-        when: match form.get("timing_when") {
-            Some("push") => Some(When::Push),
-            Some("release") => Some(When::Release),
-            Some("manual") => Some(When::Manual),
-            _ => None,
-        },
+        when: unless_default(
+            match form.get("timing_when") {
+                Some("push") => Some(When::Push),
+                Some("release") => Some(When::Release),
+                Some("manual") => Some(When::Manual),
+                _ => None,
+            },
+            defaults.when,
+        ),
         paths: lines_of(form.get("timing_paths")),
         min_interval_hours: parse_num(
             form,
@@ -1568,23 +1775,33 @@ fn parse_kind_form(form: &FormData, id: &str) -> Result<KindSettings, String> {
     };
     s.timing = (timing != Timing::default()).then_some(timing);
     if id == "changelog" {
+        let cl_defaults = &defaults.changelog;
         let cl = ChangelogSettings {
-            format: match form.get("cl_format") {
-                Some("existing") => Some(ChangelogFormat::Existing),
-                Some("keep-a-changelog") => Some(ChangelogFormat::KeepAChangelog),
-                _ => None,
-            },
+            format: unless_default(
+                match form.get("cl_format") {
+                    Some("existing") => Some(ChangelogFormat::Existing),
+                    Some("keep-a-changelog") => Some(ChangelogFormat::KeepAChangelog),
+                    _ => None,
+                },
+                cl_defaults.format,
+            ),
             release_tag: form.text("cl_release_tag"),
-            on_release: match form.get("cl_on_release") {
-                Some("promote") => Some(OnRelease::Promote),
-                Some("ignore") => Some(OnRelease::Ignore),
-                _ => None,
-            },
-            backfill: match form.get("cl_backfill") {
-                Some("tags") => Some(Backfill::Tags),
-                Some("none") => Some(Backfill::Off),
-                _ => None,
-            },
+            on_release: unless_default(
+                match form.get("cl_on_release") {
+                    Some("promote") => Some(OnRelease::Promote),
+                    Some("ignore") => Some(OnRelease::Ignore),
+                    _ => None,
+                },
+                cl_defaults.on_release,
+            ),
+            backfill: unless_default(
+                match form.get("cl_backfill") {
+                    Some("tags") => Some(Backfill::Tags),
+                    Some("none") => Some(Backfill::Off),
+                    _ => None,
+                },
+                cl_defaults.backfill,
+            ),
             backfill_max_releases: parse_num(
                 form,
                 "cl_backfill_max_releases",
@@ -1781,10 +1998,20 @@ pub async fn kind_save(
         );
     }
     let builtin = kinds::is_builtin_id(&id);
-    let settings = match parse_kind_form(&form, &id) {
+    let mut settings = match parse_kind_form(&form, &id) {
         Ok(s) => s,
         Err(e) => return error_page(&state, StatusCode::BAD_REQUEST, e, back),
     };
+    // 画面に欄が無い値は、保存で失わせない（種類別の上限・言語と、ファイルではないテンプレートの指定）。
+    if let Some(old) = current(&state).config.kinds.get(&id) {
+        settings.max_chars = old.max_chars;
+        settings.max_bytes = old.max_bytes;
+        settings.language = old.language.clone();
+        let prefix = format!("{}/", kinds::TEMPLATES_DIR);
+        if settings.template.is_none() {
+            settings.template = old.template.clone().filter(|t| !t.starts_with(&prefix));
+        }
+    }
     let value = if builtin && settings == KindSettings::default() {
         None
     } else {
@@ -2031,6 +2258,8 @@ pub async fn worker(State(state): State<AppState>, Query(q): Query<Msg>) -> Resp
             ),
         ],
         claude_path: w.claude_path.clone(),
+        claude_problem: !w.claude_path.trim().is_empty()
+            && !FsPath::new(w.claude_path.trim()).is_file(),
         claude_state,
         layout: layout(
             &state,
@@ -2151,7 +2380,7 @@ pub async fn worker_save(
 fn document_language_choices(current: Option<&str>) -> Vec<Choice> {
     let mut out = vec![Choice::new(
         "",
-        crate::t!("ui.general.language_auto"),
+        crate::t!("ui.documents.language_auto"),
         current.is_none(),
     )];
     let mut known = false;
@@ -2169,125 +2398,6 @@ fn document_language_choices(current: Option<&str>) -> Vec<Choice> {
     out
 }
 
-pub async fn general(State(state): State<AppState>, Query(q): Query<Msg>) -> Response {
-    let cur = current(&state);
-    let d = &cur.config.defaults;
-    let e = &cur.config.enrollment;
-    let page = GeneralPage {
-        revision: cur.revision.to_string(),
-        exclude: d.exclude.join("\n"),
-        instructions: d.instructions.clone(),
-        instructions_max: kinds::INSTRUCTIONS_MAX_CHARS,
-        languages: document_language_choices(d.language.as_deref()),
-        max_chars: num_text(d.max_chars),
-        max_bytes: num_text(d.max_bytes),
-        ph_no_limit: crate::t!("ui.kind.ph.no_limit").to_string(),
-        policies: vec![
-            Choice::new(
-                "explicit",
-                crate::t!("ui.general.policy_explicit"),
-                e.policy == Policy::Explicit,
-            ),
-            Choice::new(
-                "remote-owner",
-                crate::t!("ui.general.policy_owner"),
-                e.policy == Policy::RemoteOwner,
-            ),
-            Choice::new(
-                "all",
-                crate::t!("ui.general.policy_all"),
-                e.policy == Policy::All,
-            ),
-        ],
-        owners: e.owners.join("\n"),
-        layout: layout(
-            &state,
-            crate::t!("ui.title.general"),
-            "general",
-            q.msg.as_deref(),
-            cur.broken,
-        ),
-    };
-    html(page)
-}
-
-/// 全般設定の値（除外・共通の追加指示・自動登録）。既定の対象の文書は「文書」タブで扱う。
-#[derive(Clone)]
-struct GeneralValues {
-    exclude: Vec<String>,
-    instructions: String,
-    language: Option<String>,
-    max_chars: Option<u64>,
-    max_bytes: Option<u64>,
-    policy: Policy,
-    owners: Vec<String>,
-}
-
-fn apply_general(c: &mut Config, v: GeneralValues) -> Result<(), String> {
-    c.defaults.exclude = v.exclude;
-    c.defaults.instructions = v.instructions;
-    c.defaults.language = v.language;
-    c.defaults.max_chars = v.max_chars;
-    c.defaults.max_bytes = v.max_bytes;
-    c.enrollment.policy = v.policy;
-    c.enrollment.owners = v.owners;
-    Ok(())
-}
-
-pub async fn general_save(
-    State(state): State<AppState>,
-    Extension(form): Extension<FormData>,
-) -> Response {
-    let back = "/settings/general";
-    let policy = match form.get("policy") {
-        Some("explicit") => Policy::Explicit,
-        Some("remote-owner") => Policy::RemoteOwner,
-        Some("all") => Policy::All,
-        _ => {
-            return error_page(
-                &state,
-                StatusCode::BAD_REQUEST,
-                crate::t!("ui.error.policy"),
-                back,
-            );
-        }
-    };
-    let max_chars = match parse_num(&form, "max_chars", crate::t!("ui.kind.max_chars")) {
-        Ok(v) => v,
-        Err(e) => return error_page(&state, StatusCode::BAD_REQUEST, e, back),
-    };
-    let max_bytes = match parse_num(&form, "max_bytes", crate::t!("ui.kind.max_bytes")) {
-        Ok(v) => v,
-        Err(e) => return error_page(&state, StatusCode::BAD_REQUEST, e, back),
-    };
-    let values = GeneralValues {
-        exclude: lines_of(form.get("exclude")),
-        instructions: normalized(&form, "instructions").unwrap_or_default(),
-        language: form.text("language"),
-        max_chars,
-        max_bytes,
-        policy,
-        owners: lines_of(form.get("owners")),
-    };
-    let preview = values.clone();
-    apply_change(
-        &state,
-        back,
-        &form,
-        back,
-        Vec::new(),
-        |c| apply_general(c, preview),
-        move |s, rev| {
-            let done = ops::edit(&s.store, Some(rev), |c| apply_general(c, values))?;
-            Ok(format!(
-                "/settings/general?msg={}",
-                if done.saved { "saved" } else { "unchanged" }
-            ))
-        },
-    )
-    .await
-}
-
 // ---------------------------------------------------------------------------
 // 診断・変更履歴
 // ---------------------------------------------------------------------------
@@ -2296,16 +2406,37 @@ pub async fn doctor(State(state): State<AppState>) -> Response {
     let Ok(result) = blocking(|| doctor::run(false)).await else {
         return internal(&state, "/");
     };
-    let items = result["items"]
+    let mut rows: Vec<DoctorRow> = result["items"]
         .as_array()
         .into_iter()
         .flatten()
-        .map(|i| DoctorRow {
-            id: i["id"].as_str().unwrap_or("").to_string(),
-            status: i["status"].as_str().unwrap_or("").to_string(),
-            detail: views::redact(i["detail"].as_str().unwrap_or("")),
+        .map(|i| {
+            let status = i["status"].as_str().unwrap_or("").to_string();
+            let status_label = match status.as_str() {
+                "ok" => crate::t!("ui.doctor.status.ok").to_string(),
+                "warn" => crate::t!("ui.doctor.status.warn").to_string(),
+                "fail" => crate::t!("ui.doctor.status.fail").to_string(),
+                "info" => crate::t!("ui.doctor.status.info").to_string(),
+                other => views::redact(other),
+            };
+            DoctorRow {
+                id: i["id"].as_str().unwrap_or("").to_string(),
+                status,
+                status_label,
+                detail: views::redact(i["detail"].as_str().unwrap_or("")),
+            }
         })
         .collect();
+    // 失敗 → 警告 → 正常の順（同じ状態の中は診断が返した順のまま）。正常な項目は折りたたむ。
+    rows.sort_by_key(|r| match r.status.as_str() {
+        "fail" => 0,
+        "warn" => 1,
+        "ok" => 2,
+        _ => 3,
+    });
+    let (problems, passed): (Vec<DoctorRow>, Vec<DoctorRow>) = rows
+        .into_iter()
+        .partition(|r| matches!(r.status.as_str(), "fail" | "warn"));
     let cur = current(&state);
     html(DoctorPage {
         layout: layout(
@@ -2316,7 +2447,8 @@ pub async fn doctor(State(state): State<AppState>) -> Response {
             cur.broken,
         ),
         ok: result["ok"].as_bool().unwrap_or(false),
-        items,
+        problems,
+        passed,
     })
 }
 
@@ -2361,6 +2493,7 @@ fn run_views(config: &Config, page: &crate::runlog::Page) -> Vec<RunView> {
                 }),
                 attempts: row.attempts,
                 repo_label: run.repo_root.clone(),
+                repo_name: views::folder_name(&run.repo_root),
                 repo_index: index,
                 origin: if run.origin == "run_now" {
                     crate::t!("ui.runs.origin.run_now").to_string()

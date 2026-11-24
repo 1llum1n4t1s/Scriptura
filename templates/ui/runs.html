@@ -1,25 +1,30 @@
 {% extends "ui/base.html" %}
 {% block content %}
-<div class="heading"><h1>{{ crate::locale::tr("ui.title.runs") }}</h1></div>
-<section class="panel">
-  <form method="get" action="/history" class="inline">
-    <label>{{ crate::locale::tr("ui.runs.filter") }} <select name="repo" aria-label="{{ crate::locale::tr("ui.runs.filter") }}">{% for c in repos %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
-    <button class="small" type="submit">{{ crate::locale::tr("ui.runs.filter_apply") }}</button>
+<div class="heading"><h1>{{ crate::locale::tr("ui.title.runs") }}</h1>
+  <form method="get" action="/history" class="filter-form">
+    <label>{{ crate::locale::tr("ui.runs.filter") }} <select name="repo" data-autosubmit>{% for c in repos %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+    <button class="small" type="submit" data-autosubmit-fallback>{{ crate::locale::tr("ui.runs.filter_apply") }}</button>
   </form>
+</div>
+<section class="panel">
   {% if rows.is_empty() %}<p class="note">{{ crate::locale::tr("ui.runs.none") }}</p>{% else %}
   <div class="table-wrap"><table>
-    <thead><tr><th>{{ crate::locale::tr("ui.runs.time") }}</th><th>{{ crate::locale::tr("ui.common.repository") }}</th><th>{{ crate::locale::tr("ui.runs.origin") }}</th><th>{{ crate::locale::tr("ui.runs.kinds") }}</th><th>{{ crate::locale::tr("ui.runs.outcome") }}</th><th>{{ crate::locale::tr("ui.runs.documents") }}</th><th>{{ crate::locale::tr("ui.runs.range") }}</th><th>{{ crate::locale::tr("ui.runs.result") }}</th><th>{{ crate::locale::tr("ui.runs.reason") }}</th></tr></thead>
+    <thead><tr><th>{{ crate::locale::tr("ui.runs.time") }}</th><th>{{ crate::locale::tr("ui.common.repository") }}</th><th>{{ crate::locale::tr("ui.runs.outcome") }}</th><th>{{ crate::locale::tr("ui.runs.documents") }}</th></tr></thead>
     <tbody>
     {% for r in rows %}<tr>
-      <td>{% let t = r.time %}{% include "ui/time_secs.html" %}{% if r.attempts > 1 %} <span class="badge">&times;{{ r.attempts }}</span>{% endif %}</td>
-      <td>{% if let Some(i) = r.repo_index %}<a href="/repos/{{ i }}"><code>{{ r.repo_label }}</code></a>{% else %}<code>{{ r.repo_label }}</code>{% endif %}</td>
-      <td>{{ r.origin }}</td>
-      <td>{{ r.kinds }}</td>
-      <td><span class="badge{% if !r.outcome_class.is_empty() %} {{ r.outcome_class }}{% endif %}">{{ r.outcome }}</span></td>
-      <td>{% for d in r.documents %}<div class="path">{{ d }}</div>{% endfor %}</td>
-      <td>{% if !r.range.is_empty() %}<code>{{ r.range }}</code>{% endif %}</td>
-      <td>{% if !r.result_short.is_empty() %}<code>{{ r.result_short }}</code>{% endif %}</td>
-      <td>{% if !r.message.is_empty() %}<span class="error-text">{{ r.message }}</span>{% endif %}</td>
+      <td class="nowrap">{% let t = r.time %}{% include "ui/time_secs.html" %}{% if r.attempts > 1 %} <span class="badge">&times;{{ r.attempts }}</span>{% endif %}</td>
+      <td>{% if let Some(i) = r.repo_index %}<a href="/repos/{{ i }}" title="{{ r.repo_label }}">{{ r.repo_name }}</a>{% else %}<span title="{{ r.repo_label }}">{{ r.repo_name }}</span>{% endif %}</td>
+      <td><span class="badge{% if !r.outcome_class.is_empty() %} {{ r.outcome_class }}{% endif %}">{{ r.outcome }}</span>{% if !r.message.is_empty() %}<div class="error-text">{{ r.message }}</div>{% endif %}</td>
+      <td>{% for d in r.documents %}<div class="path">{{ d }}</div>{% endfor %}
+        <details class="run-details"><summary>{{ crate::locale::tr("ui.runs.details") }}</summary>
+          <dl class="facts">
+            <dt>{{ crate::locale::tr("ui.common.repository") }}</dt><dd><code>{{ r.repo_label }}</code></dd>
+            <dt>{{ crate::locale::tr("ui.runs.origin") }}</dt><dd>{{ r.origin }}</dd>
+            <dt>{{ crate::locale::tr("ui.runs.kinds") }}</dt><dd>{{ r.kinds }}</dd>
+            {% if !r.range.is_empty() %}<dt>{{ crate::locale::tr("ui.runs.range") }}</dt><dd><code>{{ r.range }}</code></dd>{% endif %}
+            {% if !r.result_short.is_empty() %}<dt>{{ crate::locale::tr("ui.runs.result") }}</dt><dd><code>{{ r.result_short }}</code></dd>{% endif %}
+          </dl>
+        </details></td>
     </tr>{% endfor %}
     </tbody>
   </table></div>

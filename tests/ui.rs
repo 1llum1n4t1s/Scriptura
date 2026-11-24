@@ -248,6 +248,11 @@ impl Fx {
         self.post_exact(path, &hidden_fields(&first.body)).await
     }
 
+    /// 画面（`body`）の `action` のフォームを、表示された値のまま送信する（利用者が何も変えずに保存する操作）。
+    async fn submit(&self, body: &str, action: &str) -> Resp {
+        self.post_exact(action, &form_pairs(body, action)).await
+    }
+
     fn revision(&self) -> String {
         config::read_at(&self.store.config_file)
             .revision
@@ -304,6 +309,54 @@ fn hidden_fields(body: &str) -> Vec<(String, String)> {
         .captures_iter(body)
         .map(|c| (unescape(&c[1]), unescape(&c[2])))
         .collect()
+}
+
+/// 画面のフォーム（`action` が一致するもの）を、ブラウザーが送るのと同じ値の組にする
+/// （input は値、チェックボックスはチェック済みだけ、textarea は本文、select は選択中の option）。
+fn form_pairs(body: &str, action: &str) -> Vec<(String, String)> {
+    let marker = format!("action=\"{action}\"");
+    let at = body.find(&marker).unwrap_or_else(|| panic!("{action}"));
+    let start = body[..at].rfind("<form").unwrap();
+    let form = &body[start..start + body[start..].find("</form>").unwrap()];
+    let attr = |tag: &str, name: &str| -> Option<String> {
+        Regex::new(&format!(r#"\s{name}="([^"]*)""#))
+            .unwrap()
+            .captures(tag)
+            .map(|c| unescape(&c[1]))
+    };
+    let controls = Regex::new(
+        r"(?s)<input\b[^>]*>|<textarea\b[^>]*>.*?</textarea>|<select\b[^>]*>.*?</select>",
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    for m in controls.find_iter(form) {
+        let text = m.as_str();
+        let head = &text[..text.find('>').unwrap() + 1];
+        let Some(name) = attr(head, "name") else {
+            continue;
+        };
+        if text.starts_with("<textarea") {
+            let inner = &text[head.len()..text.len() - "</textarea>".len()];
+            out.push((name, unescape(inner)));
+        } else if text.starts_with("<select") {
+            let options = Regex::new(r#"<option value="([^"]*)"( selected)?>"#).unwrap();
+            let all: Vec<_> = options.captures_iter(text).collect();
+            let chosen = all.iter().find(|c| c.get(2).is_some()).or(all.first());
+            if let Some(c) = chosen {
+                out.push((name, unescape(&c[1])));
+            }
+        } else {
+            let kind = attr(head, "type").unwrap_or_else(|| "text".into());
+            if matches!(kind.as_str(), "submit" | "button") {
+                continue;
+            }
+            if kind == "checkbox" && !Regex::new(r"\schecked[\s>]").unwrap().is_match(head) {
+                continue;
+            }
+            out.push((name, attr(head, "value").unwrap_or_default()));
+        }
+    }
+    out
 }
 
 fn set_hidden(fields: &mut [(String, String)], name: &str, value: &str) {
@@ -508,6 +561,7 @@ async fn resident_screens_explain_reopening_from_the_tray() {
     assert!(!body.contains("タスクトレイ"), "{body}");
     let page = fx.get("/").await;
     assert!(page.body.contains("60 分操作が無いと終了します"));
+    assert!(page.body.contains("action=\"/shutdown\""));
     assert!(!page.body.contains("常駐中"));
 
     // 常駐: トレイのアイコンから開き直す案内と、ログインが切れるというフッター。
@@ -557,6 +611,8 @@ async fn resident_screens_explain_reopening_from_the_tray() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("（常駐中）"), "{body}");
     assert!(!body.contains("60 分操作が無いと終了します"), "{body}");
+    // 常駐ではトレイの「終了」があるので、画面の「終了」ボタン（サーバーを止める）は出さない。
+    assert!(!body.contains("action=\"/shutdown\""), "{body}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -620,7 +676,7 @@ async fn get_pages_render_without_creating_state_or_config() {
         "/settings/documents/changelog",
         "/settings/documents/new",
         "/settings/worker",
-        "/settings/general",
+        "/settings/app",
         "/history",
         "/settings/history",
         "/doctor",
@@ -645,9 +701,15 @@ async fn get_pages_render_without_creating_state_or_config() {
         "/proposals",
         "/proposals/0/abc",
         "/consent",
+        "/settings/general",
     ] {
         assert_eq!(fx.get(old).await.status, StatusCode::NOT_FOUND, "{old}");
     }
+    // 旧「全般」の保存も無い（項目は文書・リポジトリへ移った）。
+    let r = fx
+        .post("/settings/general", &[("revision", "x"), ("policy", "all")])
+        .await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.body);
     assert_eq!(fx.get("/repos/0").await.status, StatusCode::NOT_FOUND);
     assert_eq!(
         fx.get("/settings/history/..%2Fconfig.toml").await.status,
@@ -1071,6 +1133,11 @@ async fn run_now_always_confirms_and_runs_as_a_background_job() {
     assert!(!body.contains("実行中です"), "{body}");
     // 更新案へのリンクは無い。
     assert!(!body.contains("/proposals"), "{body}");
+    // 見出しは利用者向けの言葉（内部の呼び名 run-now を出さない）。
+    assert!(
+        !body.contains("run-now #") && body.contains("今すぐ保守"),
+        "{body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,20 +1161,64 @@ async fn kind_form_shows_builtin_defaults_as_placeholders_without_saving_them() 
         "{}",
         design.body
     );
-    let general = fx.get("/settings/general").await;
+    let common = fx.get("/settings/documents").await;
     assert!(
-        general.body.contains(
+        common.body.contains(
             r#"name="max_bytes" inputmode="numeric" value="" placeholder="上限なし（既定）""#
         ),
         "{}",
-        general.body
+        common.body
     );
     assert!(design.body.contains(r#"placeholder="0（既定）""#));
     assert!(design.body.contains(r#"placeholder="例: architecture.md""#));
-    // プレースホルダーは値ではない: 既定のまま保存しても設定には何も書かれない。
+    // 選択欄は「既定（…）」ではなく、実際に効く値を選択済みで出す。
+    assert_eq!(
+        option_values(&design.body, "create_if_missing"),
+        vec![("true".to_string(), true), ("false".to_string(), false)]
+    );
+    assert_eq!(
+        option_values(&design.body, "timing_when"),
+        vec![
+            ("push".to_string(), true),
+            ("release".to_string(), false),
+            ("manual".to_string(), false)
+        ]
+    );
+    assert!(!design.body.contains(r#"value="default""#));
+    let changelog = fx.get("/settings/documents/changelog").await;
+    for (name, selected) in [
+        ("cl_format", "existing"),
+        ("cl_on_release", "promote"),
+        ("cl_backfill", "tags"),
+    ] {
+        let chosen: Vec<_> = option_values(&changelog.body, name)
+            .into_iter()
+            .filter(|(_, on)| *on)
+            .collect();
+        assert_eq!(chosen, vec![(selected.to_string(), true)], "{name}");
+    }
+    // 空欄の数値・タグには、実際の既定値を placeholder で出す。
+    for needle in [
+        r#"name="cl_release_tag" value="" placeholder="v*（既定）""#,
+        r#"name="cl_backfill_max_releases" inputmode="numeric" value="" placeholder="20（既定）""#,
+        r#"name="cl_backfill_max_commits" inputmode="numeric" value="" placeholder="300（既定）""#,
+    ] {
+        assert!(changelog.body.contains(needle), "{needle}");
+    }
+    // 既定と同じ値は未設定として保存する: 既定のまま保存しても設定には何も書かれない。
     let rev = fx.revision();
     let r = fx
         .post("/settings/documents/agents", &[("revision", &rev)])
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    assert!(fx.config().kinds.is_empty());
+    let design = fx.get("/settings/documents/design").await;
+    let r = fx.submit(&design.body, "/settings/documents/design").await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    assert!(fx.config().kinds.is_empty());
+    let changelog = fx.get("/settings/documents/changelog").await;
+    let r = fx
+        .submit(&changelog.body, "/settings/documents/changelog")
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     assert!(fx.config().kinds.is_empty());
@@ -1131,6 +1242,9 @@ async fn kinds_are_edited_and_user_text_is_escaped() {
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     let k = fx.config().kinds["agents"].clone();
     assert_eq!(k.required_headings, vec!["## 概要", "## 構成"]);
+    // 変更済みの種類だけ、一覧の名前の横にタグが付く。
+    let list = fx.get("/settings/documents").await.body;
+    assert_eq!(list.matches("変更あり").count(), 1, "{list}");
     let page = fx.get("/settings/documents/agents").await;
     assert!(!page.body.contains("<script>alert"));
     // askama の自動エスケープ（数値参照）を通っている。
@@ -1142,10 +1256,10 @@ async fn kinds_are_edited_and_user_text_is_escaped() {
     let rev = fx.revision();
     let r = fx
         .post(
-            "/settings/general",
+            "/settings/documents",
             &[
                 ("revision", &rev),
-                ("policy", "explicit"),
+                ("documents", "AGENTS.md"),
                 ("max_chars", "0"),
             ],
         )
@@ -1269,39 +1383,205 @@ async fn kinds_are_edited_and_user_text_is_escaped() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn general_settings_confirm_policy_and_leave_default_documents_alone() {
+async fn enrollment_lives_on_repos_confirms_policy_and_is_saved_apart_from_documents() {
     let fx = Fx::new().await;
-    // 全般には既定のモード・既定の対象の文書の欄は無い（対象の文書は「文書」タブ）。
-    let page = fx.get("/settings/general").await;
-    for gone in ["name=\"mode\"", "name=\"documents\""] {
-        assert!(!page.body.contains(gone), "{gone}");
+    // 自動登録は「リポジトリ」画面（一覧 → 登録 → 自動登録の順の折りたたみ）にあり、文書の画面には無い。
+    let page = fx.get("/repos").await;
+    assert!(page.body.contains(r#"action="/repos/enrollment""#));
+    let at = |needle: &str| page.body.find(needle).unwrap_or_else(|| panic!("{needle}"));
+    assert!(at("まだ登録がありません") < at(r#"action="/repos/enable""#));
+    assert!(at(r#"action="/repos/enable""#) < at(r#"action="/repos/enrollment""#));
+    // 登録も自動登録も折りたたみ（`<details class="panel">`）。登録は 0 件なので開いている。
+    assert_eq!(page.body.matches(r#"<details class="panel""#).count(), 2);
+    assert!(
+        page.body.contains(r#"<details class="panel" open>"#),
+        "{}",
+        page.body
+    );
+    let docs = fx.get("/settings/documents").await;
+    for gone in ["name=\"policy\"", "name=\"owners\""] {
+        assert!(!docs.body.contains(gone), "{gone}");
     }
+    assert!(!fx.get("/repos").await.body.contains(r#"name="exclude""#));
+    // 共通の指示は文書の画面から先に保存する。
     let rev = fx.revision();
-    let pairs = [
-        ("revision", rev.as_str()),
-        ("instructions", "日本語で書く"),
-        ("policy", "all"),
-    ];
-    let first = fx.post("/settings/general", &pairs).await;
+    let r = fx
+        .post(
+            "/settings/documents",
+            &[
+                ("revision", rev.as_str()),
+                ("documents", "AGENTS.md"),
+                ("instructions", "日本語で書く"),
+            ],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    // 自動登録の方針を all にするのは確認画面が先（書き込まない）。
+    let rev = fx.revision();
+    let pairs = [("revision", rev.as_str()), ("policy", "all")];
+    let before = fs::read(&fx.store.config_file).unwrap();
+    let first = fx.post("/repos/enrollment", &pairs).await;
     assert_eq!(first.status, StatusCode::OK);
     assert!(first.body.contains("all"));
-    assert!(!fx.store.config_file.exists());
+    assert_eq!(fs::read(&fx.store.config_file).unwrap(), before);
     let r = fx
-        .post_exact("/settings/general", &hidden_fields(&first.body))
+        .post_exact("/repos/enrollment", &hidden_fields(&first.body))
+        .await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    assert_eq!(r.location(), "/repos?msg=saved");
+    let c = fx.config();
+    assert_eq!(c.enrollment.policy, Policy::All);
+    // 自動登録の保存は、文書の共通設定を消さない。
+    assert_eq!(c.defaults.instructions, "日本語で書く");
+    assert_eq!(c.defaults.documents, vec![config::Document::Agents]);
+    // 逆に、文書の共通設定の保存は自動登録を消さない。
+    let docs = fx.get("/settings/documents").await;
+    let r = fx.submit(&docs.body, "/settings/documents").await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    assert_eq!(fx.config().enrollment.policy, Policy::All);
+    let rev = fx.revision();
+    let r = fx
+        .post(
+            "/settings/documents",
+            &[
+                ("revision", rev.as_str()),
+                ("documents", "AGENTS.md"),
+                ("instructions", "英語で書く"),
+            ],
+        )
         .await;
     assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
     let c = fx.config();
     assert_eq!(c.enrollment.policy, Policy::All);
-    assert_eq!(c.defaults.instructions, "日本語で書く");
-    // 全般の保存は既定の対象の文書を変えない（空にもしない）。
-    assert_eq!(c.defaults.documents, Config::default().defaults.documents);
-    // 警告と確認の文面は、自動で commit・push することを伝える。
+    assert_eq!(c.defaults.instructions, "英語で書く");
+    // 方針が不正なら 400（書かない）。
+    let rev = fx.revision();
+    let r = fx
+        .post(
+            "/repos/enrollment",
+            &[("revision", rev.as_str()), ("policy", "nope")],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    // 警告と確認の文面は、自動で commit・push することを伝える（概要に出る）。
     let overview = fx.get("/").await;
     assert!(
         overview.body.contains("自動で commit・push"),
         "{}",
         overview.body
     );
+}
+
+/// 受入条件: 各フォームを開いて、表示された値のまま保存しても何も変わらない（設定ファイルはバイト単位で同じ）。
+/// 既定と違う値が明示されているときも、その値は保たれる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saving_every_form_unchanged_keeps_config_bytes() {
+    let fx = Fx::new().await;
+    let mut c = Config::default();
+    c.defaults.documents = vec![config::Document::Agents, config::Document::Changelog];
+    c.defaults.exclude = vec!["secret/**".into(), "*.pem".into()];
+    c.defaults.instructions = "日本語で書く".into();
+    c.defaults.language = Some("en".into());
+    c.defaults.max_chars = Some(3000);
+    c.defaults.max_bytes = Some(40000);
+    c.enrollment.policy = Policy::RemoteOwner;
+    c.enrollment.owners = vec!["github.com/acme".into()];
+    c.kinds.insert(
+        "agents".into(),
+        config::KindSettings {
+            create_if_missing: Some(false),
+            instructions: Some("短く".into()),
+            // 画面に欄が無い値も、保存で失わない。
+            max_chars: Some(2500),
+            max_bytes: Some(9000),
+            language: Some("ja".into()),
+            timing: Some(config::Timing {
+                when: Some(config::When::Release),
+                min_interval_hours: Some(12),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    c.kinds.insert(
+        "changelog".into(),
+        config::KindSettings {
+            template: Some("none".into()),
+            changelog: Some(config::ChangelogSettings {
+                format: Some(config::ChangelogFormat::KeepAChangelog),
+                release_tag: Some("rel-*".into()),
+                on_release: Some(config::OnRelease::Ignore),
+                backfill: Some(config::Backfill::Off),
+                backfill_max_releases: Some(5),
+                backfill_max_commits: Some(100),
+            }),
+            ..Default::default()
+        },
+    );
+    c.kinds.insert(
+        "architecture".into(),
+        config::KindSettings {
+            guidance: Some("構成を書く".into()),
+            paths: vec!["docs/ARCHITECTURE.md".into()],
+            create_if_missing: Some(true),
+            timing: Some(config::Timing {
+                paths: vec!["src/**".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    config::save_to(&fx.store.config_file, &c).unwrap();
+    let before = fs::read(&fx.store.config_file).unwrap();
+    for (screen, action) in [
+        ("/settings/documents", "/settings/documents"),
+        ("/repos", "/repos/enrollment"),
+        ("/settings/documents/agents", "/settings/documents/agents"),
+        (
+            "/settings/documents/changelog",
+            "/settings/documents/changelog",
+        ),
+        (
+            "/settings/documents/architecture",
+            "/settings/documents/architecture",
+        ),
+    ] {
+        let page = fx.get(screen).await;
+        assert_eq!(page.status, StatusCode::OK, "{screen}");
+        let r = fx.submit(&page.body, action).await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{action}: {}", r.body);
+        assert_eq!(
+            r.location(),
+            format!("{}?msg=unchanged", screen),
+            "{action}"
+        );
+        assert_eq!(fs::read(&fx.store.config_file).unwrap(), before, "{action}");
+    }
+}
+
+/// 設定ファイルが無い（未作成）ときに、既定のまま保存しても、既定と同じ値は設定として残らない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saving_defaults_without_a_config_file_records_no_overrides() {
+    let fx = Fx::new().await;
+    for (screen, action) in [
+        ("/settings/documents", "/settings/documents"),
+        ("/repos", "/repos/enrollment"),
+        ("/settings/documents/readme", "/settings/documents/readme"),
+        (
+            "/settings/documents/changelog",
+            "/settings/documents/changelog",
+        ),
+    ] {
+        let page = fx.get(screen).await;
+        let r = fx.submit(&page.body, action).await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{action}: {}", r.body);
+    }
+    let c = fx.config();
+    let defaults = Config::default();
+    assert!(c.kinds.is_empty());
+    assert_eq!(c.defaults, defaults.defaults);
+    assert_eq!(c.enrollment.policy, Policy::Explicit);
+    assert!(c.enrollment.owners.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1318,6 +1598,35 @@ async fn documents_tab_saves_default_targets_with_revision_check() {
     assert!(page.body.contains(r#"href="/settings/documents/new""#));
     assert!(page.body.contains(r#"action="/settings/documents""#));
     assert!(!page.body.contains("既定で対象"));
+    // 「すべての文書に共通の設定」は 1 つのフォーム・1 つの保存ボタン。並びは 対象文書 → 言語 → 上限 → 共通指示 → 除外 → 種類一覧。
+    let at = |needle: &str| page.body.find(needle).unwrap_or_else(|| panic!("{needle}"));
+    let order = [
+        r#"name="documents""#,
+        r#"name="language""#,
+        r#"name="max_chars""#,
+        r#"name="max_bytes""#,
+        r#"name="instructions""#,
+        r#"name="exclude""#,
+        r#"href="/settings/documents/new""#,
+    ];
+    for pair in order.windows(2) {
+        assert!(at(pair[0]) < at(pair[1]), "{} < {}", pair[0], pair[1]);
+    }
+    let form = &page.body[at(r#"action="/settings/documents""#)..];
+    let form = &form[..form.find("</form>").unwrap()];
+    for name in [
+        "documents",
+        "language",
+        "max_chars",
+        "instructions",
+        "exclude",
+    ] {
+        assert!(form.contains(&format!("name=\"{name}\"")), "{name}");
+    }
+    assert_eq!(form.matches(r#"type="submit""#).count(), 1);
+    // 種類の一覧に「設定」の列は無い。変更済みの種類だけ、名前の横にタグが付く。
+    assert!(!page.body.contains("<th>設定</th>"));
+    assert!(!page.body.contains("変更あり"));
     // 保存（版の照合つき）。CHANGELOG はオプトインで、ここで既定の対象にできる。
     let rev = fx.revision();
     let r = fx
@@ -1438,12 +1747,7 @@ async fn legacy_config_is_shown_as_converted_without_being_rewritten() {
     assert!(r.body.contains("旧形式"), "{}", r.body);
     assert!(r.body.contains("移行で停止"), "{}", r.body);
     assert_eq!(fs::read_to_string(&fx.store.config_file).unwrap(), text);
-    for path in [
-        "/repos",
-        "/repos/0",
-        "/settings/documents",
-        "/settings/general",
-    ] {
+    for path in ["/repos", "/repos/0", "/settings/documents", "/settings/app"] {
         assert_eq!(fx.get(path).await.status, StatusCode::OK, "{path}");
     }
     assert_eq!(fs::read_to_string(&fx.store.config_file).unwrap(), text);
@@ -1619,7 +1923,7 @@ async fn secrets_never_appear_in_pages() {
         "/settings/documents",
         "/settings/documents/agents",
         "/settings/worker",
-        "/settings/general",
+        "/settings/app",
         "/settings/history",
         "/history",
         history_page.as_str(),
@@ -1913,9 +2217,9 @@ async fn display_language_follows_cookie_then_accept_language_then_english() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn overview_does_not_claim_not_installed_for_non_standalone_builds() {
+async fn app_screen_does_not_claim_not_installed_for_non_standalone_builds() {
     let fx = Fx::new().await;
-    let r = fx.get("/").await;
+    let r = fx.get("/settings/app").await;
     assert_eq!(r.status, StatusCode::OK);
     // 開発ビルド・プラグイン同梱は「未導入」ではなく中立の表現にし、単独導入の案内は補足にとどめる。
     assert!(!r.body.contains("未導入"), "{}", r.body);
@@ -1984,18 +2288,31 @@ async fn header_has_four_items_and_settings_screens_share_a_subnav() {
     let head = header(&r.body);
     let nav = &head[head.find("<nav").unwrap()..head.find("</nav>").unwrap()];
     assert_eq!(nav.matches("<a ").count(), 4, "{nav}");
-    for href in ["/", "/repos", "/history", "/settings/general"] {
-        assert!(nav.contains(&format!("href=\"{href}\"")), "{href}: {nav}");
-    }
-    for gone in ["/kinds", "/proposals", "/consent"] {
+    // 並びは 概要・リポジトリ・保守履歴・設定。保守履歴の名前は、設定の変更履歴と紛れない。
+    let hrefs: Vec<usize> = ["/", "/repos", "/history", "/settings/documents"]
+        .iter()
+        .map(|href| {
+            nav.find(&format!("href=\"{href}\""))
+                .unwrap_or_else(|| panic!("{href}: {nav}"))
+        })
+        .collect();
+    assert!(hrefs.windows(2).all(|w| w[0] < w[1]), "{nav}");
+    assert!(nav.contains(">保守履歴</a>"), "{nav}");
+    for gone in ["/kinds", "/proposals", "/consent", "/settings/general"] {
         assert!(!nav.contains(gone), "{gone}: {nav}");
     }
+    // 表示言語の選択はヘッダーではなくフッターにあり、どの画面からも届く。
+    assert!(!head.contains("data-language-selector"), "{head}");
+    assert!(!head.contains("action=\"/language\""), "{head}");
+    let foot = &r.body[r.body.find("<footer").unwrap()..];
+    assert!(foot.contains("data-language-selector"), "{foot}");
+    assert!(foot.contains("action=\"/language\""), "{foot}");
     assert!(!r.body.contains("class=\"subnav\""));
-    // 設定系の 5 画面: ヘッダーの「設定」が強調され、同じサブナビで現在の画面だけが強調される。
+    // 設定系の 5 画面: ヘッダーの「設定」が強調され、同じサブナビ（この順）で現在の画面だけが強調される。
     let settings = [
-        "/settings/general",
         "/settings/documents",
         "/settings/worker",
+        "/settings/app",
         "/settings/history",
         "/doctor",
     ];
@@ -2004,19 +2321,24 @@ async fn header_has_four_items_and_settings_screens_share_a_subnav() {
         assert_eq!(r.status, StatusCode::OK, "{path}");
         let head = header(&r.body);
         assert!(
-            head.contains("href=\"/settings/general\" aria-current=\"page\""),
+            head.contains("href=\"/settings/documents\" aria-current=\"page\""),
             "{path}: {head}"
         );
+        let foot = &r.body[r.body.find("<footer").unwrap()..];
+        assert!(foot.contains("data-language-selector"), "{path}");
         let sub = &r.body[r.body.find("class=\"subnav\"").expect(path)..];
         let sub = &sub[..sub.find("</nav>").unwrap()];
         assert_eq!(sub.matches("<a ").count(), 5, "{path}: {sub}");
         assert_eq!(sub.matches("aria-current=\"page\"").count(), 1, "{path}");
-        for other in settings {
-            assert!(
-                sub.contains(&format!("href=\"{other}\"")),
-                "{path}: {other}"
-            );
-        }
+        let positions: Vec<usize> = settings
+            .iter()
+            .map(|other| {
+                sub.find(&format!("href=\"{other}\""))
+                    .unwrap_or_else(|| panic!("{path}: {other}"))
+            })
+            .collect();
+        assert!(positions.windows(2).all(|w| w[0] < w[1]), "{path}: {sub}");
+        assert!(!sub.contains("/settings/general"), "{path}");
         assert!(
             sub.contains(&format!("href=\"{path}\" aria-current=\"page\"")),
             "{path}: {sub}"
@@ -2048,7 +2370,7 @@ async fn header_has_four_items_and_settings_screens_share_a_subnav() {
             .contains("href=\"/settings/history\" aria-current=\"page\"")
     );
     let r = fx.get("/repos").await;
-    assert!(!header(&r.body).contains("href=\"/settings/general\" aria-current=\"page\""));
+    assert!(!header(&r.body).contains("href=\"/settings/documents\" aria-current=\"page\""));
     assert!(!r.body.contains("class=\"subnav\""));
 }
 
@@ -2200,7 +2522,7 @@ async fn model_list_refresh_is_explicit_keyed_by_environment_and_never_shows_the
         "{}",
         page.body
     );
-    assert!(page.body.contains("<button type=\"submit\" disabled>"));
+    assert!(page.body.contains("form=\"models-refresh\" disabled>"));
     assert!(!fx.base.join("state").exists());
     // キーが無いと、更新は通信せず理由だけを返す。
     let r = fx.post("/settings/worker/models", &[]).await;
@@ -2227,7 +2549,7 @@ async fn model_list_refresh_is_explicit_keyed_by_environment_and_never_shows_the
     ui::models::set_endpoint_for_tests(Some(url));
     let page = fx.get("/settings/worker").await;
     assert!(page.body.contains("ANTHROPIC_API_KEY があるため"));
-    assert!(!page.body.contains("<button type=\"submit\" disabled>"));
+    assert!(!page.body.contains("form=\"models-refresh\" disabled>"));
     assert!(!page.body.contains(KEY));
     let r = fx.post("/settings/worker/models", &[]).await;
     assert_eq!(
@@ -2287,7 +2609,7 @@ async fn auth_next_is_an_allow_list_of_names_not_urls() {
     let state = AppState::new(fx.store.clone(), PORT).0;
     let app = ui::router(state.clone());
     for (next, expected) in [
-        ("&next=updates", "/?check_updates=1#updates"),
+        ("&next=updates", "/settings/app?check_updates=1#updates"),
         ("", "/"),
         ("&next=unknown", "/"),
         ("&next=https%3A%2F%2Fevil.example%2F", "/"),
@@ -2372,12 +2694,17 @@ async fn update_posts_go_through_the_guard() {
     assert!(!fx.base.join("state").exists());
 }
 
-/// Setup 版ではない（このテストの実行ファイルは Velopack 管理外）とき、概要は注意の文だけを出し、確認・
-/// インストール・設定は何もせずに `supported: false` を返す（状態フォルダーにも触れない）。
+/// Setup 版ではない（このテストの実行ファイルは Velopack 管理外）とき、「アプリ」画面は注意の文だけを出し、確認・
+/// インストール・設定は何もせずに `supported: false` を返す（状態フォルダーにも触れない）。更新パネルは概要には無い。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_panel_is_unsupported_outside_setup_and_touches_no_state() {
     let fx = Fx::new().await;
-    let page = fx.get("/").await;
+    let overview = fx.get("/").await;
+    assert_eq!(overview.status, StatusCode::OK);
+    for gone in ["id=\"updates\"", "data-updates", "設定の状態"] {
+        assert!(!overview.body.contains(gone), "{gone}");
+    }
+    let page = fx.get("/settings/app").await;
     assert_eq!(page.status, StatusCode::OK);
     assert!(page.body.contains(r#"id="updates""#), "{}", page.body);
     assert!(
@@ -2437,15 +2764,130 @@ async fn update_panel_is_unsupported_outside_setup_and_touches_no_state() {
     let r = fx.post("/updates/check", &[]).await;
     assert_eq!(r.status, StatusCode::OK);
     assert!(r.body.contains("Setup 版でのみ使えます"), "{}", r.body);
-    assert!(r.body.contains(r#"href="/#updates""#));
+    assert!(r.body.contains(r#"href="/settings/app#updates""#));
     let r = fx.post("/updates/install", &[]).await;
     assert_eq!(r.status, StatusCode::OK);
     // 設定の保存は拒否する（Setup 版の設定だけ）。
     let r = fx.post("/updates/settings", &[("auto_update", "1")]).await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(
+        r.body.contains(r#"href="/settings/app#updates""#),
+        "{}",
+        r.body
+    );
     assert!(!fx.base.join("state").exists());
     // インストールの要求は、サーバーを止めない（非対応のときは shutdown を通知しない）。
     assert_eq!(fx.get("/").await.status, StatusCode::OK);
+}
+
+/// 「アプリ」画面と自動登録の保存は、他の画面と同じ保護を通り、利用者の文面はエスケープされ、秘密値を出さない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_screen_and_enrollment_post_are_guarded_escaped_and_secret_free() {
+    let fx = Fx::new().await;
+    unsafe {
+        env::set_var("ANTHROPIC_API_KEY", "sk-ant-SENTINELAPPKEY0000");
+    }
+    // Cookie 無しの閲覧は 401（本文に画面の中身を出さない）。
+    let r = fx.raw(get("/settings/app")).await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
+    assert!(!r.body.contains("アプリの更新"), "{}", r.body);
+    // 自動登録の POST: Cookie 無し 401・CSRF 違い 403・Origin 違い 403・Origin 無し 403。書き込みはしない。
+    let rev = fx.revision();
+    let body = |csrf: &str| {
+        url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("csrf", csrf)
+            .append_pair("revision", &rev)
+            .append_pair("policy", "explicit")
+            .finish()
+    };
+    let post = |origin: Option<&str>, cookie: Option<&str>, csrf: &str| {
+        let mut b = Request::post("/repos/enrollment")
+            .header(header::HOST, HOST)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(origin) = origin {
+            b = b.header(header::ORIGIN, origin);
+        }
+        if let Some(cookie) = cookie {
+            b = b.header(header::COOKIE, cookie);
+        }
+        b.body(Body::from(body(csrf))).unwrap()
+    };
+    for (req, expected) in [
+        (post(Some(ORIGIN), None, &fx.csrf), 401),
+        (post(Some(ORIGIN), Some(&fx.cookie), &"0".repeat(64)), 403),
+        (
+            post(Some("http://evil.example"), Some(&fx.cookie), &fx.csrf),
+            403,
+        ),
+        (post(None, Some(&fx.cookie), &fx.csrf), 403),
+    ] {
+        assert_eq!(fx.raw(req).await.status.as_u16(), expected);
+    }
+    assert_eq!(
+        fx.get("/repos/enrollment").await.status,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    assert!(!fx.store.config_file.exists());
+    assert!(!fx.base.join("state").exists());
+    // 不正な owner は 400。入力した文字列はエスケープされて出る（そのままの HTML としては出ない）。
+    let r = fx
+        .post(
+            "/repos/enrollment",
+            &[
+                ("revision", rev.as_str()),
+                ("policy", "remote-owner"),
+                ("owners", "<script>alert(1)"),
+            ],
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(!r.body.contains("<script>alert"), "{}", r.body);
+    assert!(!fx.store.config_file.exists());
+    // 「アプリ」画面は設定ファイルの場所と状態だけを出し、環境変数・秘密値は出さない。
+    let page = fx.get("/settings/app").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("まだありません"), "{}", page.body);
+    assert!(page.body.contains("config.toml"), "{}", page.body);
+    for forbidden in ["SENTINELAPPKEY", "ANTHROPIC_API_KEY", "SCRIPTURA_CONFIG"] {
+        assert!(!page.body.contains(forbidden), "{forbidden}");
+    }
+    unsafe {
+        env::remove_var("ANTHROPIC_API_KEY");
+    }
+}
+
+/// 概要は「警告 → 最近の保守 5 件 + リポジトリ一覧」。更新・版・設定ファイルは「アプリ」へ移った。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overview_shows_the_five_latest_runs_and_the_repository_list_only() {
+    let fx = Fx::new().await;
+    // 記録が無い間は空の案内。DB を作らない。
+    let r = fx.get("/").await;
+    assert!(r.body.contains("保守の記録はまだありません"), "{}", r.body);
+    assert!(!fx.base.join("state").exists());
+    let root = fx.enable(&fx.repo).await;
+    let key = scriptura::timing::repo_key(Path::new(&root)).unwrap();
+    let db = scriptura::maintenance::open_state_db().unwrap();
+    for n in 0..7 {
+        let mut run = sample_run(&key, "unchanged", None);
+        run.started_at += f64::from(n) * 100.0;
+        run.finished_at += f64::from(n) * 100.0;
+        run.detail.documents[0].path = format!("DOC{n}.md");
+        scriptura::runlog::record(&db, &run).unwrap();
+    }
+    drop(db);
+    let r = fx.get("/").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let shown = (0..7)
+        .filter(|n| r.body.contains(&format!("DOC{n}.md")))
+        .count();
+    assert_eq!(shown, 5, "{}", r.body);
+    assert!(r.body.contains("DOC6.md") && !r.body.contains("DOC0.md"));
+    assert!(r.body.contains(r#"href="/history""#));
+    assert!(r.body.contains("保守履歴をすべて見る"), "{}", r.body);
+    assert!(r.body.contains(r#"href="/repos/0""#));
+    for gone in ["id=\"updates\"", "設定ファイル", "設定の状態", "導入と設定"] {
+        assert!(!r.body.contains(gone), "{gone}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2700,7 +3142,7 @@ async fn template_has_no_dropdown_and_icon_is_served() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn document_language_is_a_global_dropdown_and_not_a_per_kind_field() {
     let fx = Fx::new().await;
-    let general = fx.get("/settings/general").await.body;
+    let general = fx.get("/settings/documents").await.body;
     assert!(general.contains("<select name=\"language\">"), "{general}");
     assert!(general.contains("<option value=\"ja\">"), "{general}");
     let design = fx.get("/settings/documents/design").await.body;
@@ -2708,11 +3150,11 @@ async fn document_language_is_a_global_dropdown_and_not_a_per_kind_field() {
     let rev = fx.revision();
     let r = fx
         .post(
-            "/settings/general",
+            "/settings/documents",
             &[
                 ("revision", rev.as_str()),
+                ("documents", "AGENTS.md"),
                 ("language", "en"),
-                ("policy", "explicit"),
             ],
         )
         .await;
@@ -2730,10 +3172,10 @@ async fn global_limits_apply_to_every_kind_except_changelog() {
     let rev = fx.revision();
     let r = fx
         .post(
-            "/settings/general",
+            "/settings/documents",
             &[
                 ("revision", rev.as_str()),
-                ("policy", "explicit"),
+                ("documents", "AGENTS.md"),
                 ("max_chars", "3000"),
                 ("max_bytes", "40000"),
             ],
@@ -2758,4 +3200,273 @@ async fn global_limits_apply_to_every_kind_except_changelog() {
     );
     // CHANGELOG は対象外。
     assert_eq!(resolve("changelog").max_chars, None);
+}
+
+// ---------------------------------------------------------------------------
+// 画面レイアウトの契約（各画面の中の並び・折りたたみ・列）
+// ---------------------------------------------------------------------------
+
+/// 本文の中の位置。無ければ本文つきで失敗させる。
+fn at(body: &str, needle: &str) -> usize {
+    body.find(needle)
+        .unwrap_or_else(|| panic!("{needle} が無い\n{body}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn overview_leads_with_repository_state_and_recent_runs_side_by_side() {
+    let fx = Fx::new().await;
+    // 0 件のときは、登録へ進む主ボタンを出す。
+    let empty = fx.get("/").await;
+    assert!(
+        empty
+            .body
+            .contains(r#"<a class="button primary" href="/repos">リポジトリを登録</a>"#),
+        "{}",
+        empty.body
+    );
+    let root = fx.enable(&fx.repo).await;
+    let key = scriptura::timing::repo_key(Path::new(&root)).unwrap();
+    let db = scriptura::maintenance::open_state_db().unwrap();
+    scriptura::runlog::record(
+        &db,
+        &sample_run(&key, "failed", Some("理由: push が拒否されました")),
+    )
+    .unwrap();
+    drop(db);
+    let r = fx.get("/").await;
+    let b = &r.body;
+    // 一覧と最近の保守を並べる枠（狭い幅では縦）。一覧が先、状態のバッジつき。
+    assert!(b.contains(r#"class="overview-grid""#), "{b}");
+    assert!(at(b, r#"id="overview-repos""#) < at(b, r#"id="overview-runs""#));
+    assert!(b.contains("稼働中"), "{b}");
+    // 自動で commit・push する注意は、警告ではなく一覧の下の補足として残す。
+    assert!(b.contains(r#"<p class="note">有効な登録が 1 件"#), "{b}");
+    assert!(
+        !b.contains("リポジトリを登録</a>"),
+        "登録済みなら主ボタンは出さない"
+    );
+    // 保守の行はフォルダー名で出し、フルパスは title と下段の小字に置く。失敗の理由も読める。
+    let folder = fx.repo.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(b.contains(&format!(">{folder}</a>")), "{b}");
+    assert!(b.contains(&format!(r#"title="{root}""#)), "{b}");
+    assert!(b.contains("理由: push が拒否されました"), "{b}");
+    assert!(b.contains(r#"href="/repos/0""#));
+    // 停止中・要再有効化のバッジ。
+    scriptura::ops::edit(&fx.store, None, |c| {
+        c.repository[0].paused = true;
+        Ok(())
+    })
+    .unwrap();
+    assert!(fx.get("/").await.body.contains("停止中"));
+    scriptura::ops::edit(&fx.store, None, |c| {
+        c.repository[0].migrated_from = Some(config::MigratedFrom::Propose);
+        Ok(())
+    })
+    .unwrap();
+    assert!(fx.get("/repos").await.body.contains("要再有効化"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repo_detail_orders_status_runs_documents_internals_and_management() {
+    let fx = Fx::new().await;
+    fx.enable(&fx.repo).await;
+    let page = fx.get("/repos/0").await;
+    let b = &page.body;
+    let order = [
+        r#"repo-head""#,
+        r#"action="/repos/run-now""#,
+        r#"action="/repos/pause""#,
+        r#"id="repo-runs""#,
+        r#"id="repo-documents""#,
+        r#"id="repo-internal""#,
+        r#"id="repo-manage""#,
+    ];
+    let positions: Vec<usize> = order.iter().map(|n| at(b, n)).collect();
+    assert!(
+        positions.windows(2).all(|w| w[0] < w[1]),
+        "{positions:?}\n{b}"
+    );
+    // 今すぐ保守は主ボタン。
+    assert!(
+        Regex::new(r#"class="primary"[^>]*>今すぐ保守<"#)
+            .unwrap()
+            .is_match(b)
+    );
+    // 内部情報（cursor と publication）は 1 つの折りたたみで、問題が無ければ閉じている。
+    let internal = Regex::new(r#"<details class="panel" id="repo-internal"([^>]*)>"#).unwrap();
+    assert!(!internal.captures(b).unwrap()[1].contains("open"), "{b}");
+    // 再有効化と解除は最下部。再有効化の空欄の意味が分かる。
+    assert_eq!(b.matches(r#"action="/repos/enable""#).count(), 1);
+    assert!(at(b, r#"action="/repos/enable""#) > at(b, r#"id="repo-manage""#));
+    assert!(at(b, r#"action="/repos/disable""#) > at(b, r#"id="repo-manage""#));
+    assert!(
+        Regex::new(r#"name="branches"[^>]*placeholder="[^"]*現在のブランチ"#)
+            .unwrap()
+            .is_match(b),
+        "{b}"
+    );
+    // 種類表の「有効」は記号と読み上げ用の文言で分かる。対象は 1 つの枠にまとめ、既定に従う間は個別欄を CSS で隠す。
+    assert!(
+        b.contains(r#"<span aria-hidden="true">✓</span><span class="visually-hidden">有効</span>"#),
+        "{b}"
+    );
+    assert!(b.contains(r#"class="doc-targets""#));
+    let css = include_str!("../assets/ui/app.css");
+    assert!(
+        css.contains(":has(input[name=use_default]:checked)"),
+        "既定に従う間は個別欄を隠す"
+    );
+    // 隠す欄も無効化しない（GET した値のまま POST できる）。
+    assert!(!b.contains("disabled"), "{b}");
+    // 移行で停止した登録は、再有効化を見出しの直下へ出し、下には重複させない。
+    scriptura::ops::edit(&fx.store, None, |c| {
+        c.repository[0].paused = true;
+        c.repository[0].migrated_from = Some(config::MigratedFrom::Propose);
+        Ok(())
+    })
+    .unwrap();
+    let m = fx.get("/repos/0").await.body;
+    assert_eq!(m.matches(r#"action="/repos/enable""#).count(), 1, "{m}");
+    assert!(at(&m, r#"action="/repos/enable""#) < at(&m, r#"id="repo-runs""#));
+    assert!(at(&m, r#"action="/repos/disable""#) > at(&m, r#"id="repo-documents""#));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_rows_have_four_columns_and_fold_the_rest() {
+    let fx = Fx::new().await;
+    let root = fx.enable(&fx.repo).await;
+    let key = scriptura::timing::repo_key(Path::new(&root)).unwrap();
+    let db = scriptura::maintenance::open_state_db().unwrap();
+    scriptura::runlog::record(&db, &sample_run(&key, "failed", Some("拒否された理由"))).unwrap();
+    scriptura::runlog::record(&db, &sample_run(&key, "unchanged", None)).unwrap();
+    drop(db);
+    let b = fx.get("/history").await.body;
+    assert_eq!(b.matches("<th>").count(), 4, "{b}");
+    assert_eq!(
+        b.matches(r#"<details class="run-details""#).count(),
+        2,
+        "{b}"
+    );
+    // 理由は結果のバッジの下、起点などは詳細の中。
+    let reason = at(&b, "拒否された理由");
+    assert!(at(&b, "失敗") < reason);
+    let details = reason + at(&b[reason..], r#"<details class="run-details""#);
+    assert!(b[details..].contains("push 後の自動実行"));
+    let row_start = b[..reason].rfind("<tr>").unwrap();
+    assert!(
+        !b[row_start..reason].contains("run-details"),
+        "理由は詳細の外"
+    );
+    // 絞り込みは選ぶと反映（JS が無ければ適用ボタン）。
+    assert!(
+        Regex::new(r#"<select name="repo"[^>]*data-autosubmit"#)
+            .unwrap()
+            .is_match(&b),
+        "{b}"
+    );
+    assert!(
+        Regex::new(r#"<button[^>]*data-autosubmit-fallback"#)
+            .unwrap()
+            .is_match(&b),
+        "{b}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kind_form_has_sections_one_save_and_folded_effective_values() {
+    let fx = Fx::new().await;
+    let b = fx.get("/settings/documents/changelog").await.body;
+    let order = [
+        "<legend>書き方</legend>",
+        "<legend>ファイル</legend>",
+        "<legend>保守のタイミング</legend>",
+        "<legend>CHANGELOG</legend>",
+    ];
+    let positions: Vec<usize> = order.iter().map(|n| at(&b, n)).collect();
+    assert!(positions.windows(2).all(|w| w[0] < w[1]), "{positions:?}");
+    let start = at(&b, r#"action="/settings/documents/changelog""#);
+    let end = start + b[start..].find("</form>").unwrap();
+    assert_eq!(b[start..end].matches(r#"type="submit""#).count(), 1);
+    // 現在の実効値はフォームの下の折りたたみ。共通の言語・上限は文書の画面で設定すると案内する。
+    assert!(at(&b, r#"id="kind-effective""#) > end, "{b}");
+    assert!(b.contains(r#"<details class="panel" id="kind-effective">"#));
+    assert!(b.contains(r#"href="/settings/documents#common""#), "{b}");
+    // 組み込み種類（CHANGELOG 以外）にも節がある。
+    let agents = fx.get("/settings/documents/agents").await.body;
+    assert!(
+        agents.contains("<legend>書き方</legend>")
+            && !agents.contains("<legend>CHANGELOG</legend>")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn documents_screen_links_to_the_kind_list_and_groups_limits() {
+    let fx = Fx::new().await;
+    let b = fx.get("/settings/documents").await.body;
+    assert!(b.contains(r##"href="#kinds""##), "{b}");
+    assert!(b.contains(r#"id="kinds""#) && b.contains(r#"id="common""#));
+    assert!(b.contains(r#"class="check-grid""#));
+    assert!(at(&b, r#"name="language""#) < at(&b, r#"name="max_chars""#));
+    assert!(at(&b, r#"name="max_bytes""#) < at(&b, r#"name="instructions""#));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worker_refresh_button_sits_by_the_model_and_claude_path_is_folded() {
+    let fx = Fx::new().await;
+    let b = fx.get("/settings/worker").await.body;
+    // 別の form のボタンは form 属性で結ぶ（入れ子の form にしない）。モデル欄の次に置く。
+    assert!(
+        b.contains(r#"<form method="post" action="/settings/worker/models" id="models-refresh""#),
+        "{b}"
+    );
+    assert!(at(&b, r#"name="model""#) < at(&b, r#"form="models-refresh""#));
+    assert!(at(&b, r#"form="models-refresh""#) < at(&b, r#"name="effort""#));
+    // 実行ファイルの場所は「詳細」。見つかる・PATH 任せのときは閉じる。
+    let fold = Regex::new(r#"<details class="fold" id="claude-details"([^>]*)>"#).unwrap();
+    assert!(!fold.captures(&b).unwrap()[1].contains("open"), "{b}");
+    assert!(at(&b, "claude-details") < at(&b, r#"name="claude_path""#));
+    // 見つからないと開く。
+    let missing = fx.base.join("no-such-claude");
+    let missing = missing.to_string_lossy().into_owned();
+    scriptura::ops::edit(&fx.store, None, |c| {
+        c.worker.claude_path = missing.clone();
+        Ok(())
+    })
+    .unwrap();
+    let b = fx.get("/settings/worker").await.body;
+    assert!(fold.captures(&b).unwrap()[1].contains("open"), "{b}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doctor_orders_problems_first_and_localizes_status_words() {
+    let fx = Fx::new().await;
+    let b = fx.get("/doctor").await.body;
+    for raw in [">ok<", ">warn<", ">fail<"] {
+        assert!(!b.contains(raw), "状態は表示言語の文言にする: {raw}\n{b}");
+    }
+    // 失敗 → 警告 → 正常の順。正常は折りたたみにまとめる。
+    let first = |class: &str| b.find(class);
+    if let (Some(fail), Some(ok)) = (first("status-fail"), first("status-ok")) {
+        assert!(fail < ok);
+    }
+    if let (Some(warn), Some(ok)) = (first("status-warn"), first("status-ok")) {
+        assert!(warn < ok);
+    }
+    assert!(
+        b.contains(r#"<details class="fold" id="doctor-passed""#),
+        "{b}"
+    );
+}
+
+#[test]
+fn stylesheet_keeps_layout_rules() {
+    let css = include_str!("../assets/ui/app.css");
+    for needle in [
+        "max-width: 760px",
+        "details.panel > summary:focus-visible",
+        ".overview-grid",
+        "@media (max-width: 640px)",
+    ] {
+        assert!(css.contains(needle), "{needle}");
+    }
 }

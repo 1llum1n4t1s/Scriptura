@@ -142,7 +142,7 @@ tr:last-child td { border-bottom: 0; }
 .path { font-size: 11px; color: var(--muted); }
 .back { display: inline-block; font-size: 12px; text-decoration: none; margin-bottom: 14px; }
 pre.diff { margin: 0; padding: 14px; background: var(--input); border: 1px solid var(--line); border-radius: 4px; overflow-x: auto; font-size: 12px; line-height: 1.6; white-space: pre; }
-pre.diff span { display: block; }
+pre.diff span { display: block; min-height: 1.6em; }
 pre.diff .add { background: var(--add-bg); }
 pre.diff .del { background: var(--del-bg); }
 pre.diff .hunk { color: var(--violet); }
@@ -162,8 +162,14 @@ pre.diff .meta { color: var(--muted); font-weight: 600; }
   .grid { grid-template-columns: minmax(0, 1fr); }
   .facts { grid-template-columns: minmax(0, 1fr); }
 }
-/* 画面上部の言語の選択欄。ラベルは読み上げ用にだけ残す。 */
-.topbar form.language select { font-size: 12px; padding: 4px 6px; }
+/* フッターの言語の選択欄（全画面から届く）。 */
+footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; }
+footer form.language { display: flex; align-items: center; gap: 6px; }
+footer form.language select { font-size: 12px; padding: 4px 6px; }
+/* 折りたたみのパネル（リポジトリの登録・自動登録）。見出しをそのまま開閉の取っ手にする。 */
+details.panel > summary { cursor: pointer; }
+details.panel > summary h2 { display: inline; margin: 0; }
+details.panel[open] > summary { margin-bottom: 16px; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 [hidden] { display: none !important; }
 /* 更新のインストールの確認（画面の中のダイアログ。ブラウザー標準の確認は使わない）。 */
@@ -173,3 +179,59 @@ pre.diff .meta { color: var(--muted); font-weight: 600; }
 .confirmation-dialog p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; }
 .confirmation-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 12px; margin-top: 24px; }
 @media (max-width: 640px) { .confirmation-dialog { padding: 18px; } .confirmation-actions button { flex: 1; } }
+
+/* ---- 各画面の中の配置 ---- */
+/* 読みやすい幅: フォームの列は 760px までにとどめ、表（.table-wrap）は全幅に広げる。 */
+form.stack, .panel > .stack, details.panel > .stack { max-width: 760px; }
+.panel, .heading > *, .overview-grid > *, .pair > * { min-width: 0; }
+.heading { flex-wrap: wrap; }
+.heading .actions { margin-top: 0; }
+h3 { font-size: 14px; margin: 20px 0 10px; }
+.nowrap { white-space: nowrap; }
+td a, td .path, .repo-list .path { overflow-wrap: anywhere; }
+.stack.tight { gap: 8px; }
+/* 概要: リポジトリ一覧と最近の保守を、広い幅では横に並べ、狭い幅では縦に積む。 */
+.overview-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; align-items: start; margin-bottom: 20px; }
+.overview-grid > .panel { margin-bottom: 0; }
+@media (min-width: 980px) { .overview-grid { grid-template-columns: minmax(280px, 1fr) minmax(0, 2fr); } }
+.repo-list { margin: 0 0 8px; padding: 0; list-style: none; }
+.repo-list li { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.repo-list li:last-child { border-bottom: 0; }
+.repo-name { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; font-weight: 650; }
+/* リポジトリ詳細: 見出し行（名前・状態・操作）。 */
+.repo-head { align-items: flex-start; }
+.repo-title h1 { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; overflow-wrap: anywhere; }
+.repo-title .path { margin-top: 2px; }
+/* 対象の文書: 既定に従う間は、個別のチェック欄を隠す（送信はされる。無効化はしない）。 */
+.check-grid { display: flex; flex-wrap: wrap; gap: 8px 22px; }
+.doc-targets { display: flex; flex-direction: column; gap: 12px; }
+.doc-targets:has(input[name=use_default]:checked) .doc-choices { display: none; }
+/* 文書の共通設定: 言語と上限を並べる。 */
+.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 14px; align-items: start; }
+.row { grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr)); }
+/* 保守履歴: 絞り込みと行ごとの詳細。 */
+.filter-form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0; }
+.filter-form label { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; max-width: 100%; }
+.filter-form select { width: min(360px, 100%); }
+.run-details { margin-top: 6px; }
+.run-details > summary { cursor: pointer; color: var(--accent); font-size: 12px; font-weight: 600; }
+.run-details .facts { margin: 8px 0 0; }
+/* 折りたたみ。パネルは見出しごと、小さな折りたたみは枠つきの 1 行で、押せると分かる見た目にする。 */
+details.panel > summary { display: flex; align-items: center; gap: 8px; padding: 2px 0; border-radius: 3px; }
+details.panel > summary { list-style: none; }
+details.panel > summary::-webkit-details-marker { display: none; }
+details.panel > summary::before { content: ""; flex: none; width: 7px; height: 7px; border: solid var(--accent); border-width: 0 2px 2px 0; transform: rotate(-45deg); transition: transform .15s; }
+details.panel[open] > summary::before { transform: rotate(45deg); }
+details.panel > summary:hover h2 { color: var(--accent-strong); }
+details.panel > summary:focus-visible, details.fold > summary:focus-visible, .run-details > summary:focus-visible { outline: 2px solid var(--violet); outline-offset: 3px; }
+details.panel > summary h2 { display: block; }
+details.fold { margin: 0 0 18px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper); }
+details.fold > summary { cursor: pointer; font-weight: 600; font-size: .9rem; }
+details.fold > summary:hover { color: var(--accent-strong); }
+details.fold[open] > summary { margin-bottom: 12px; }
+@media (max-width: 640px) {
+  .heading { align-items: flex-start; }
+  .repo-head .actions { width: 100%; }
+  .filter-form { width: 100%; }
+  .check-grid { flex-direction: column; }
+}

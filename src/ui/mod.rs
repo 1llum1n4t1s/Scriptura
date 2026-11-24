@@ -244,6 +244,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(handlers::overview))
         .route("/repos", get(handlers::repos))
         .route("/repos/enable", post(handlers::repo_enable))
+        .route("/repos/enrollment", post(handlers::repos_enrollment_save))
         .route("/repos/pause", post(handlers::repo_pause))
         .route("/repos/resume", post(handlers::repo_resume))
         .route("/repos/documents", post(handlers::repo_documents))
@@ -276,10 +277,7 @@ pub fn router(state: AppState) -> Router {
             "/settings/worker/models",
             post(handlers::worker_models_refresh),
         )
-        .route(
-            "/settings/general",
-            get(handlers::general).post(handlers::general_save),
-        )
+        .route("/settings/app", get(handlers::app_screen))
         .route("/doctor", get(handlers::doctor))
         .route("/history", get(handlers::runs))
         .route("/settings/history", get(handlers::history))
@@ -460,8 +458,8 @@ fn auth_url(port: u16, key: &str) -> String {
     format!("http://127.0.0.1:{port}/auth?key={key}")
 }
 
-/// 入口の URL（使い捨て鍵つき）で、交換の後に概要画面の更新パネル（`?check_updates=1#updates`。画面が自動で
-/// 確認を始める）へ移る。移動先は `handlers::auth_destination` の許可リストの名前（`updates`）で渡す。
+/// 入口の URL（使い捨て鍵つき）で、交換の後に「アプリ」画面の更新パネル（`/settings/app?check_updates=1#updates`。
+/// 画面が自動で確認を始める）へ移る。移動先は `handlers::auth_destination` の許可リストの名前（`updates`）で渡す。
 #[cfg(any(windows, target_os = "macos"))]
 fn auth_url_updates(port: u16, key: &str) -> String {
     format!("{}&next=updates", auth_url(port, key))

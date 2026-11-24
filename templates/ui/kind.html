@@ -2,29 +2,24 @@
 {% block content %}
 <a class="back" href="/settings/documents">← {{ crate::locale::tr("ui.nav.documents") }}</a>
 <div class="heading"><h1>{% if form.is_new %}{{ crate::locale::tr("ui.kind.add_custom") }}{% else %}{{ form.name }}{% if !form.builtin %} <span class="tag">{{ crate::locale::tr("cli.docs.custom") }}</span>{% endif %}{% endif %}</h1></div>
-{% if !resolved.is_empty() %}
-<section class="panel">
-  <h2>{{ crate::locale::tr("ui.kind.effective") }}</h2>
-  <dl class="facts">{% for f in resolved %}<dt>{{ f.name }}</dt><dd>{{ f.value }}</dd>{% endfor %}</dl>
-</section>
-{% endif %}
 <section class="panel">
   <h2>{{ crate::locale::tr("ui.kind.settings") }}</h2>
+  <p class="note">{{ crate::locale::tr("ui.kind.common_note") }} <a href="/settings/documents#common">{{ crate::locale::tr("ui.kind.common_link") }}</a></p>
   <form method="post" action="{% if form.is_new %}/settings/documents/new{% else %}/settings/documents/{{ form.id }}{% endif %}" class="stack">
     <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}">
     {% if form.is_new %}<label>{{ crate::locale::tr("ui.kind.id") }}<input name="id" required pattern="[a-z][a-z0-9\-]{0,31}" placeholder="architecture"></label>{% endif %}
-    {% if !form.builtin %}
-    <label>{{ crate::locale::tr1("ui.kind.guidance", "max", guidance_max) }}<textarea name="guidance" rows="3" data-max="{{ guidance_max }}">{{ form.guidance }}</textarea><span class="counter" data-for="guidance"></span></label>
-    <label>{{ crate::locale::tr("ui.kind.paths") }}<textarea name="paths" rows="3">{{ form.paths }}</textarea></label>
-    {% endif %}
-    <label>{{ crate::locale::tr("ui.kind.when_missing") }}<select name="create_if_missing">{% for c in form.create_if_missing %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
-    <div class="row">
+    <fieldset class="choices"><legend>{{ crate::locale::tr("ui.kind.section_style") }}</legend>
+      {% if !form.builtin %}<label>{{ crate::locale::tr1("ui.kind.guidance", "max", guidance_max) }}<textarea name="guidance" rows="3" data-max="{{ guidance_max }}">{{ form.guidance }}</textarea><span class="counter" data-for="guidance"></span></label>{% endif %}
+      <label>{{ crate::locale::tr1("ui.kind.instructions", "max", instructions_max) }}<textarea name="instructions" rows="4" data-max="{{ instructions_max }}" placeholder="{{ form.ph_none }}">{{ form.instructions }}</textarea><span class="counter" data-for="instructions"></span></label>
+      <label>{{ crate::locale::tr("ui.kind.required_headings") }}<textarea name="required_headings" rows="3" placeholder="{{ form.ph_none }}">{{ form.required_headings }}</textarea></label>
       <label>{{ crate::locale::tr("ui.kind.template_file_label") }}<input name="template_file" value="{{ form.template_file }}" placeholder="{{ form.ph_template_file }}"></label>
-    </div>
-    {% if !form.is_changelog %}<label>{{ crate::locale::tr("ui.kind.split_dir") }}<input name="split_dir" value="{{ form.split_dir }}" placeholder="{{ form.ph_split_dir }}"></label>{% endif %}
-    <label>{{ crate::locale::tr1("ui.kind.instructions", "max", instructions_max) }}<textarea name="instructions" rows="4" data-max="{{ instructions_max }}" placeholder="{{ form.ph_none }}">{{ form.instructions }}</textarea><span class="counter" data-for="instructions"></span></label>
-    <label>{{ crate::locale::tr("ui.kind.required_headings") }}<textarea name="required_headings" rows="3" placeholder="{{ form.ph_none }}">{{ form.required_headings }}</textarea></label>
-    <fieldset class="choices"><legend>{{ crate::locale::tr("ui.kind.summary_timing") }}</legend>
+    </fieldset>
+    <fieldset class="choices"><legend>{{ crate::locale::tr("ui.kind.section_files") }}</legend>
+      {% if !form.builtin %}<label>{{ crate::locale::tr("ui.kind.paths") }}<textarea name="paths" rows="3">{{ form.paths }}</textarea></label>{% endif %}
+      <label>{{ crate::locale::tr("ui.kind.when_missing") }}<select name="create_if_missing">{% for c in form.create_if_missing %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+      {% if !form.is_changelog %}<label>{{ crate::locale::tr("ui.kind.split_dir") }}<input name="split_dir" value="{{ form.split_dir }}" placeholder="{{ form.ph_split_dir }}"></label>{% endif %}
+    </fieldset>
+    <fieldset class="choices"><legend>{{ crate::locale::tr("ui.kind.section_timing") }}</legend>
       <div class="row">
         <label>{{ crate::locale::tr("ui.kind.when") }}<select name="timing_when">{% for c in form.timing_when %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
         <label>{{ crate::locale::tr("ui.kind.min_interval_label") }}<input name="timing_min_interval" inputmode="numeric" value="{{ form.timing_min_interval }}" placeholder="{{ form.ph_min_interval }}"></label>
@@ -35,15 +30,15 @@
     <fieldset class="choices"><legend>CHANGELOG</legend>
       <div class="row">
         <label>{{ crate::locale::tr("ui.kind.cl_format") }}<select name="cl_format">{% for c in form.cl_format %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
-        <label>{{ crate::locale::tr("ui.kind.cl_release_tag") }}<input name="cl_release_tag" value="{{ form.cl_release_tag }}"></label>
+        <label>{{ crate::locale::tr("ui.kind.cl_release_tag") }}<input name="cl_release_tag" value="{{ form.cl_release_tag }}" placeholder="{{ form.ph_release_tag }}"></label>
       </div>
       <div class="row">
         <label>{{ crate::locale::tr("ui.kind.cl_on_release") }}<select name="cl_on_release">{% for c in form.cl_on_release %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
         <label>{{ crate::locale::tr("ui.kind.cl_backfill") }}<select name="cl_backfill">{% for c in form.cl_backfill %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
       </div>
       <div class="row">
-        <label>{{ crate::locale::tr("ui.kind.cl_backfill_releases") }}<input name="cl_backfill_max_releases" inputmode="numeric" value="{{ form.cl_backfill_max_releases }}"></label>
-        <label>{{ crate::locale::tr("ui.kind.cl_backfill_commits") }}<input name="cl_backfill_max_commits" inputmode="numeric" value="{{ form.cl_backfill_max_commits }}"></label>
+        <label>{{ crate::locale::tr("ui.kind.cl_backfill_releases") }}<input name="cl_backfill_max_releases" inputmode="numeric" value="{{ form.cl_backfill_max_releases }}" placeholder="{{ form.ph_backfill_releases }}"></label>
+        <label>{{ crate::locale::tr("ui.kind.cl_backfill_commits") }}<input name="cl_backfill_max_commits" inputmode="numeric" value="{{ form.cl_backfill_max_commits }}" placeholder="{{ form.ph_backfill_commits }}"></label>
       </div>
     </fieldset>
     {% endif %}
@@ -62,6 +57,12 @@
   </form>
   {% endif %}
 </section>
+{% endif %}
+{% if !resolved.is_empty() %}
+<details class="panel" id="kind-effective">
+  <summary><h2>{{ crate::locale::tr("ui.kind.effective") }}</h2></summary>
+  <dl class="facts">{% for f in resolved %}<dt>{{ f.name }}</dt><dd>{{ f.value }}</dd>{% endfor %}</dl>
+</details>
 {% endif %}
 {% if !form.is_new && !form.builtin %}
 <section class="panel">

@@ -8,8 +8,8 @@
     <thead><tr><th>{{ crate::locale::tr("ui.common.repository") }}</th><th>{{ crate::locale::tr("ui.repos.status") }}</th><th>{{ crate::locale::tr("ui.repo.documents") }}</th><th>{{ crate::locale::tr("ui.repos.branches") }}</th></tr></thead>
     <tbody>
     {% for r in repos %}<tr>
-      <td><a href="/repos/{{ r.index }}"><code>{{ r.root }}</code></a>{% if !r.remote.is_empty() %}<br><span class="path">{{ r.remote }}</span>{% endif %}</td>
-      <td>{% if r.migrated %}<span class="badge warning">{{ crate::locale::tr("ui.repo.migrated") }}</span>{% else if r.paused %}<span class="badge">{{ crate::locale::tr("ui.common.paused") }}</span>{% else %}<span class="badge published">{{ crate::locale::tr("ui.repo.active") }}</span>{% endif %}</td>
+      <td><a href="/repos/{{ r.index }}" title="{{ r.root }}">{{ r.name }}</a><div class="path">{{ r.root }}</div>{% if !r.remote.is_empty() %}<div class="path">{{ r.remote }}</div>{% endif %}</td>
+      <td><span class="badge{% if !r.status_class.is_empty() %} {{ r.status_class }}{% endif %}"{% if r.migrated %} title="{{ crate::locale::tr("ui.repo.migrated") }}"{% endif %}>{{ r.status_label }}</span></td>
       <td>{{ r.documents }}</td>
       <td>{{ r.branches }}</td>
     </tr>{% endfor %}
@@ -17,8 +17,8 @@
   </table></div>
   {% endif %}
 </section>
-<section class="panel">
-  <h2>{{ crate::locale::tr("ui.repos.enable_heading") }}</h2>
+<details class="panel"{% if repos.is_empty() %} open{% endif %}>
+  <summary><h2>{{ crate::locale::tr("ui.overview.register") }}</h2></summary>
   <form method="post" action="/repos/enable" class="stack">
     <input type="hidden" name="csrf" value="{{ layout.csrf }}">
     <input type="hidden" name="revision" value="{{ revision }}">
@@ -31,5 +31,15 @@
     <p class="note">{{ crate::locale::tr("ui.repos.enable_note") }}</p>
     <div class="actions"><button class="primary" type="submit">{{ crate::locale::tr("ui.repos.enable") }}</button></div>
   </form>
-</section>
+</details>
+<details class="panel">
+  <summary><h2>{{ crate::locale::tr("ui.repos.enrollment_heading") }}</h2></summary>
+  <form method="post" action="/repos/enrollment" class="stack">
+    <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}">
+    <label>{{ crate::locale::tr("ui.repos.policy") }}<select name="policy">{% for c in policies %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+    <label>{{ crate::locale::tr("ui.repos.owners") }}<textarea name="owners" rows="2">{{ owners }}</textarea></label>
+    <p class="note">{{ crate::locale::tr("ui.repos.enrollment_note") }}</p>
+    <div class="actions"><button class="primary" type="submit">{{ crate::locale::tr("ui.common.save") }}</button></div>
+  </form>
+</details>
 {% endblock %}

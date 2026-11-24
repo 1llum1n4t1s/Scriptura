@@ -4,21 +4,19 @@
 <div class="heading"><h1>{{ crate::locale::tr("ui.history.entry") }} <code>{{ id }}</code></h1></div>
 <section class="panel">
   <p>{{ state }}</p>
-  {% if restorable %}
-  <form method="post" action="/settings/history/restore">
-    <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="id" value="{{ id }}">
-    <button class="primary" type="submit">{{ crate::locale::tr("ui.history.restore") }}</button>
-    <span class="note">{{ crate::locale::tr("ui.history.restore_note") }}</span>
-  </form>
-  {% endif %}
 </section>
 <section class="panel">
   <h2>{{ crate::locale::tr("ui.history.diff") }}</h2>
-  <pre class="diff">{% for l in diff %}<span class="{{ l.class }}">{{ l.text }}</span>
-{% endfor %}</pre>
+  <pre class="diff">{% for l in diff %}<span class="{{ l.class }}">{{ l.text }}</span>{% endfor %}</pre>
+  {% if restorable %}
+  <form method="post" action="/settings/history/restore" class="restore">
+    <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="id" value="{{ id }}">
+    <div class="actions wrap"><button class="primary" type="submit">{{ crate::locale::tr("ui.history.restore") }}</button><span class="note">{{ crate::locale::tr("ui.history.restore_note") }}</span></div>
+  </form>
+  {% endif %}
 </section>
-<section class="panel">
-  <h2>{{ crate::locale::tr("ui.history.content") }}</h2>
+<details class="panel">
+  <summary><h2>{{ crate::locale::tr("ui.history.content") }}</h2></summary>
   <pre class="diff">{{ content }}</pre>
-</section>
+</details>
 {% endblock %}

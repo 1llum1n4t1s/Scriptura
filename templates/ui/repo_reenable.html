@@ -1,0 +1,6 @@
+<form method="post" action="/repos/enable" class="stack">
+    <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}"><input type="hidden" name="repo" value="{{ repo.root }}">
+    <label>{{ crate::locale::tr("ui.repos.branches_label") }}<input name="branches" placeholder="{{ crate::locale::tr("ui.repo.reenable_branches_hint") }}"></label>
+    <p class="note">{{ crate::locale::tr("ui.repos.enable_note") }}</p>
+    <div class="actions"><button{% if repo.migrated %} class="primary"{% endif %} type="submit">{{ crate::locale::tr("ui.repo.reenable") }}</button></div>
+  </form>

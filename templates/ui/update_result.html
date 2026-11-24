@@ -1,8 +1,8 @@
 {% extends "ui/base.html" %}
 {% block content %}
+<div class="heading"><h1>{{ crate::locale::tr("ui.updates.title") }}</h1></div>
 <section class="panel">
-  <h1>{{ crate::locale::tr("ui.updates.title") }}</h1>
   <p role="status">{{ message }}</p>
-  <p><a class="button" href="/#updates">{{ crate::locale::tr("ui.error.back") }}</a></p>
+  <div class="actions"><a class="button" href="/settings/app#updates">{{ crate::locale::tr("ui.error.back") }}</a></div>
 </section>
 {% endblock %}

@@ -1,11 +1,22 @@
 {% extends "ui/base.html" %}
 {% block content %}
 <div class="heading"><h1>{{ crate::locale::tr("ui.nav.doctor") }}</h1></div>
+<p class="notice{% if !ok %} warning{% endif %}">{% if ok %}{{ crate::locale::tr("ui.doctor.ok") }}{% else %}{{ crate::locale::tr("ui.doctor.failed") }}{% endif %}</p>
+{% if !problems.is_empty() %}
 <section class="panel">
-  <p class="notice{% if !ok %} warning{% endif %}">{% if ok %}{{ crate::locale::tr("ui.doctor.ok") }}{% else %}{{ crate::locale::tr("ui.doctor.failed") }}{% endif %}</p>
   <div class="table-wrap"><table>
-    <thead><tr><th>{{ crate::locale::tr("ui.doctor.item") }}</th><th>{{ crate::locale::tr("ui.doctor.result") }}</th><th>{{ crate::locale::tr("ui.doctor.detail") }}</th></tr></thead>
-    <tbody>{% for i in items %}<tr><td><code>{{ i.id }}</code></td><td><span class="badge status-{{ i.status }}">{{ i.status }}</span></td><td>{{ i.detail }}</td></tr>{% endfor %}</tbody>
+    <thead><tr><th>{{ crate::locale::tr("ui.doctor.result") }}</th><th>{{ crate::locale::tr("ui.doctor.item") }}</th><th>{{ crate::locale::tr("ui.doctor.detail") }}</th></tr></thead>
+    <tbody>{% for i in problems %}<tr><td><span class="badge status-{{ i.status }}">{{ i.status_label }}</span></td><td><code>{{ i.id }}</code></td><td>{{ i.detail }}</td></tr>{% endfor %}</tbody>
   </table></div>
 </section>
+{% endif %}
+{% if !passed.is_empty() %}
+<details class="fold" id="doctor-passed">
+  <summary>{{ crate::locale::tr1("ui.doctor.passed", "count", passed.len()) }}</summary>
+  <div class="table-wrap"><table>
+    <thead><tr><th>{{ crate::locale::tr("ui.doctor.result") }}</th><th>{{ crate::locale::tr("ui.doctor.item") }}</th><th>{{ crate::locale::tr("ui.doctor.detail") }}</th></tr></thead>
+    <tbody>{% for i in passed %}<tr><td><span class="badge status-{{ i.status }}">{{ i.status_label }}</span></td><td><code>{{ i.id }}</code></td><td>{{ i.detail }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+</details>
+{% endif %}
 {% endblock %}

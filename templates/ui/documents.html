@@ -1,29 +1,40 @@
 {% extends "ui/base.html" %}
 {% block content %}
-<div class="heading"><h1>{{ crate::locale::tr("ui.nav.documents") }}</h1></div>
-<section class="panel">
-  <h2>{{ crate::locale::tr("ui.documents.defaults_heading") }}</h2>
+<div class="heading"><h1>{{ crate::locale::tr("ui.nav.documents") }}</h1><a href="#kinds">{{ crate::locale::tr("ui.documents.kinds_jump") }} ↓</a></div>
+<section class="panel" id="common">
+  <h2>{{ crate::locale::tr("ui.documents.common_heading") }}</h2>
   <form method="post" action="/settings/documents" class="stack">
     <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}">
     <fieldset class="choices"><legend>{{ crate::locale::tr("ui.documents.defaults_legend") }}</legend>
-      {% for d in documents %}<label class="checkbox"><input type="checkbox" name="documents" value="{{ d.value }}"{% if d.selected %} checked{% endif %}>{{ d.label }}</label>
-      {% endfor %}
+      <div class="check-grid">{% for d in documents %}<label class="checkbox"><input type="checkbox" name="documents" value="{{ d.value }}"{% if d.selected %} checked{% endif %}>{{ d.label }}</label>
+      {% endfor %}</div>
+      <p class="note">{{ crate::locale::tr("ui.documents.defaults_note") }}</p>
     </fieldset>
+    <div class="pair">
+      <label>{{ crate::locale::tr("ui.documents.language") }}<select name="language">{% for c in languages %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+      <fieldset class="choices"><legend>{{ crate::locale::tr("ui.documents.limits") }}</legend>
+        <div class="row">
+          <label>{{ crate::locale::tr("ui.kind.max_chars") }}<input name="max_chars" inputmode="numeric" value="{{ max_chars }}" placeholder="{{ ph_no_limit }}"></label>
+          <label>{{ crate::locale::tr("ui.kind.max_bytes") }}<input name="max_bytes" inputmode="numeric" value="{{ max_bytes }}" placeholder="{{ ph_no_limit }}"></label>
+        </div>
+        <p class="note">{{ crate::locale::tr("ui.documents.limits_note") }}</p>
+      </fieldset>
+    </div>
+    <label>{{ crate::locale::tr1("ui.documents.instructions", "max", instructions_max) }}<textarea name="instructions" rows="4" data-max="{{ instructions_max }}">{{ instructions }}</textarea><span class="counter" data-for="instructions"></span></label>
+    <label>{{ crate::locale::tr("ui.documents.exclude") }}<textarea name="exclude" rows="3">{{ exclude }}</textarea></label>
     <div class="actions"><button class="primary" type="submit">{{ crate::locale::tr("ui.common.save") }}</button></div>
   </form>
-  <p class="note">{{ crate::locale::tr("ui.documents.defaults_note") }}</p>
 </section>
-<section class="panel">
+<section class="panel" id="kinds">
   <div class="heading"><h2>{{ crate::locale::tr("ui.documents.kinds_heading") }}</h2><a class="button primary small" href="/settings/documents/new">＋ {{ crate::locale::tr("ui.kinds.add") }}</a></div>
   <div class="table-wrap"><table>
-    <thead><tr><th>{{ crate::locale::tr("ui.kinds.kind") }}</th><th>{{ crate::locale::tr("ui.kind.summary_limits") }}</th><th>{{ crate::locale::tr("ui.kind.summary_timing") }}</th><th>{{ crate::locale::tr("ui.kind.summary_template") }}</th><th>{{ crate::locale::tr("ui.kinds.settings") }}</th></tr></thead>
+    <thead><tr><th>{{ crate::locale::tr("ui.kinds.kind") }}</th><th>{{ crate::locale::tr("ui.kind.summary_limits") }}</th><th>{{ crate::locale::tr("ui.kind.summary_timing") }}</th><th>{{ crate::locale::tr("ui.kind.summary_template") }}</th></tr></thead>
     <tbody>
     {% for k in kinds %}<tr>
-      <td><a href="/settings/documents/{{ k.id }}">{{ k.name }}</a>{% if !k.builtin %} <span class="tag">{{ crate::locale::tr("cli.docs.custom") }}</span>{% endif %}</td>
+      <td><a href="/settings/documents/{{ k.id }}">{{ k.name }}</a>{% if !k.builtin %} <span class="tag">{{ crate::locale::tr("cli.docs.custom") }}</span>{% endif %}{% if k.customized %} <span class="tag">{{ crate::locale::tr("ui.kinds.customized") }}</span>{% endif %}</td>
       <td>{{ k.limits }}</td>
       <td>{{ k.when }}</td>
-      <td><code>{{ k.template }}</code></td>
-      <td>{% if k.customized %}{{ crate::locale::tr("ui.kinds.customized") }}{% else %}{{ crate::locale::tr("ui.kind.default") }}{% endif %}</td>
+      <td>{% if k.template == "none" %}-{% else %}<code>{{ k.template }}</code>{% endif %}</td>
     </tr>{% endfor %}
     </tbody>
   </table></div>

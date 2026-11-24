@@ -5,21 +5,26 @@
   <form method="post" action="/settings/worker" class="stack">
     <input type="hidden" name="csrf" value="{{ layout.csrf }}"><input type="hidden" name="revision" value="{{ revision }}">
     <div class="row">
-      <label>{{ crate::locale::tr("ui.worker.model") }}<select name="model">{% for c in models %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+      <div class="stack tight">
+        <label>{{ crate::locale::tr("ui.worker.model") }}<select name="model">{% for c in models %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
+        <div class="actions wrap"><button class="small" type="submit" form="models-refresh"{% if !can_refresh %} disabled{% endif %}>{{ crate::locale::tr("ui.worker.models_refresh") }}</button><span class="note">{{ models_note }}</span></div>
+      </div>
       <label>{{ crate::locale::tr("ui.worker.effort") }}<select name="effort">{% for c in efforts %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
     </div>
     <div class="row">
       <label>{{ crate::locale::tr2("ui.worker.timeout", "min", timeout_min, "max", timeout_max) }}<input name="timeout_secs" inputmode="numeric" value="{{ timeout_secs }}"></label>
+      <label>{{ crate::locale::tr("ui.worker.permission") }}<select name="permission">{% for c in permission %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
     </div>
-    <label>{{ crate::locale::tr("ui.worker.permission") }}<select name="permission">{% for c in permission %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label>
-    <label>{{ crate::locale::tr("ui.worker.claude_path") }}<input name="claude_path" value="{{ claude_path }}"></label>
-    <p class="note">{{ claude_state }}</p>
+    <details class="fold" id="claude-details"{% if claude_problem %} open{% endif %}>
+      <summary>{{ crate::locale::tr("ui.worker.claude_details") }}</summary>
+      <div class="stack">
+        <label>{{ crate::locale::tr("ui.worker.claude_path") }}<input name="claude_path" value="{{ claude_path }}"></label>
+        <p class="note{% if claude_problem %} error-text{% endif %}">{{ claude_state }}</p>
+      </div>
+    </details>
+    <p class="note">{{ crate::locale::tr("ui.worker.note") }}</p>
     <div class="actions"><button class="primary" type="submit">{{ crate::locale::tr("ui.common.save") }}</button></div>
   </form>
-  <form method="post" action="/settings/worker/models" class="stack">
-    <input type="hidden" name="csrf" value="{{ layout.csrf }}">
-    <div class="actions"><button type="submit"{% if !can_refresh %} disabled{% endif %}>{{ crate::locale::tr("ui.worker.models_refresh") }}</button> <span class="note">{{ models_note }}</span></div>
-  </form>
-  <p class="note">{{ crate::locale::tr("ui.worker.note") }}</p>
+  <form method="post" action="/settings/worker/models" id="models-refresh"><input type="hidden" name="csrf" value="{{ layout.csrf }}"></form>
 </section>
 {% endblock %}

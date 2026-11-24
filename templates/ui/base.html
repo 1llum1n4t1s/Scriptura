@@ -8,10 +8,9 @@
     <a href="/" aria-current="{% if layout.nav == "overview" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.overview") }}</a>
     <a href="/repos" aria-current="{% if layout.nav == "repos" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.repos") }}</a>
     <a href="/history" aria-current="{% if layout.nav == "history" %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.runs") }}</a>
-    <a href="/settings/general" aria-current="{% if layout.in_settings() %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.settings") }}</a>
+    <a href="/settings/documents" aria-current="{% if layout.in_settings() %}page{% else %}false{% endif %}">{{ crate::locale::tr("ui.nav.settings") }}</a>
   </nav>
-  <form method="post" action="/language" class="inline language" data-language-selector><input type="hidden" name="csrf" value="{{ layout.csrf }}"><label><span class="visually-hidden">{{ crate::locale::tr("ui.lang.label") }}</span><select name="language" aria-label="{{ crate::locale::tr("ui.lang.label") }}" data-autosubmit>{% for c in crate::ui::views::language_choices() %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label><button class="small" type="submit" data-autosubmit-fallback>{{ crate::locale::tr("ui.lang.apply") }}</button></form>
-  <form method="post" action="/shutdown" class="inline"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><button class="small destructive" type="submit">{{ crate::locale::tr("ui.base.exit") }}</button></form>
+  {% if !layout.resident %}<form method="post" action="/shutdown" class="inline"><input type="hidden" name="csrf" value="{{ layout.csrf }}"><button class="small destructive" type="submit">{{ crate::locale::tr("ui.base.exit") }}</button></form>{% endif %}
 </header>
 <main id="main">
 {% if layout.in_settings() %}{% include "ui/settings_nav.html" %}
@@ -20,5 +19,8 @@
 {% if let Some(reason) = layout.broken %}<p class="notice warning" role="alert">{{ crate::locale::tr1("ui.base.broken", "reason", reason) }}</p>{% endif %}
 {% block content %}{% endblock %}
 </main>
-<footer>{% if layout.resident %}{{ crate::locale::tr("ui.base.footer_resident") }}{% else %}{{ crate::locale::tr("ui.base.footer") }}{% endif %}</footer>
+<footer>
+  <span>{% if layout.resident %}{{ crate::locale::tr("ui.base.footer_resident") }}{% else %}{{ crate::locale::tr("ui.base.footer") }}{% endif %}</span>
+  <form method="post" action="/language" class="inline language" data-language-selector><input type="hidden" name="csrf" value="{{ layout.csrf }}"><label>{{ crate::locale::tr("ui.lang.label") }} <select name="language" data-autosubmit>{% for c in crate::ui::views::language_choices() %}<option value="{{ c.value }}"{% if c.selected %} selected{% endif %}>{{ c.label }}</option>{% endfor %}</select></label><button class="small" type="submit" data-autosubmit-fallback>{{ crate::locale::tr("ui.lang.apply") }}</button></form>
+</footer>
 </body></html>
