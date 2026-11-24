@@ -2,7 +2,6 @@
 /.build
 /.tmp
 /validation
-/PowerShellEditorServices.json
 
 # プラグイン配布用の生成物（ビルド時に配置する）
 /plugins/scriptura/bin/scriptura.exe
