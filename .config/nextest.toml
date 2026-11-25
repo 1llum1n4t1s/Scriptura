@@ -8,9 +8,11 @@
 nextest-version = "0.9.152"
 
 # `python_worker_running_and_legacy_missing_fields_recovers` は、製品の `worker_quiescence_error`（Windows では
-# マシン上の全プロセスから `--no-session-persistence` 付きの claude/node/cmd を数える）を実際に通る。並列で走る
-# 他のテストの worker スタブをそのプロセス一覧が拾って失敗するので、ほかのテストと同時に動かさない専用の
-# プロファイルで単独実行する（test-group では、グループ外のテストとの同時実行を防げない）。
+# マシン上の全プロセスから、`--no-session-persistence` と `--(dangerously-skip-permissions|safe-mode)` の
+# 両方を持つ claude/node/cmd を数える）を実際に通る。並列で走る他のテストの worker スタブや、同じ引数を持つ
+# 実プロセスをそのプロセス一覧が拾って失敗するので、
+# ほかのテストと同時に動かさない専用のプロファイルで単独実行する（test-group では、グループ外のテストとの
+# 同時実行を防げない）。
 
 [profile.default]
 default-filter = "not test(=python_worker_running_and_legacy_missing_fields_recovers)"

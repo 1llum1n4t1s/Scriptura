@@ -2917,6 +2917,13 @@ pub fn run() {
         _ => {}
     }
 }
+/// Scriptura の worker のコマンドラインを選ぶ pwsh の条件式（`$_.CommandLine` に対する）。
+/// `--no-session-persistence` と、権限フラグ（`--dangerously-skip-permissions` / `--safe-mode`）の
+/// 両方を持つもの。順序・引用符・間の別引数に依存しない（`.cmd` シム経由でも一致させるため）。
+/// stop-review フックの `claude -p`（権限フラグが無い）は選ばない。`worker_quiescence_error` とテストが共用する。
+pub fn worker_command_filter() -> &'static str {
+    "$_.CommandLine -match '--no-session-persistence' -and $_.CommandLine -match '--(dangerously-skip-permissions|safe-mode)'"
+}
 /// 中断した worker が残っていないかの確認。
 ///
 /// 既知の制約（未対応）: 非 Windows では終了を確認する手段が無く、常に「見送り」を返すため、
@@ -2926,8 +2933,13 @@ pub fn worker_quiescence_error() -> Option<String> {
         return Some(crate::t!("maint.quiescence_unsupported").into());
     }
     let mut c = command("pwsh");
-    // Claude worker（--no-session-persistence）の終了を待つ。
-    c.args(["-NoProfile","-Command","$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^(claude|node|cmd)(\\.exe)?$' -and $_.CommandLine -match '--no-session-persistence' -and $_.CommandLine -notmatch 'Get-CimInstance' }).Count"]);
+    // Scriptura の worker（`worker_command_filter`）の終了を待つ。
+    // stop-review フックの `claude -p` など、`--no-session-persistence` だけを持つ他のプロセスは数えない。
+    let filter = worker_command_filter();
+    let script = format!(
+        "$ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -match '^(claude|node|cmd)(\\.exe)?$' -and {filter} -and $_.CommandLine -notmatch 'Get-CimInstance' }}).Count"
+    );
+    c.args(["-NoProfile", "-Command", script.as_str()]);
     match capture(c, None, Duration::from_secs(15), false) {
         Ok(r) if r.code == Some(0) && String::from_utf8_lossy(&r.stdout).trim() == "0" => None,
         Ok(r)
@@ -3634,6 +3646,66 @@ fn discard_outputs(root: &Path, state: &Value) -> Vec<String> {
     }
     kept
 }
+/// 戻せたパスだけ記録（`after`）も変更前に揃える。戻せなかったパス（`kept`）は、記録のまま残す。
+fn align_after_to_before(state: &mut Value, kept: &[String]) {
+    let mut merged = state["after"].as_object().cloned().unwrap_or_default();
+    for (relative, digest) in state["before"].as_object().into_iter().flatten() {
+        if !kept.contains(relative) {
+            merged.insert(relative.clone(), digest.clone());
+        }
+    }
+    state["after"] = json!(merged);
+}
+/// 追い修正が書き始める前に中断した場合に、直前の起動の出力（`after` に測定値が保存されたもの）を
+/// 変更前へ戻す。追い修正が書き始めていれば触らない。最初の起動中の中断（`after`＝`before`）も触らない。
+/// 次の条件をすべて満たすときだけ `discard_outputs` を呼び、1 つでも欠ければ何も触らない
+/// （部分的に戻すと、移した先の新規文書だけ削除されて本文が失われるため）。
+/// (a) 記録の `head` が現在の HEAD と同じ、(b) `before` の全キーで現在のハッシュが `after` と一致
+/// （変わっていないパスも含む。読めなければ不一致）、(c) `ignored_before` が配列で、変わったパス
+/// （`before`≠`after`）がその中に無い（旧形式で欠ける記録は触らない）、
+/// (d) 変わったパスに staged が無い。戻せたパスだけ記録も変更前に揃える。通知はしない。
+pub fn discard_interrupted_outputs(root: &Path, state: &mut Value, head: &str) {
+    let (Some(before), Some(after)) = (state["before"].as_object(), state["after"].as_object())
+    else {
+        return;
+    };
+    if s(state, "head") != head {
+        return;
+    }
+    let recorded = |relative: &String| after.get(relative).cloned().unwrap_or(Value::Null);
+    if before.keys().any(|relative| {
+        document_hash(root, relative)
+            .ok()
+            .map(|v| json!(v))
+            .as_ref()
+            != Some(&recorded(relative))
+    }) {
+        return;
+    }
+    let changed: Vec<String> = before
+        .iter()
+        .filter(|(relative, digest)| recorded(relative) != **digest)
+        .map(|(relative, _)| relative.clone())
+        .collect();
+    if changed.is_empty() {
+        return;
+    }
+    // `ignored_before` が配列でない（旧形式で欠ける）記録は、無視対象かどうか確かめられないので触らない。
+    let Some(ignored) = state["ignored_before"].as_array() else {
+        return;
+    };
+    if ignored.iter().any(|p| changed.iter().any(|c| p == c)) {
+        return;
+    }
+    let mut args = vec!["diff", "--cached", "--name-only", "--"];
+    args.extend(changed.iter().map(String::as_str));
+    // staged を確かめられない（git の失敗）ときも、何も触らない。
+    if run_git(root, &args) != Some(vec![]) {
+        return;
+    }
+    let kept = discard_outputs(root, state);
+    align_after_to_before(state, &kept);
+}
 /// 保守ループの worker の期限（秒）。テスト用に、設定の下限（60 秒）より短い期限を環境変数で指定できる。
 fn loop_timeout_secs(options: &MaintenanceOptions) -> u64 {
     #[cfg(feature = "test-support")]
@@ -4040,6 +4112,8 @@ pub fn publish_locked_with(
             return fail(path, &mut state, e);
         }
         if s(&state, "phase") == "worker_running" {
+            // 中断した worker の書きかけは、復旧の前に戻す（戻せたものだけ。staged があれば触らない）。
+            discard_interrupted_outputs(root, &mut state, &head);
             state["phase"] = json!("interrupted_recovered");
             state["error"] = Value::Null;
             save_publication(path, &mut state)?;
@@ -4417,13 +4491,7 @@ pub fn publish_locked_with(
                     };
                     // 戻せたパスだけ記録も変更前に揃える（同じ HEAD の run-now が、戻せたパスの食い違いで
                     // 失敗しないように）。戻せなかったパスは、worker 終了時の記録のまま残す。
-                    let mut merged = state["after"].as_object().cloned().unwrap_or_default();
-                    for (relative, digest) in state["before"].as_object().into_iter().flatten() {
-                        if !kept.contains(relative) {
-                            merged.insert(relative.clone(), digest.clone());
-                        }
-                    }
-                    state["after"] = json!(merged);
+                    align_after_to_before(&mut state, &kept);
                     state["worker_timed_out"] = json!(true);
                     break Some(if kept.is_empty() {
                         crate::t!("maint.timeout_restored", error = message)
@@ -4529,7 +4597,21 @@ pub fn publish_locked_with(
     let (hard, violations) = hard_violation(root, &state, &size_dirs, options, &editable);
     // 追い修正が期限切れになり、書きかけを取り消して進んだときの警告（`worker` の節で記録）。
     let timeout_note = s(&state, "timeout_note");
+    // worker の実行中に HEAD かブランチが動いたか。ハード違反の破棄より先に見る（動いていたら、書きかけは
+    // 利用者の作業と区別できないので破棄せず、保留して次の push で新しい保守にする）。
+    let head_moved = || {
+        run_git(root, &["rev-parse", "HEAD"]) != Some(head_raw.clone())
+            || run_git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+                != Some(branch_raw.clone())
+    };
     if let Some(e) = hard {
+        if head_moved() {
+            return fail(
+                path,
+                &mut state,
+                crate::t!("maint.head_changed_uncommitted"),
+            );
+        }
         let kept = discard_outputs(root, &state);
         if kept.is_empty() {
             // 全部戻したので、記録も変更前の内容に揃える（後続の完了確認で「変わった」と見なさない）。
@@ -4616,10 +4698,7 @@ pub fn publish_locked_with(
         save_publication(path, &mut state)?;
         return Ok(None);
     }
-    if run_git(root, &["rev-parse", "HEAD"]) != Some(head_raw.clone())
-        || run_git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-            != Some(branch_raw.clone())
-    {
+    if head_moved() {
         return fail(
             path,
             &mut state,

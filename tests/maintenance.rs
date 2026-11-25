@@ -807,12 +807,21 @@ fn python_ready_checkpoint_resumes_without_worker() {
 fn python_worker_running_and_legacy_missing_fields_recovers() {
     let f = Fixture::new();
     let mut state = f.checkpoint("worker_running");
+    // 中断した worker の書きかけ（記録どおりの README）が残っている。旧形式の記録（`ignored_before` が無い）
+    // なので、書きかけは戻さず残す。
+    fs::write(f.root.join("README.md"), "half written").unwrap();
+    state["after"]["README.md"] = json!(document_hash(&f.root, "README.md").unwrap());
     f.save(&mut state);
     // 中断した worker の終了確認（`worker_quiescence_error`）は Windows でだけ行える。
     #[cfg(windows)]
     {
         assert_eq!(f.maintain(), None);
         assert_eq!(f.state()["phase"], "complete");
+        assert_eq!(
+            fs::read_to_string(f.root.join("README.md")).unwrap(),
+            "half written",
+            "旧形式の記録は復旧するが、書きかけは触らない"
+        );
     }
     // Windows 以外では終了を確認できないので、fail-closed で再開を見送り、worker も起動しない。
     #[cfg(not(windows))]
@@ -853,6 +862,218 @@ fn interrupted_legacy_disappearance_is_blocked() {
     );
     state["ignored_before"] = json!([]);
     assert_eq!(interrupted_ignored_error(&f.root, &state, &f.docs()), None);
+}
+impl Fixture {
+    /// 中断した worker が `name` を書きかけにした記録（現在の内容を `after` に持つ）を作る。
+    fn half_written(&self, state: &mut Value, name: &str, body: &str) {
+        fs::write(self.root.join(name), body).unwrap();
+        state["after"][name] = json!(document_hash(&self.root, name).unwrap());
+        // 新形式の記録（無視対象の記録を持つ）。旧形式を試すテストは、あとでこのキーを消す。
+        state["ignored_before"] = json!([]);
+    }
+}
+#[test]
+fn interrupted_outputs_are_untouched_for_legacy_records_without_ignored_before() {
+    let f = Fixture::new();
+    let mut state = f.checkpoint("worker_running");
+    f.half_written(&mut state, "README.md", "half written");
+    state.as_object_mut().unwrap().remove("ignored_before");
+    let recorded = state["after"].clone();
+    discard_interrupted_outputs(&f.root, &mut state, &f.head());
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "half written"
+    );
+    assert_eq!(state["after"], recorded);
+}
+#[test]
+fn interrupted_outputs_are_untouched_when_an_unchanged_path_was_edited_by_the_user() {
+    let f = Fixture::new();
+    let mut state = f.checkpoint("worker_running");
+    f.half_written(&mut state, "README.md", "half written");
+    state["before"]["NOTES.md"] = Value::Null;
+    f.half_written(&mut state, "NOTES.md", "new file");
+    // before==after の DESIGN.md を、利用者が編集した。
+    fs::write(f.root.join("DESIGN.md"), "user design edit").unwrap();
+    let recorded = state["after"].clone();
+    discard_interrupted_outputs(&f.root, &mut state, &f.head());
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "half written"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("NOTES.md")).unwrap(),
+        "new file"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("DESIGN.md")).unwrap(),
+        "user design edit"
+    );
+    assert_eq!(state["after"], recorded);
+}
+#[test]
+fn interrupted_outputs_matching_the_record_are_restored_and_recorded() {
+    let f = Fixture::new();
+    let mut state = f.checkpoint("worker_running");
+    f.half_written(&mut state, "README.md", "half written");
+    // worker が作った未追跡の新規ファイル（変更前は存在しない）。
+    state["before"]["NOTES.md"] = Value::Null;
+    f.half_written(&mut state, "NOTES.md", "new file");
+    discard_interrupted_outputs(&f.root, &mut state, &f.head());
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "readme"
+    );
+    assert!(!f.root.join("NOTES.md").exists());
+    assert_eq!(state["after"], state["before"]);
+}
+#[test]
+fn interrupted_outputs_differing_from_the_record_are_left_alone() {
+    let f = Fixture::new();
+    let mut state = f.checkpoint("worker_running");
+    f.half_written(&mut state, "README.md", "half written");
+    state["before"]["NOTES.md"] = Value::Null;
+    f.half_written(&mut state, "NOTES.md", "new file");
+    // 記録の後に利用者が README を書き足した（NOTES.md は記録どおり）。
+    fs::write(f.root.join("README.md"), "user edit").unwrap();
+    let recorded = state["after"].clone();
+    discard_interrupted_outputs(&f.root, &mut state, &f.head());
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "user edit"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("NOTES.md")).unwrap(),
+        "new file",
+        "1 つでも不一致なら、一致するものも触らない（部分的に戻すと本文が失われる）"
+    );
+    assert_eq!(state["after"], recorded);
+}
+#[test]
+fn interrupted_outputs_are_untouched_when_a_changed_path_was_ignored_or_head_moved() {
+    let f = Fixture::new();
+    let mut state = f.checkpoint("worker_running");
+    f.half_written(&mut state, "README.md", "half written");
+    state["before"]["NOTES.md"] = Value::Null;
+    f.half_written(&mut state, "NOTES.md", "new file");
+    let recorded = state["after"].clone();
+    // 変わったパスが ignored_before にある。
+    state["ignored_before"] = json!(["NOTES.md"]);
+    discard_interrupted_outputs(&f.root, &mut state, &f.head());
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "half written"
+    );
+    assert!(f.root.join("NOTES.md").exists());
+    assert_eq!(state["after"], recorded);
+    // 記録の head と現在の HEAD が違う。
+    state["ignored_before"] = json!([]);
+    discard_interrupted_outputs(&f.root, &mut state, "0000000");
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "half written"
+    );
+    assert!(f.root.join("NOTES.md").exists());
+    assert_eq!(state["after"], recorded);
+}
+#[test]
+fn interrupted_outputs_are_untouched_when_any_changed_path_is_staged() {
+    let f = Fixture::new();
+    let mut state = f.checkpoint("worker_running");
+    f.half_written(&mut state, "README.md", "half written");
+    f.half_written(&mut state, "DESIGN.md", "design half");
+    f.git(&["add", "README.md"]);
+    let recorded = state["after"].clone();
+    discard_interrupted_outputs(&f.root, &mut state, &f.head());
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "half written"
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("DESIGN.md")).unwrap(),
+        "design half",
+        "staged なパスが 1 つでもあれば全部触らない"
+    );
+    assert_eq!(state["after"], recorded);
+}
+#[test]
+fn interrupted_outputs_the_user_already_committed_keep_their_content() {
+    let f = Fixture::new();
+    let mut state = f.checkpoint("worker_running");
+    f.half_written(&mut state, "README.md", "user committed");
+    state["before"]["NOTES.md"] = Value::Null;
+    f.half_written(&mut state, "NOTES.md", "new file");
+    f.git(&["add", "README.md"]);
+    f.git(&["commit", "-m", "user commit"]);
+    discard_interrupted_outputs(&f.root, &mut state, &f.head());
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "user committed"
+    );
+    assert_eq!(f.git(&["status", "--porcelain", "--", "README.md"]), "");
+    assert_eq!(
+        fs::read_to_string(f.root.join("NOTES.md")).unwrap(),
+        "new file",
+        "未追跡のまま消えない"
+    );
+}
+/// 製品の条件式（`worker_command_filter`）を、サンプルのコマンドラインに pwsh でかけて、一致した（1）か
+/// しなかった（0）かを順に返す。Win32_Process は列挙しない。
+#[cfg(windows)]
+fn filter_samples(samples: &[String]) -> Vec<bool> {
+    let script = format!(
+        "foreach ($c in (ConvertFrom-Json $env:SCRIPTURA_TEST_SAMPLES)) {{ $o = [pscustomobject]@{{ CommandLine = $c }}; @($o | Where-Object {{ {} }}).Count }}",
+        worker_command_filter()
+    );
+    let out = Command::new("pwsh")
+        .args(["-NoProfile", "-Command", &script])
+        .env("SCRIPTURA_TEST_SAMPLES", json!(samples).to_string())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim() == "1")
+        .collect()
+}
+#[cfg(windows)]
+#[test]
+fn worker_command_filter_matches_workers_in_any_form_and_not_other_claude() {
+    let mut matching: Vec<String> = [Permission::Bypass, Permission::Restricted]
+        .into_iter()
+        .map(|permission| {
+            let worker = Worker {
+                permission,
+                ..Worker::default()
+            };
+            format!("claude.exe {}", worker_args(&worker, &[], &[]).join(" "))
+        })
+        .collect();
+    matching.extend(
+        [
+            r#"claude.exe -p "--dangerously-skip-permissions" "--no-session-persistence""#,
+            r#"cmd.exe /e:ON /v:OFF /d /c ""C:\x\claude.cmd" -p --safe-mode --no-session-persistence""#,
+            "claude.exe --no-session-persistence --safe-mode -p",
+            "claude.exe --safe-mode --model x --effort low --no-session-persistence",
+        ]
+        .map(String::from),
+    );
+    let rejected: Vec<String> = [
+        r#"claude.exe -p --model sonnet --tools "" --strict-mcp-config --disable-slash-commands --no-session-persistence --setting-sources "" review"#,
+        "claude.exe --dangerously-skip-permissions",
+    ]
+    .map(String::from)
+    .to_vec();
+    let all: Vec<String> = matching.iter().chain(&rejected).cloned().collect();
+    let got = filter_samples(&all);
+    assert_eq!(got.len(), all.len());
+    for (i, sample) in all.iter().enumerate() {
+        assert_eq!(got[i], i < matching.len(), "{sample}");
+    }
 }
 #[test]
 fn checkpoint_clean_proof_requires_raw_bytes_and_index() {
@@ -3383,6 +3604,48 @@ fn released_changelog_entries_are_protected_in_every_permission_mode() {
         assert_eq!(f.head(), head);
         assert_eq!(f.state()["phase"], "complete");
     }
+}
+
+#[test]
+fn head_move_with_hard_violation_is_held_not_rejected() {
+    // worker の実行中に HEAD が動き、同時にリリース済み節が書き換えられた場合。ハード違反の破棄（rejected）で
+    // 完了にせず、HEAD の変更として保留する（ready のまま・履歴は held・処理済み位置は進めない）。
+    let f = Fixture::with_config(Some(changelog_config(
+        Permission::Bypass,
+        vec![Document::Changelog],
+    )));
+    f.commit_push_file("CHANGELOG.md", KAC_CHANGELOG);
+    f.hook("UserPromptSubmit");
+    f.push_change("head move");
+    let cursor = f.cursor();
+    unsafe { env::set_var("HOOK_STUB_HEAD_CHANGE", "1") };
+    f.writes(json!({f.changelog_path(): KAC_CHANGELOG.replace("- 初版", "- 初版（書き換え）")}));
+    let message = f.hook("Stop").expect("HEAD の変更で保留するはず");
+    assert!(message.contains("HEAD"), "{message}");
+    let state = f.state();
+    assert_eq!(state["phase"], "ready");
+    assert!(state["discarded"].is_null(), "{state}");
+    let last = f.runs().pop().unwrap().run;
+    assert_eq!(last.outcome, "held");
+    let held_base = last.base_commit;
+    assert_eq!(f.cursor(), cursor, "処理済み位置は進めない");
+    // 続く push では新しい保守が全範囲を処理する（古い書きかけは戻される）。
+    unsafe { env::remove_var("HOOK_STUB_HEAD_CHANGE") };
+    f.push_change("next push");
+    f.writes(json!({f.changelog_path(): KAC_CHANGELOG.replace("- 新機能 A", "- 新機能 A\n- 新機能 B")}));
+    // 古い出力の破棄の通知つきで、新しい保守が走る。
+    let note = f.hook("Stop").expect("古い出力を破棄した通知があるはず");
+    assert!(note.contains("破棄"), "{note}");
+    assert_eq!(f.state()["phase"], "complete");
+    assert_eq!(f.worker_runs(), 2);
+    let committed = f.runs().pop().unwrap().run;
+    assert_eq!(committed.outcome, "committed");
+    assert_eq!(committed.base_commit, held_base, "全範囲を処理する");
+    assert!(
+        fs::read_to_string(f.root.join("CHANGELOG.md"))
+            .unwrap()
+            .contains("- 初版\n")
+    );
 }
 
 #[test]
