@@ -6,7 +6,7 @@
 - `src/timing.rs` … 種類ごとのタイミング（`due_kinds`。純粋関数）と、状態 DB の `kind_runs` 表（最終完了時刻）の読み書き。
 - `src/runlog.rs` … 保守履歴（`maintenance_runs`）の記録と読み取り。
 - `src/changelog.rs` … CHANGELOG 固有の処理（リリース済みエントリ不変の検査 `released_entries_error`、起点・コミット・タグの収集）。
-- `src/activity.rs` … 実行中の保守の記録と読み取り（feature `ui` に依存しない）。保守 1 件ごとに、状態 DB の隣（`SCRIPTURA_DB` に従う。既定は状態フォルダー）の `activity/` へ JSON 1 ファイル（version・pid・process_started・origin・repo_root・phase・started_at・phase_at・deadline_at・fixup・worker_pid だけ）を置き、`Guard` の Drop で消す。記録は thread-local（スレッドごと）で、`begin`（`poll_repository_inner` の保守・再開の直前）・`phase` / `worker`（`publish_locked_with`）・`worker_spawned`（`process::capture`）で更新する。書き込みは best-effort で、失敗しても保守の結果・出力・履歴を変えない。`list()` は PID の生存と開始時刻の一致を OS で確かめた記録だけを返し（壊れた・未知の版・大きすぎるものは無視。上限 100 件）、`processes()` は自分と同じ実行ファイルのプロセスを返す。どちらも副作用なし。古い記録の掃除は `begin` の中で、生存していないと確認できたものだけ。OS ごとの開始時刻は `app_update/processes.rs` の `probe`。
+- `src/activity.rs` … 実行中の保守の記録と読み取り（feature `ui` に依存しない）。記録の形式・更新・掃除は [data-model.md](data-model.md)。
 - `src/ops.rs` … 設定を変える操作・読み取り操作の本体（enable・disable・pause・resume・種類・worker・履歴の復元・run-now・docs）。CLI と管理画面が共有する。
 - `src/cli.rs` … 利用者向け CLI（`--json` は 1 オブジェクト）。本体は `ops`。
 - `src/ui/` と `templates/ui/` … 管理画面 `scriptura ui`（cargo feature `ui`、既定で有効。axum + askama の SSR）。`guard.rs`（Host・Origin・Cookie・CSRF）、`confirm.rs`（二段階確認）、`handoff.rs`（更新後の自動ログインの引き継ぎ鍵。ハッシュだけを状態フォルダーへ置く）、`sessions.rs`（常駐のログインを再起動をまたいで保つ `ui-sessions-<port>.json`。セッションの SHA-256 だけ・最大 16 件。Cookie 名 `scriptura_resident_<port>`・CSRF の導出もここ）、`handlers.rs`（概要の「実行中」は `activity_view` と `activity` ハンドラー。`templates/ui/activity_body.html`・`activity.html`・`recent_runs.html`）、`read.rs`・`views.rs`、`tray.rs` と `tray/`（常駐アイコン。Windows は `Shell_NotifyIconW`、macOS は `NSStatusItem`）。
