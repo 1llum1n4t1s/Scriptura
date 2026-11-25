@@ -583,13 +583,25 @@ use std::{
     process::Command,
 };
 
+/// 実行ごとの印。プロセス ID だけだと、ID が再利用されたときに前回の残りのフォルダーを拾う。
+/// 同じテストの中では同じ値にする（同じ名前で 2 回呼ぶテストがある）。
+fn run_stamp() -> u128 {
+    static STAMP: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    *STAMP.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    })
+}
+
 fn runtime_dir(name: &str) -> PathBuf {
     let base = std::env::var_os("SCRIPTURA_TEST_BASE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("validation"));
     let dir = base
         .join("kinds-runtime")
-        .join(format!("{name}-{}", std::process::id()));
+        .join(format!("{name}-{}-{}", std::process::id(), run_stamp()));
     fs::create_dir_all(&dir).unwrap();
     dir
 }
