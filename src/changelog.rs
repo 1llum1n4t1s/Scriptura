@@ -82,10 +82,29 @@ impl Section {
         heading_version(&self.heading)
     }
 
-    /// `Unreleased` 節か（大文字小文字・角括弧は無視）。
+    /// 未リリース節か（`UNRELEASED_NAMES` の見出し名。大文字小文字・角括弧は無視）。
+    /// 角括弧つきは中身全体で照合する。角括弧なしは、英語だけ先頭の語で一致し（従来の動作。
+    /// `## Unreleased - 日付` など）、英語以外は見出し全体の一致だけを認める。
     pub fn is_unreleased(&self) -> bool {
-        self.version()
-            .is_some_and(|v| v.eq_ignore_ascii_case("unreleased"))
+        self.unreleased_label().is_some()
+    }
+
+    /// 未リリース節なら、そのラベル（`label_key` で正規化した見出し名）。リンク定義の除外の照合に使う。
+    pub fn unreleased_label(&self) -> Option<String> {
+        let rest = self
+            .heading
+            .trim_start_matches(' ')
+            .strip_prefix("## ")
+            .unwrap_or("")
+            .trim();
+        if let Some((inner, _)) = rest.strip_prefix('[').and_then(|r| r.split_once(']')) {
+            return is_unreleased_name(inner).then(|| label_key(inner));
+        }
+        let first = rest.split_whitespace().next().unwrap_or("");
+        if first.eq_ignore_ascii_case("unreleased") {
+            return Some("unreleased".to_string());
+        }
+        is_unreleased_name(rest).then(|| label_key(rest))
     }
 
     /// 比較用の内容: 見出しと本文を LF でつなぎ、末尾の空行だけを落としたもの。
@@ -98,6 +117,37 @@ impl Section {
         }
         lines.join("\n")
     }
+}
+
+/// Keep a Changelog の「未リリース」に当たる見出し名（英語を含む 9 言語。比較は小文字化した全体一致）。
+/// 不確かな訳は入れない。版付き（`未リリース 1.0.0`）や部分一致は認めない。
+pub const UNRELEASED_NAMES: &[&str] = &[
+    "Unreleased",
+    "未リリース",
+    "未公開",
+    "未发布",
+    "未發布",
+    "未發佈",
+    "미출시",
+    "미배포",
+    "Sin publicar",
+    "No publicado",
+    "Non publié",
+    "Non publiée",
+    "Unveröffentlicht",
+    "Nicht veröffentlicht",
+    "Não lançado",
+    "Não publicado",
+];
+
+/// 見出し名（角括弧の中身・リンクのラベル）が未リリースか。前後の空白と大文字小文字は無視する。
+pub fn is_unreleased_name(name: &str) -> bool {
+    let key = name
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    UNRELEASED_NAMES.iter().any(|n| n.to_lowercase() == key)
 }
 
 /// リンク参照定義の行（`[label]: url`）。
@@ -391,7 +441,17 @@ pub fn released_entries_error_for(
     // (b) 編集前にあるラベルの定義を重複して追加しないこと。Markdown では同じラベルの最初の定義が
     //     使われるので、既存の定義より前に同じラベルの定義を足すと、既存の行を残したまま参照先を
     //     すり替えられる。Unreleased のラベルと、編集前に無いラベル（新しい版のリンク）の追加は許す。
-    let is_released_link = |l: &&LinkDef| !l.label.eq_ignore_ascii_case("unreleased");
+    //     除外するラベルは、英語の `unreleased` と、編集前の文書に同名の未リリース節の見出しが実在するものだけ
+    //     （実在しない名前の定義は、一覧にあっても通常のリンクとして不変を検査する）。
+    let unreleased_labels: Vec<String> = b
+        .sections
+        .iter()
+        .filter_map(Section::unreleased_label)
+        .collect();
+    let is_released_link = |l: &&LinkDef| {
+        let key = label_key(&l.label);
+        key != "unreleased" && !unreleased_labels.contains(&key)
+    };
     let before_links: Vec<&LinkDef> = b.links.iter().filter(is_released_link).collect();
     let after_links: Vec<&LinkDef> = a.links.iter().filter(is_released_link).collect();
     let mut cursor = 0usize;
@@ -1005,7 +1065,7 @@ pub fn prompt_parts(
     fit_material(&mut material.json, MATERIAL_MAX_BYTES);
 
     let mut rules = String::from(
-        "CHANGELOG maintenance rules: in one maintenance run, add content only inside the `## [Unreleased]` section (or its existing equivalent). Check against the existing entries to avoid duplicates, and using the untrusted material at the end (commits, changed_paths) as clues, write only changes that users can see. Do not change, delete or reorder even one character of released version sections (other than Unreleased) or link reference definitions (this is checked after maintenance; if they change, the changes are not accepted). ",
+        "CHANGELOG maintenance rules: in one maintenance run, add content only inside the `## [Unreleased]` section (or its existing equivalent). If the existing Unreleased heading is written in another language (for example `## 未リリース`), add content under it, keep that heading as it is, and do not add a second English Unreleased section. Check against the existing entries to avoid duplicates, and using the untrusted material at the end (commits, changed_paths) as clues, write only changes that users can see. Do not change, delete or reorder even one character of released version sections (other than Unreleased) or link reference definitions (this is checked after maintenance; if they change, the changes are not accepted). ",
     );
     // 節（`## ` 見出し）の無い既存の CHANGELOG は「既存の本文全体が編集後に部分文字列として残ること」で
     // 検査される（規則 5）。本文の途中へ節を差し込むと拒否されるので、追記の置き場所を指示しておく。

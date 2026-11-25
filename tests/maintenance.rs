@@ -3447,6 +3447,8 @@ fn changelog_prompt_carries_rules_and_history_and_promote_is_committed() {
     // Rust が決めた規則（Unreleased だけ・promote・バージョン表記の整合）。
     for needle in [
         "CHANGELOG maintenance rules",
+        "written in another language",
+        "do not add a second English Unreleased section",
         "The tags listed in pending_releases",
         "Keep version references in README and CHANGELOG consistent",
         // 既存の CHANGELOG への追記は、入口から結果まで確かめた変更だけを書く（restricted でも前の版が読めない代替つき）。

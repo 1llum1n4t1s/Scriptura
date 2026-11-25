@@ -155,6 +155,115 @@ fn new_documents_and_unreleased_only_edits_pass() {
     assert_eq!(released_entries_error(Some(KAC), Some(&after), &[]), None);
 }
 
+const JA: &str = "# Changelog\n\n## 未リリース\n\n- 新機能 A\n\n## [1.0.0] - 2026-01-01\n\n- 初版\n\n[未リリース]: https://example.invalid/compare/v1.0.0...HEAD\n[1.0.0]: https://example.invalid/releases/v1.0.0\n";
+
+#[test]
+fn localized_unreleased_headings_are_recognized_by_whole_name_only() {
+    // 綴りの誤りを検出するため、一覧そのものを期待値と照合する。
+    assert_eq!(
+        changelog::UNRELEASED_NAMES,
+        [
+            "Unreleased",
+            "未リリース",
+            "未公開",
+            "未发布",
+            "未發布",
+            "未發佈",
+            "미출시",
+            "미배포",
+            "Sin publicar",
+            "No publicado",
+            "Non publié",
+            "Non publiée",
+            "Unveröffentlicht",
+            "Nicht veröffentlicht",
+            "Não lançado",
+            "Não publicado",
+        ]
+    );
+    for name in changelog::UNRELEASED_NAMES {
+        for heading in [
+            format!("## {name}"),
+            format!("## [{name}] - 未定"),
+            format!("##   {}  ", name.to_uppercase()),
+        ] {
+            assert!(parse(&heading).sections[0].is_unreleased(), "{heading}");
+        }
+    }
+    // 英語だけ、角括弧なしで先頭の語に一致する（従来の動作）。
+    assert!(parse("## Unreleased - 2026-01-01").sections[0].is_unreleased());
+    for heading in [
+        "## 未リリース - 1.0.0",
+        "## 未リリース-1.0.0",
+        "## 未リリース 1.0.0",
+        "## [未リリース 1.0.0]",
+        "## 未リリース機能",
+        "## [未リリース機能]",
+        "## Sin publicar 1.0.0",
+        "## 1.0.0",
+    ] {
+        assert!(!parse(heading).sections[0].is_unreleased(), "{heading}");
+    }
+}
+
+#[test]
+fn appending_to_a_japanese_unreleased_section_passes() {
+    let after = JA.replace("- 新機能 A\n", "- 新機能 A\n- 新機能 B\n");
+    assert_eq!(released_entries_error(Some(JA), Some(&after), &[]), None);
+    // リンク定義のラベルも同じ判定（未リリースのリンクは変えてよい）。
+    let after = JA.replace("v1.0.0...HEAD", "v1.1.0...HEAD");
+    assert_eq!(released_entries_error(Some(JA), Some(&after), &[]), None);
+    // 未リリースを保ったまま、範囲内のタグに対応する版の節を足せる。
+    let promoted = JA.replace(
+        "## [1.0.0]",
+        "## [1.1.0] - 2026-02-01\n\n- 新機能 A\n\n## [1.0.0]",
+    ) + "[1.1.0]: https://example.invalid/releases/v1.1.0\n";
+    assert_eq!(
+        released_entries_error(Some(JA), Some(&promoted), &v(&["v1.1.0"])),
+        None
+    );
+    // 範囲外の版の節は却下。
+    assert!(released_entries_error(Some(JA), Some(&promoted), &[]).is_some());
+}
+
+#[test]
+fn localized_unreleased_does_not_open_loopholes() {
+    let check = |after: &str| released_entries_error(Some(JA), Some(after), &v(&["v1.1.0"]));
+    // リリース済み節の変更。
+    assert!(check(&JA.replace("- 初版", "- 初版!")).is_some());
+    // リリース済み節を未リリースの見出しへ改名して内容も変える。
+    assert!(
+        check(&JA.replace("## [1.0.0] - 2026-01-01\n\n- 初版", "## 未公開\n\n- 改ざん")).is_some()
+    );
+    // 版付き・部分一致の見出しは未リリースとして増やせない。
+    let added = JA.replace("## [1.0.0]", "## [未リリース 9.9.9]\n\n- x\n\n## [1.0.0]");
+    assert!(check(&added).is_some());
+    let added = JA.replace("## [1.0.0]", "## 未リリース機能\n\n- x\n\n## [1.0.0]");
+    assert!(check(&added).is_some());
+    // 版付きのラベルのリンク定義はリリース済み扱い（変更を却下）。
+    let before = format!("{JA}[未リリース 1.0.0]: https://example.invalid/a\n");
+    let after = before.replace("invalid/a", "invalid/b");
+    assert!(released_entries_error(Some(&before), Some(&after), &[]).is_some());
+    // 編集前に同名の未リリース節が無いラベル（一覧にある [未公開]）は、通常のリンクとして不変を検査する。
+    let before = format!("{JA}[未公開]: https://example.invalid/a\n");
+    let after = before.replace("invalid/a", "invalid/b");
+    assert!(released_entries_error(Some(&before), Some(&after), &[]).is_some());
+    // 編集後にだけ未公開節がある場合も、編集前に無い節のラベルは除外しない（既存定義の差し替えを却下）。
+    let after = before
+        .replace("invalid/a", "invalid/b")
+        .replace("## [1.0.0]", "## 未公開\n\n- x\n\n## [1.0.0]");
+    assert!(released_entries_error(Some(&before), Some(&after), &[]).is_some());
+    // 編集前に同名の節があれば除外される（[未公開] 節の文書でそのリンクは変えてよい）。
+    let before = JA
+        .replace("## 未リリース", "## 未公開")
+        .replace("[未リリース]:", "[未公開]:");
+    let after = before.replace("v1.0.0...HEAD", "v1.1.0...HEAD");
+    assert_eq!(
+        released_entries_error(Some(&before), Some(&after), &[]),
+        None
+    );
+}
+
 #[test]
 fn any_change_to_released_sections_is_detected() {
     let check = |after: &str| released_entries_error(Some(KAC), Some(after), &v(&["v1.1.0"]));
