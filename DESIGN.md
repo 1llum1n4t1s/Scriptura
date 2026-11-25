@@ -14,7 +14,7 @@
 
 hook の起動から、期限判定、worker、保守後検査、commit と push までの流れです。詳細は [docs/design/data-flow.md](docs/design/data-flow.md) を参照してください。
 
-worker が期限切れになったときの復元と再試行は [docs/design/workflow.md](docs/design/workflow.md) を参照してください。
+worker の期限切れ・中断時の復元と再試行、実行中に HEAD が動いたときの扱いは [docs/design/workflow.md](docs/design/workflow.md) を参照してください。
 
 ## 重要な不変条件
 

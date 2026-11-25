@@ -8,6 +8,6 @@
 - 文書の種類は組み込みの `AGENTS.md` / `DESIGN.md` / `README.md` / `CHANGELOG.md` と、`[kinds.<id>]` のカスタム種類（最大 20、固定パス・ASCII・文書拡張子のみ。id `new` は予約語）。**`CHANGELOG.md` とカスタム種類はオプトイン**（`documents` に挙げたときだけ動く）。組み込みの `paths` / `guidance` は拒否する。カスタムのパスは、組み込みの対象・`AGENTS.override.md`・`.gitignore`・機密パターン・`exclude`・種類間の重複を拒否する。
 - **種類の検査は権限モードに関係なく Rust が行う**。上限・`required_headings`・AGENTS の 30,000 バイト未満の違反は、違反だけを直す再実行（最大 2 回。AGENTS の超過は階層の合計も対象で最大 3 回、縮まなければ打ち切る）のあと分類する。上限・見出し（ソフト）は警告つきで commit・push、AGENTS の 30,000 バイト・CHANGELOG のリリース済みエントリ不変（ハード）は worker の出力を破棄して完了にし位置を進める（`discard_outputs`）。階層の大きさは、commit に入る文書は作業ツリー・ほかは HEAD で数え、破棄したときは削るファイルとバイト数を通知する。分割先 `split_dir` は `kinds::split_candidates` が許可パスへ入れる（詳細は DESIGN.md）。
 - **CHANGELOG の契約**: worker が編集してよいのは `Unreleased` 節だけで、リリース済み節は変えない。未リリース節の判定・版の節への移動・履歴の渡し方は [section-01.md](section-01.md)。
-- **タイミングと worker の期限切れ**: 保守の起動・再試行・書きかけの復元の契約は [workflow.md](workflow.md)。
+- **タイミングと worker の期限切れ**: 保守の起動・再試行は [workflow.md](workflow.md)、書きかけの復元は [troubleshooting.md](troubleshooting.md)。
 - **保守履歴**: worker を起動した保守と失敗した回（hook・run-now）を、`poll_repository_with` が戻った後に 1 回 `maintenance_runs` へ書く（`runlog::record`。ベストエフォート）。起動も試行もしなかった回・`complete_recovery`・送信済み検知は記録しない。本文・差分は持たない。上限は DESIGN.md。
 - `ops::restore` は、有効な登録が増える・有効に変わる版を拒否し、停止中の登録が増える場合は保存前に起点を記録する。
