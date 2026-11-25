@@ -5,6 +5,9 @@
 // `--tray` を付けると、タスクトレイ（Windows）・メニューバー（macOS）に常駐する（`tray`）。常駐は無操作で
 // 終了せず、セッションも失効させない（開いたままのタブのログインが切れない）。アイコンの「開く」のたびに使い捨て鍵を発行し直す。
 // 更新のインストールで常駐が再起動するときは、`handoff` の引き継ぎ鍵（ハッシュだけをファイルに置く）で新しい版へ自動で入り直す。
+// 常駐でポートの引数が 0 でないときは、さらに `sessions` が、ログインを再起動・PC の再起動・ブラウザーの終了をまたいで保つ
+// （専用の Cookie `scriptura_resident_<port>`（400 日）のトークンの SHA-256 だけを状態フォルダーへ最大 16 件置き、CSRF はトークンから導く。
+// ピン止めしたタブのため）。通常起動は従来どおりプロセスごとのログイン（Max-Age なし）。
 //
 // 設計上の要点:
 // - hook の経路とは独立。hook は画面の有無を一切見ない。画面が触るのは設定ファイル（ops 経由の書き込み）、
@@ -41,12 +44,14 @@ mod handoff;
 pub mod locale;
 pub mod models;
 mod read;
+mod sessions;
 #[cfg(any(windows, target_os = "macos"))]
 mod tray;
 mod views;
 
 pub use confirm::{dangers, line_diff};
 pub use guard::{SESSION_COOKIE, session_cookie_name};
+pub use sessions::resident_cookie_name;
 
 /// 既定のポート（Skilvella の 7465 と重ならない値）。
 pub const DEFAULT_PORT: u16 = 7468;
@@ -69,14 +74,19 @@ pub struct Inner {
     pub(crate) hosts: [String; 2],
     /// 受け付ける Origin（`http://` + hosts）。
     pub(crate) origins: [String; 2],
-    /// セッション Cookie の値と CSRF トークン。常駐しない起動では起動から終了まで同じ値。常駐（`--tray`）でも同じ値で、
-    /// プロセスが終わるまで失効しない。
+    /// セッション Cookie の値と CSRF トークン。保存しない起動（通常起動・`--port 0` の常駐）では、起動から終了までの
+    /// プロセスごとの値で、失効しない。ログインを保存する常駐（`sessions`）では使わない（Cookie と CSRF は一覧と提示された値から決まる）。
     creds: Mutex<Creds>,
     /// 使い捨て鍵。一度交換したら None になり、二度目は無効。常駐ではトレイの「開く」のたびに置き換える。
     auth_key: Mutex<Option<AuthKey>>,
     /// 更新のインストールの後、新しい版が起動時に引き継ぐ鍵（ハッシュだけ）。`auth_key` とは別の枠で、
     /// トレイの「開く」が発行する鍵と互いに無効化しない。一度交換したら None。
     handoff: Mutex<Option<Handoff>>,
+    /// 常駐でログインを保存する設定のときの、有効なセッションの一覧（None は保存しない通常のログイン）。
+    /// 読み・追加・ファイルへの書き込みはこの 1 つの Mutex の下で行う。
+    sessions: Mutex<Option<sessions::Sessions>>,
+    /// このプロセスの識別子（起動ごとの乱数。秘密ではない。認証済みの応答ヘッダーで返し、ページが再起動を検知する）。
+    instance: String,
     /// 二段階確認の nonce（nonce → 結び付けた内容の SHA-256 と期限）。
     pub(crate) nonces: Mutex<HashMap<String, confirm::Pending>>,
     /// run-now のバックグラウンドジョブ。
@@ -150,6 +160,8 @@ impl AppState {
                 expires: None,
             })),
             handoff: Mutex::new(None),
+            sessions: Mutex::new(None),
+            instance: guard::random_token(),
             nonces: Mutex::new(HashMap::new()),
             jobs: Mutex::new(handlers::Jobs::default()),
             last_activity: Mutex::new(Instant::now()),
@@ -185,6 +197,68 @@ impl AppState {
             .unwrap_or_else(|p| p.into_inner())
             .session
             .clone()
+    }
+
+    /// 常駐のログインの保存を有効にする（`run_resident` が、サーバーを起動する前に、引数のポートが 0 でないときだけ呼ぶ）。
+    /// 状態フォルダーの `ui-sessions-<port>.json` を読む（壊れていれば「保存なし」。書き換えない）。
+    /// 常駐でない・ポートが 0 なら何もしない。
+    pub fn adopt_sessions(&self) {
+        if !self.is_resident() || self.port() == 0 {
+            return;
+        }
+        *self.sessions.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(sessions::Sessions::load(&self.store.state_dir, self.port()));
+    }
+
+    /// このプロセスの識別子。
+    pub(crate) fn instance(&self) -> &str {
+        &self.instance
+    }
+
+    /// 要求のログインを照合する。保存する設定では、同名の Cookie のどれかが一覧と一致すればよい。
+    pub(crate) fn authenticate(&self, headers: &axum::http::HeaderMap) -> Option<guard::Login> {
+        let slot = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(list) = slot.as_ref() {
+            let name = sessions::resident_cookie_name(self.port());
+            return guard::cookie_values(headers, &name)
+                .into_iter()
+                .find(|v| list.contains(v))
+                .map(|token| guard::Login {
+                    csrf: sessions::csrf_for(token),
+                    token: Some(token.to_string()),
+                });
+        }
+        drop(slot);
+        let session = self.session();
+        let name = guard::session_cookie_name(self.port());
+        guard::cookie_values(headers, &name)
+            .into_iter()
+            .any(|v| guard::same(v, &session))
+            .then(|| guard::Login {
+                csrf: self.csrf(),
+                token: None,
+            })
+    }
+
+    /// `/auth` 成功時の Set-Cookie の値。保存する設定では、既に有効なセッションの Cookie を持つ要求はそれを継続し
+    /// （増やさない）、無ければ新しいトークンを発行して一覧へ足す（読み・追加・書きは 1 つの Mutex の下）。
+    pub(crate) fn login_cookie(&self, headers: &axum::http::HeaderMap) -> String {
+        let mut slot = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(list) = slot.as_mut() else {
+            drop(slot);
+            return format!(
+                "{}={}; HttpOnly; SameSite=Strict; Path=/",
+                guard::session_cookie_name(self.port()),
+                self.session()
+            );
+        };
+        let name = sessions::resident_cookie_name(self.port());
+        let existing = guard::cookie_values(headers, &name)
+            .into_iter()
+            .find(|v| list.contains(v))
+            .map(str::to_string);
+        let token = existing.unwrap_or_else(|| list.issue());
+        sessions::cookie_header(self.port(), &token)
     }
 
     /// 今の CSRF トークン。
@@ -645,6 +719,10 @@ fn run_resident(runtime: tokio::runtime::Runtime, args: Args) -> i32 {
     let (state, key) = AppState::new(Store::current(), port);
     state.set_resident();
     state.adopt_handoff();
+    // `--port 0`（実ポートが毎回変わる）ではログインを保存しない。
+    if args.port != 0 {
+        state.adopt_sessions();
+    }
     announce(port, &key, args.open, true);
     let stopped = Arc::new(AtomicBool::new(false));
     let guard = StopOnDrop(stopped.clone());

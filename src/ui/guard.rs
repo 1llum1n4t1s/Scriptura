@@ -4,20 +4,23 @@
 // 1. Host は `127.0.0.1:<port>` か `localhost:<port>` だけ（DNS rebinding 対策）→ 違えば 403。
 // 2. Origin があれば同一オリジンだけ → 違えば 403。POST は「同一オリジンの Origin」か
 //    `Sec-Fetch-Site: same-origin` のどちらかを必須にする（Skilvella より厳しく）→ 無ければ 403。
-// 3. `/auth` と `/assets/*` 以外はセッション Cookie が必須 → 無い・違えば 401。
+// 3. `/auth` と `/assets/*` 以外はセッション Cookie が必須 → 無い・違えば 401。ログインを保存する常駐では、
+//    Cookie（`scriptura_resident_<port>`）の SHA-256 を保存した一覧と定数時間で照合し、認証済みの GET（`/activity` を除く）の
+//    応答へ同じトークンの Set-Cookie を付け直す（期限の延長。ほかの Set-Cookie は潰さない）。
 // 4. POST は本文を上限つきで読み、`csrf` を定数時間比較 → 違えば 403。解析済みのフォームを
-//    extensions に入れてハンドラへ渡す（ハンドラは本文を読み直さない）。
+//    extensions に入れてハンドラへ渡す（ハンドラは本文を読み直さない）。比較する値と画面へ埋め込む値は、要求ごとの
+//    CSRF（保存する常駐ではセッショントークンから導く）で、task-local で画面へ渡す。
 //
 // 応答ヘッダー（CSP など）は `security_headers` が最外層で付けるので、401・403・404 にも付く。
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{HeaderValue, Method, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 
-use super::{AppState, views};
+use super::{AppState, sessions, views};
 
 /// セッション Cookie の名前。
 /// セッション Cookie 名の接頭辞。Cookie はポートで分けられないため、名前にポートを含めて、同じ 127.0.0.1 の
@@ -154,23 +157,16 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
     // 3. セッション Cookie（`/auth` と同梱の静的ファイル 3 つだけ免除。完全一致で判定する）。
     //    前方一致にすると、存在しない `/assets/x` が 404 画面（CSRF トークンを含む枠）を
     //    Cookie なしで返してしまうため。
-    let path = req.uri().path();
+    let path = req.uri().path().to_string();
     let public = matches!(
-        path,
+        path.as_str(),
         "/auth" | "/assets/app.css" | "/assets/app.js" | "/assets/icon.png"
     );
+    // 認証済みの要求のログイン（常駐で保存が有効なら、提示されたトークンと、そこから導いた CSRF トークン）。
+    let mut login = None;
     if !public {
-        let session = state.session();
-        let cookie_name = session_cookie_name(state.port());
-        let has_session = req
-            .headers()
-            .get_all(header::COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(';'))
-            .filter_map(|pair| pair.trim().split_once('='))
-            .any(|(name, value)| name == cookie_name && same(value, &session));
-        if !has_session {
+        login = state.authenticate(req.headers());
+        if login.is_none() {
             // 常駐中はコンソールに表示した URL が無いので、トレイのアイコンから開き直す案内にする。
             let message = if state.is_resident() {
                 crate::t!("ui.deny.login_resident")
@@ -189,8 +185,17 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
             state.touch();
         }
     }
+    // この要求の CSRF トークン（常駐で保存が有効なら提示されたトークンから導いた値。それ以外はプロセスの値）。
+    let csrf = login
+        .as_ref()
+        .map_or_else(|| state.csrf(), |l| l.csrf.clone());
+    // Cookie の期限の延長: 認証済みの GET（`/activity` の自動更新を除く）の応答へ、同じトークンを付け直す。
+    let authed = login.is_some();
+    let renew = (req.method() == Method::GET && path != "/activity")
+        .then(|| login.and_then(|l| l.token))
+        .flatten();
     // 4. CSRF（全 POST）。本文を上限つきで読み、解析結果を extensions へ渡す。
-    if is_post {
+    let mut response = if is_post {
         let (mut parts, body) = req.into_parts();
         let bytes = match axum::body::to_bytes(body, BODY_LIMIT).await {
             Ok(b) => b,
@@ -203,7 +208,7 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
             }
         };
         let form = FormData::parse(&bytes);
-        if !form.get("csrf").is_some_and(|t| same(t, &state.csrf())) {
+        if !form.get("csrf").is_some_and(|t| same(t, &csrf)) {
             return deny(
                 StatusCode::FORBIDDEN,
                 crate::t!("ui.deny.title"),
@@ -211,9 +216,71 @@ pub async fn guard(State(state): State<AppState>, req: Request, next: Next) -> R
             );
         }
         parts.extensions.insert(form);
-        return next.run(Request::from_parts(parts, Body::empty())).await;
+        CSRF.scope(csrf, next.run(Request::from_parts(parts, Body::empty())))
+            .await
+    } else {
+        CSRF.scope(csrf, next.run(req)).await
+    };
+    if let Some(token) = renew
+        && let Ok(cookie) = HeaderValue::from_str(&sessions::cookie_header(state.port(), &token))
+    {
+        // ハンドラが付けた別の Set-Cookie（言語など）を潰さない。
+        response.headers_mut().append(header::SET_COOKIE, cookie);
     }
-    next.run(req).await
+    // 認証済みの応答だけに、このプロセスの識別子を付ける（ページが再起動を検知するため。秘密ではなく、
+    // セッション・CSRF とは無関係の起動ごとの乱数。未認証の応答には付けない）。
+    if authed && let Ok(id) = HeaderValue::from_str(state.instance()) {
+        response.headers_mut().insert(INSTANCE_HEADER, id);
+    }
+    response
+}
+
+/// 認証済みの応答に付けるプロセス識別子のヘッダー名。
+pub(crate) const INSTANCE_HEADER: &str = "x-scriptura-instance";
+
+tokio::task_local! {
+    /// 要求 1 件の CSRF トークン（画面のフォームへ埋め込む値）。
+    static CSRF: String;
+}
+
+/// 現在の要求の CSRF トークン。要求の外（テスト・起動処理）ではプロセスの値。
+pub(crate) fn request_csrf(state: &AppState) -> String {
+    CSRF.try_with(String::clone)
+        .unwrap_or_else(|_| state.csrf())
+}
+
+/// 要求の CSRF トークンを同期の処理へ引き継ぐ（spawn_blocking へは task-local が渡らないため）。
+pub(crate) fn scoped_csrf<R>(value: Option<String>, f: impl FnOnce() -> R) -> R {
+    match value {
+        Some(v) => CSRF.sync_scope(v, f),
+        None => f(),
+    }
+}
+
+/// 呼び出し時点の要求の CSRF トークン（要求の外では None）。
+pub(crate) fn captured_csrf() -> Option<String> {
+    CSRF.try_with(String::clone).ok()
+}
+
+/// ヘッダーの Cookie のうち、名前が `name` のものの値すべて。
+pub(crate) fn cookie_values<'a>(headers: &'a HeaderMap, name: &'a str) -> Vec<&'a str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .filter(|(n, _)| *n == name)
+        .map(|(_, v)| v)
+        .collect()
+}
+
+/// 認証済みの要求のログイン。
+pub(crate) struct Login {
+    /// この要求の CSRF トークン。
+    pub csrf: String,
+    /// 常駐で保存が有効なときに提示されたセッショントークン（Cookie の付け直しに使う）。
+    pub token: Option<String>,
 }
 
 /// 応答ヘッダー。インラインの script・style は CSP で禁止する

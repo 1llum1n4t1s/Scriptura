@@ -4001,3 +4001,428 @@ async fn activity_fragment_marks_the_latest_run_so_the_page_can_refresh_history(
     let fourth = latest(&fx.get("/activity").await.body);
     assert_ne!(third, fourth, "試行の増加で変わる");
 }
+
+// ---------------------------------------------------------------------------
+// 常駐のログインの保存（`ui-sessions-<port>.json`）
+// ---------------------------------------------------------------------------
+
+fn sessions_file(fx: &Fx) -> PathBuf {
+    fx.store.state_dir.join("ui-sessions-7468.json")
+}
+
+/// `name=value; ...` の組の値（トークン）。
+fn cookie_token(cookie: &str) -> String {
+    cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .split_once('=')
+        .unwrap()
+        .1
+        .to_string()
+}
+
+fn set_cookies(r: &Resp) -> Vec<String> {
+    r.headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect()
+}
+
+/// 常駐でログインを保存する状態（再起動を表すときは、同じ状態フォルダーで作り直す）。画面を `fx` へ差し替える。
+fn persistent_state(fx: &mut Fx) -> (AppState, String) {
+    let (state, key) = AppState::new(fx.store.clone(), PORT);
+    state.set_resident();
+    state.adopt_sessions();
+    fx.app = ui::router(state.clone());
+    (state, key)
+}
+
+/// `/auth` を（任意の Cookie つきで）呼ぶ。
+async fn auth_with(fx: &Fx, key: &str, cookie: Option<&str>) -> Resp {
+    let mut req = get(&format!("/auth?key={key}"));
+    if let Some(c) = cookie {
+        req.headers_mut().insert(header::COOKIE, c.parse().unwrap());
+    }
+    fx.raw(req).await
+}
+
+fn csrf_values(body: &str) -> Vec<String> {
+    Regex::new(r#"name="csrf" value="([^"]*)""#)
+        .unwrap()
+        .captures_iter(body)
+        .map(|c| c[1].to_string())
+        .collect()
+}
+
+fn derived_csrf(token: &str) -> String {
+    key_digest(&format!("scriptura-csrf\0{token}"))
+}
+
+fn stored_hashes(fx: &Fx) -> Vec<String> {
+    let v: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(sessions_file(fx)).unwrap()).unwrap();
+    v["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h.as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resident_login_survives_a_restart_with_the_same_cookie_and_csrf() {
+    let mut fx = Fx::new().await;
+    fs::create_dir_all(&fx.store.state_dir).unwrap();
+    let (_state, key) = persistent_state(&mut fx);
+    let r = auth_with(&fx, &key, None).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    let cookies = set_cookies(&r);
+    assert_eq!(cookies.len(), 1);
+    let token = cookie_token(&cookies[0]);
+    assert_eq!(token.len(), 64);
+    assert_eq!(
+        cookies[0],
+        format!(
+            "scriptura_resident_7468={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=34560000"
+        )
+    );
+    assert_eq!(ui::resident_cookie_name(PORT), "scriptura_resident_7468");
+    let cookie = format!("scriptura_resident_7468={token}");
+    fx.cookie = cookie.clone();
+    let page = fx.get("/").await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    let csrf = derived_csrf(&token);
+    assert!(!csrf_values(&page.body).is_empty());
+    assert!(csrf_values(&page.body).iter().all(|c| *c == csrf));
+    fx.csrf = csrf.clone();
+    // 画面の POST が通る。
+    assert_eq!(
+        fx.post("/language", &[("language", "ja")]).await.status,
+        StatusCode::SEE_OTHER
+    );
+
+    // ファイルにはハッシュだけ（生のトークン・CSRF は載らない）。
+    let text = fs::read_to_string(sessions_file(&fx)).unwrap();
+    assert!(!text.contains(&token) && !text.contains(&csrf), "{text}");
+    assert_eq!(stored_hashes(&fx), vec![key_digest(&token)]);
+
+    // 再起動（同じ状態フォルダーで作り直す）: 同じ Cookie の GET が 200、再起動前のページの csrf の POST も通る。
+    let (_state, _key) = persistent_state(&mut fx);
+    let again = fx.get("/").await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.body);
+    assert!(csrf_values(&again.body).iter().all(|c| *c == csrf));
+    assert_eq!(
+        fx.post("/language", &[("language", "en")]).await.status,
+        StatusCode::SEE_OTHER
+    );
+
+    // 別の Cookie は拒否される。別セッションの csrf も拒否される。
+    let mut req = get("/");
+    req.headers_mut().insert(
+        header::COOKIE,
+        format!("scriptura_resident_7468={}", "0".repeat(64))
+            .parse()
+            .unwrap(),
+    );
+    assert_eq!(fx.raw(req).await.status, StatusCode::UNAUTHORIZED);
+    let (state, _) = persistent_state(&mut fx);
+    let second = auth_with(&fx, &state.issue_key(), None).await;
+    let token2 = cookie_token(&set_cookies(&second)[0]);
+    assert_ne!(token2, token);
+    assert_eq!(stored_hashes(&fx).len(), 2);
+    let req = Request::post("/language")
+        .header(header::HOST, HOST)
+        .header(header::ORIGIN, ORIGIN)
+        .header(header::COOKIE, &cookie)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(format!(
+            "csrf={}&language=ja",
+            derived_csrf(&token2)
+        )))
+        .unwrap();
+    assert_eq!(fx.raw(req).await.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resident_cookie_is_renewed_on_screens_but_not_on_activity_or_posts() {
+    let mut fx = Fx::new().await;
+    fs::create_dir_all(&fx.store.state_dir).unwrap();
+    let (_state, key) = persistent_state(&mut fx);
+    let token = cookie_token(&set_cookies(&auth_with(&fx, &key, None).await)[0]);
+    fx.cookie = format!("scriptura_resident_7468={token}");
+    fx.csrf = derived_csrf(&token);
+    let before = fs::read(sessions_file(&fx)).unwrap();
+    let renewed = format!(
+        "scriptura_resident_7468={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=34560000"
+    );
+    for path in ["/", "/repos", "/settings/app", "/missing"] {
+        let r = fx.get(path).await;
+        assert_eq!(set_cookies(&r), vec![renewed.clone()], "{path}");
+    }
+    // 概要の自動更新は付け直さない。GET はファイルを書かない。
+    assert!(set_cookies(&fx.get("/activity").await).is_empty());
+    assert_eq!(fs::read(sessions_file(&fx)).unwrap(), before);
+    // 言語の Cookie と併存する（言語の選択の応答は言語の Cookie だけ。付け直しは GET だけ）。
+    let post = fx.post("/language", &[("language", "ja")]).await;
+    let cookies = set_cookies(&post);
+    assert_eq!(cookies.len(), 1);
+    assert!(
+        cookies[0].starts_with("scriptura-language-7468=ja"),
+        "{cookies:?}"
+    );
+    fx.cookie = format!("{}; scriptura-language-7468=en", fx.cookie);
+    let page = fx.get("/").await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(page.body.contains("lang=\"en\""), "{}", page.body);
+    assert_eq!(set_cookies(&page), vec![renewed]);
+    // 同名の Cookie が複数あっても、どれかが一致すればよい。
+    fx.cookie = format!(
+        "scriptura_resident_7468={}; scriptura_resident_7468={token}",
+        "1".repeat(64)
+    );
+    assert_eq!(fx.get("/").await.status, StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_screen_embeds_the_csrf_of_its_own_request() {
+    let mut fx = Fx::new().await;
+    fs::create_dir_all(&fx.store.state_dir).unwrap();
+    let (state, key) = persistent_state(&mut fx);
+    let token_a = cookie_token(&set_cookies(&auth_with(&fx, &key, None).await)[0]);
+    let token_b = cookie_token(&set_cookies(&auth_with(&fx, &state.issue_key(), None).await)[0]);
+    for token in [&token_a, &token_b] {
+        fx.cookie = format!("scriptura_resident_7468={token}");
+        fx.csrf = derived_csrf(token);
+        for path in [
+            "/",
+            "/repos",
+            "/settings/documents",
+            "/settings/documents/new",
+            "/settings/worker",
+            "/settings/app",
+            "/settings/history",
+            "/history",
+            "/doctor",
+            "/no-such-page",
+        ] {
+            let r = fx.get(path).await;
+            let found = csrf_values(&r.body);
+            assert!(!found.is_empty(), "{path}");
+            assert!(found.iter().all(|c| *c == fx.csrf), "{path}: {found:?}");
+        }
+    }
+    // 二段階確認の画面（spawn_blocking をまたぐ経路を含む）と、確認後の保存も同じ値で通る。
+    let repo = fx.repo.clone();
+    fx.enable(&repo).await;
+    let rev = fx.revision();
+    let r = fx
+        .post(
+            "/repos/enable",
+            &[("revision", rev.as_str()), ("repo", "/no/such/repo")],
+        )
+        .await;
+    let found = csrf_values(&r.body);
+    assert!(
+        !found.is_empty() && found.iter().all(|c| *c == fx.csrf),
+        "{}",
+        r.body
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_existing_valid_cookie_is_continued_and_the_list_is_capped_at_sixteen() {
+    let mut fx = Fx::new().await;
+    fs::create_dir_all(&fx.store.state_dir).unwrap();
+    let (state, key) = persistent_state(&mut fx);
+    let first = set_cookies(&auth_with(&fx, &key, None).await)[0].clone();
+    let token = cookie_token(&first);
+    let cookie = format!("scriptura_resident_7468={token}");
+    // 有効な Cookie を持つ /auth は、同じトークンを継続して、増やさない。
+    let again = auth_with(&fx, &state.issue_key(), Some(&cookie)).await;
+    assert_eq!(set_cookies(&again), vec![first]);
+    assert_eq!(stored_hashes(&fx).len(), 1);
+    // 無効な Cookie を持つ /auth は、新しく発行する。
+    let stale = format!("scriptura_resident_7468={}", "2".repeat(64));
+    auth_with(&fx, &state.issue_key(), Some(&stale)).await;
+    assert_eq!(stored_hashes(&fx).len(), 2);
+    // 上限 16 件。超えたら最も古いものから捨てる。
+    for _ in 0..20 {
+        auth_with(&fx, &state.issue_key(), None).await;
+    }
+    let hashes = stored_hashes(&fx);
+    assert_eq!(hashes.len(), 16);
+    assert!(!hashes.contains(&key_digest(&token)));
+    fx.cookie = cookie;
+    assert_eq!(fx.get("/").await.status, StatusCode::UNAUTHORIZED);
+    // 再起動しても 16 件のまま読める。
+    let (_state, _key) = persistent_state(&mut fx);
+    assert_eq!(stored_hashes(&fx), hashes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_session_files_count_as_none_are_not_rewritten_at_startup_and_are_remade_on_login()
+{
+    let mut fx = Fx::new().await;
+    fs::create_dir_all(&fx.store.state_dir).unwrap();
+    let hash = key_digest("x");
+    let valid = |port: u16, hashes: &[String]| {
+        serde_json::json!({"port": port, "sessions": hashes}).to_string()
+    };
+    let token = "3".repeat(64);
+    let good = key_digest(&token);
+    let bad_files = [
+        "not json".to_string(),
+        valid(7469, std::slice::from_ref(&good)),
+        valid(PORT, &[good.to_uppercase()]),
+        valid(PORT, &["abc".to_string()]),
+        valid(PORT, &vec![good.clone(); 17]),
+        format!(r#"{{"port":{PORT},"sessions":["{good}"],"extra":1}}"#),
+        format!(r#"{{"port":{PORT},"sessions":["{}"]}}"#, "a".repeat(5000)),
+    ];
+    assert_ne!(hash, good);
+    for text in bad_files {
+        fs::write(sessions_file(&fx), &text).unwrap();
+        let (state, _key) = persistent_state(&mut fx);
+        fx.cookie = format!("scriptura_resident_7468={token}");
+        assert_eq!(fx.get("/").await.status, StatusCode::UNAUTHORIZED, "{text}");
+        assert_eq!(fs::read_to_string(sessions_file(&fx)).unwrap(), text);
+        // 次のログインで作り直す。
+        let r = auth_with(&fx, &state.issue_key(), None).await;
+        let new = cookie_token(&set_cookies(&r)[0]);
+        assert_eq!(stored_hashes(&fx), vec![key_digest(&new)], "{text}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sessions_are_not_stored_without_a_state_folder_and_the_login_still_works_in_memory() {
+    let mut fx = Fx::new().await;
+    assert!(!fx.store.state_dir.exists());
+    let (_state, key) = persistent_state(&mut fx);
+    let r = auth_with(&fx, &key, None).await;
+    let token = cookie_token(&set_cookies(&r)[0]);
+    fx.cookie = format!("scriptura_resident_7468={token}");
+    assert_eq!(fx.get("/").await.status, StatusCode::OK);
+    assert!(!fx.store.state_dir.exists(), "状態フォルダーを作らない");
+    // 保存されていないので、再起動すると失効する。
+    let (_state, _key) = persistent_state(&mut fx);
+    assert_eq!(fx.get("/").await.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_and_unsaved_resident_starts_keep_the_per_process_login() {
+    let mut fx = Fx::new().await;
+    fs::create_dir_all(&fx.store.state_dir).unwrap();
+    // 通常起動（`Fx::new` のログイン）: 従来の名前で、Max-Age なし、付け直しなし、ファイルなし。
+    assert!(fx.cookie.starts_with("scriptura_session_7468="));
+    let page = fx.get("/").await;
+    assert!(set_cookies(&page).is_empty());
+    assert!(!sessions_file(&fx).exists());
+    let (state, key) = AppState::new(fx.store.clone(), PORT);
+    fx.app = ui::router(state.clone());
+    let r = auth_with(&fx, &key, None).await;
+    let cookie = set_cookies(&r)[0].clone();
+    assert!(!cookie.contains("Max-Age"), "{cookie}");
+    assert!(cookie.starts_with("scriptura_session_7468="));
+    // 常駐でも `adopt_sessions` を呼ばなければ（`--port 0` の起動）従来どおり。
+    let (state, key) = AppState::new(fx.store.clone(), PORT);
+    state.set_resident();
+    fx.app = ui::router(state.clone());
+    let cookie = set_cookies(&auth_with(&fx, &key, None).await)[0].clone();
+    assert!(!cookie.contains("Max-Age"), "{cookie}");
+    assert!(cookie.starts_with("scriptura_session_7468="));
+    // 常駐でなければ `adopt_sessions` は何もしない。
+    let (state, key) = AppState::new(fx.store.clone(), PORT);
+    state.adopt_sessions();
+    fx.app = ui::router(state.clone());
+    let cookie = set_cookies(&auth_with(&fx, &key, None).await)[0].clone();
+    assert!(cookie.starts_with("scriptura_session_7468="));
+    assert!(!sessions_file(&fx).exists());
+    // 保存する常駐は、通常起動の Cookie を受け付けない（名前が違う）。
+    let (_state, _key) = persistent_state(&mut fx);
+    fx.cookie = cookie.split(';').next().unwrap().to_string();
+    assert_eq!(fx.get("/").await.status, StatusCode::UNAUTHORIZED);
+}
+
+fn instance_of(r: &Resp) -> Option<String> {
+    r.headers
+        .get("x-scriptura-instance")
+        .map(|v| v.to_str().unwrap().to_string())
+}
+
+/// 認証済みの応答だけがプロセスの識別子を返す（再起動で変わる）。未認証の応答には付かない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_responses_carry_a_per_process_instance_id() {
+    let mut fx = Fx::new().await;
+    fs::create_dir_all(&fx.store.state_dir).unwrap();
+    let (_state, key) = persistent_state(&mut fx);
+    let auth = auth_with(&fx, &key, None).await;
+    assert_eq!(instance_of(&auth), None, "/auth の応答には付けない");
+    let token = cookie_token(&set_cookies(&auth)[0]);
+    fx.cookie = format!("scriptura_resident_7468={token}");
+    fx.csrf = derived_csrf(&token);
+    let first = instance_of(&fx.get("/").await).expect("認証済みの GET");
+    assert_eq!(first.len(), 64);
+    assert!(first.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(!first.contains(&token) && first != fx.csrf);
+    assert_eq!(instance_of(&fx.get("/activity").await), Some(first.clone()));
+    assert_eq!(
+        instance_of(&fx.post("/language", &[("language", "ja")]).await),
+        Some(first.clone())
+    );
+    assert_eq!(instance_of(&fx.get("/assets/app.css").await), None);
+    let mut anon = get("/");
+    anon.headers_mut()
+        .insert(header::ACCEPT_LANGUAGE, "ja".parse().unwrap());
+    let denied = fx.raw(anon).await;
+    assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(instance_of(&denied), None);
+    // 再起動すると、同じ Cookie のまま識別子だけが変わる。
+    let (_state, _key) = persistent_state(&mut fx);
+    let page = fx.get("/").await;
+    assert_eq!(page.status, StatusCode::OK);
+    let second = instance_of(&page).unwrap();
+    assert_ne!(first, second);
+}
+
+/// 保存の読み取りが NotFound 以外で失敗したときは、その起動では保存を使わず（上書きせず）、メモリーだけで続ける。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_sessions_file_disables_saving_for_that_start() {
+    let mut fx = Fx::new().await;
+    fs::create_dir_all(&fx.store.state_dir).unwrap();
+    // ファイルの場所にフォルダーがある（読み取りは NotFound 以外のエラーになる）。
+    fs::create_dir(sessions_file(&fx)).unwrap();
+    let (_state, key) = persistent_state(&mut fx);
+    let r = auth_with(&fx, &key, None).await;
+    assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
+    fx.cookie = format!(
+        "scriptura_resident_7468={}",
+        cookie_token(&set_cookies(&r)[0])
+    );
+    assert_eq!(fx.get("/").await.status, StatusCode::OK);
+    assert!(sessions_file(&fx).is_dir(), "置き換えない");
+    let names: Vec<_> = fs::read_dir(&fx.store.state_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["ui-sessions-7468.json"], "一時ファイルも残さない");
+}
+
+/// 画面の JS の契約（実行はしない）: 401 の後の復帰で再読み込み・入力中は注記・再起動の識別子による検知。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_recovers_after_unauthorized_and_detects_restarts_by_instance_id() {
+    let fx = Fx::new().await;
+    let js = fx.get("/assets/app.js").await.body;
+    for needle in [
+        "location.reload()",
+        "wasUnauthorized",
+        "formsChanged",
+        "x-scriptura-instance",
+    ] {
+        assert!(js.contains(needle), "{needle}");
+    }
+    assert!(!js.contains("stopped = true"));
+    let page = fx.get("/").await;
+    assert!(page.body.contains("data-reload=\""), "{}", page.body);
+}

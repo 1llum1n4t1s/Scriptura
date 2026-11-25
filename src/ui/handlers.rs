@@ -26,7 +26,7 @@ use serde::Deserialize;
 use super::{
     AppState,
     confirm::{self, dangers},
-    guard::{FormData, session_cookie_name},
+    guard::{self, FormData},
     models, read,
     views::{self, *},
 };
@@ -53,7 +53,10 @@ where
     R: Send + 'static,
 {
     let language = crate::locale::current();
-    tokio::task::spawn_blocking(move || crate::locale::scoped(language, f))
+    let csrf = guard::captured_csrf();
+    tokio::task::spawn_blocking(move || {
+        guard::scoped_csrf(csrf, || crate::locale::scoped(language, f))
+    })
 }
 
 #[derive(Deserialize, Default)]
@@ -106,7 +109,7 @@ fn layout(
     Layout {
         title: title.into(),
         nav,
-        csrf: state.csrf(),
+        csrf: guard::request_csrf(state),
         flash: views::flash_text(msg),
         broken,
         resident: state.is_resident(),
@@ -414,7 +417,11 @@ fn auth_destination(next: Option<&str>) -> &'static str {
 }
 
 /// 使い捨て鍵をセッション Cookie に交換する。一度だけ有効（二度目は 401）。
-pub async fn auth(State(state): State<AppState>, Query(q): Query<AuthQuery>) -> Response {
+pub async fn auth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<AuthQuery>,
+) -> Response {
     let accepted = q
         .key
         .as_deref()
@@ -435,11 +442,7 @@ pub async fn auth(State(state): State<AppState>, Query(q): Query<AuthQuery>) -> 
     }
     state.touch();
     let mut response = Redirect::to(auth_destination(q.next.as_deref())).into_response();
-    if let Ok(cookie) = HeaderValue::from_str(&format!(
-        "{}={}; HttpOnly; SameSite=Strict; Path=/",
-        session_cookie_name(state.port()),
-        state.session()
-    )) {
+    if let Ok(cookie) = HeaderValue::from_str(&state.login_cookie(&headers)) {
         response.headers_mut().insert(header::SET_COOKIE, cookie);
     }
     response

@@ -3,7 +3,7 @@
 <div class="heading"><h1>{{ crate::locale::tr("ui.nav.overview") }}</h1>{% if repos.is_empty() %}<a class="button primary" href="/repos">{{ crate::locale::tr("ui.overview.register") }}</a>{% endif %}</div>
 {% for w in warnings %}<p class="notice warning">{{ w }}</p>
 {% endfor %}
-<section class="panel activity-panel" id="overview-activity" data-activity data-stale="{{ crate::locale::tr("ui.activity.stale") }}" data-expired="{{ crate::locale::tr("ui.activity.expired") }}">
+<section class="panel activity-panel" id="overview-activity" data-activity data-stale="{{ crate::locale::tr("ui.activity.stale") }}" data-expired="{{ crate::locale::tr("ui.activity.expired") }}" data-reload="{{ crate::locale::tr("ui.activity.reload") }}">
   <h2>{{ crate::locale::tr("ui.activity.title") }}</h2>
   {% include "ui/activity_body.html" %}
   <p class="note" role="status" data-activity-stale hidden></p>

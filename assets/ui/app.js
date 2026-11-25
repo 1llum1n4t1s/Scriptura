@@ -54,7 +54,6 @@
     const body = () => panel.querySelector("[data-activity-body]");
     let skew = 0; // サーバー時刻 - ブラウザー時刻（ミリ秒）
     let inflight = false;
-    let stopped = false;
     const pad = n => String(n).padStart(2, "0");
     // サーバーの `views::clock` と同じ形（1 時間以上は H:MM:SS、未満は M:SS）。
     const clock = total => {
@@ -167,15 +166,39 @@
         clearTimeout(timer);
       }
     };
+    // 画面の入力が、読み込み時の値から変わっているフォームがあるか（再読み込みで入力を失わないための判定）。
+    const formsChanged = () => {
+      for (const field of document.querySelectorAll("form input, form textarea, form select")) {
+        if (field.type === "hidden") continue;
+        if (field.tagName === "SELECT") {
+          if (Array.from(field.options).some(option => option.selected !== option.defaultSelected)) return true;
+        } else if (field.type === "checkbox" || field.type === "radio") {
+          if (field.checked !== field.defaultChecked) return true;
+        } else if (field.value !== field.defaultValue) {
+          return true;
+        }
+      }
+      return false;
+    };
+    let wasUnauthorized = false; // 401 を見た後、まだ成功していない。
+    let reloadNeeded = false; // 再読み込みしたいが、入力中のフォームがあるため注記だけを残している。
     const poll = async () => {
-      if (inflight || stopped || document.hidden) return;
+      if (inflight || document.hidden) return;
       inflight = true;
       try {
         applyBody(await load(false));
         if (runsPending && applyRuns(await load(true))) runsPending = false;
-        showNote("");
+        if (wasUnauthorized) {
+          // ログインが戻った。埋め込まれている CSRF トークンが古い可能性があるので、再読み込みする。
+          // 入力中のフォームがあるときは、入力を失わないよう再読み込みせず、注記だけを残す。
+          wasUnauthorized = false;
+          if (formsChanged()) reloadNeeded = true; else { location.reload(); return; }
+        }
+        showNote(reloadNeeded ? text("reload") : "");
       } catch (error) {
-        if (error && error.unauthorized) { stopped = true; showNote(text("expired")); } else showNote(text("stale"));
+        // 401 でも止めない（常駐の再起動の直後・別タブでのログインの後に、次の周期で復帰できるように）。
+        if (error && error.unauthorized) wasUnauthorized = true;
+        showNote(error && error.unauthorized ? text("expired") : text("stale"));
       } finally {
         inflight = false;
       }
@@ -212,6 +235,8 @@
           body: new URLSearchParams(new FormData(form)),
           signal: controller.signal,
         });
+        // 認証済みの応答が返すプロセスの識別子（再起動の検知の基準。インストールの応答の値を使う）。
+        instance = response.headers.get("x-scriptura-instance") || instance;
         const type = response.headers.get("content-type") || "";
         if (!response.ok || !type.includes("application/json")) throw new Error(String(response.status));
         return await response.json();
@@ -219,17 +244,23 @@
         clearTimeout(timer);
       }
     };
-    // 更新を適用して再起動すると、セッションの秘密が新しくなり古い Cookie は 401 になる。再起動を検知したら
-    // （サーバーが一度つながらなくなった後に応答した、または 401）、サーバーが返した引き継ぎ鍵（この変数だけに持ち、
-    // 保存しない）で /auth へ入り直す。旧サーバーがまだ 200 で応答している間は鍵を使わない。鍵が無い、または
-    // 最大 180 秒待っても再起動を検知できないときは、「トレイ（メニューバー）のアイコンから開き直してください」へ切り替える。
+    // 更新を適用して再起動すると、常駐のログインが保存されていても（Cookie は 401 にならない）新しいプロセスになる。
+    // 再起動の検知は、次のどれか: 401（保存されないログイン）、サーバーが一度つながらなくなった後に 200 で応答した、
+    // 認証済みの応答のプロセス識別子（`x-scriptura-instance`）がインストールの応答のときから変わった。検知したら、
+    // サーバーが返した引き継ぎ鍵（この変数だけに持ち、保存しない）で /auth へ入り直す。旧サーバーがまだ同じ識別子で
+    // 200 を返している間は鍵を使わない。鍵が無い、または最大 180 秒待っても再起動を検知できないときは、
+    // 「トレイ（メニューバー）のアイコンから開き直してください」へ切り替える。
+    let instance = "";
     const waitForRestart = async handoffKey => {
       let wasDown = false;
+      const baseline = instance;
       for (let i = 0; i < 90; i += 1) {
         await new Promise(resolve => setTimeout(resolve, 2000));
         try {
           const response = await fetch("/", { cache: "no-store", credentials: "same-origin" });
-          if (response.status === 401 || (response.status === 200 && wasDown)) {
+          const current = response.headers.get("x-scriptura-instance") || "";
+          const replaced = response.status === 200 && baseline !== "" && current !== "" && current !== baseline;
+          if (response.status === 401 || (response.status === 200 && wasDown) || replaced) {
             if (handoffKey) {
               location.replace(`/auth?key=${encodeURIComponent(handoffKey)}&next=updated`);
             } else {
