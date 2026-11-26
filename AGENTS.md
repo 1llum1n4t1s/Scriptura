@@ -20,14 +20,22 @@ Scriptura は、利用者が登録したリポジトリへの push 後に `AGENT
 
 次の詳細は、対象を変える前に該当ファイルを読みます。
 
-- モジュールの構成と責務（`src/`・`plugins/`・`xtask/`）: [docs/agents/modules-and-responsibilities.md](docs/agents/modules-and-responsibilities.md)
-- 設定の書き込み・schema・保守の検査・CHANGELOG・保守履歴: [docs/agents/settings-and-maintenance-contracts.md](docs/agents/settings-and-maintenance-contracts.md)
-- hook からの保守の起動・タイミング・worker の期限切れ: [docs/agents/workflow.md](docs/agents/workflow.md)
-- hook・Claude Code の `settings.json`・管理画面・プラグインのスキル: [docs/agents/hooks-settings-ui-and-plugin.md](docs/agents/hooks-settings-ui-and-plugin.md)
-- Setup 版（Velopack）の配信・自動更新・登録: [docs/agents/setup-installer-velopack.md](docs/agents/setup-installer-velopack.md)
-- Setup 版の検証の隔離: [docs/agents/testing.md](docs/agents/testing.md)
-- 配信 CI の起動・やり直し: [docs/agents/release-process.md](docs/agents/release-process.md)
-- 9 言語の表示とローカライズの決め方: [docs/agents/localization.md](docs/agents/localization.md)
+- モジュールの構成と責務（`src/`・`plugins/`・`xtask/`）: `docs/agents/modules-and-responsibilities.md`
+- 設定の書き込み・schema・保守の検査・CHANGELOG・保守履歴: `docs/agents/settings-and-maintenance-contracts.md`
+- 分割先（`split_dir`）の名前・新規作成の許可・案内の検査・違反の扱い: `docs/agents/split-dir-contract.md`
+- CHANGELOG の編集範囲・未リリース節・リリース済み節の不変: `docs/agents/changelog-contract.md`
+- hook からの保守の起動・タイミング・worker の期限切れ: `docs/agents/workflow.md`
+- 中断・期限切れからの復旧: `docs/agents/troubleshooting.md`
+- 実行中の保守の記録（`src/activity.rs`）: `docs/agents/data-model.md`
+- 管理画面の画面とルート: `docs/agents/api-reference.md`
+- 秘密値と管理画面の保護: `docs/agents/security.md`
+- Claude Code の `settings.json` の書き換え（連携の登録・解除・旧 Stop 登録の移行）: `docs/agents/configuration.md`
+- プラグインのスキルとコマンド: `docs/agents/commands.md`
+- hook・Claude Code の `settings.json`・管理画面・プラグインのスキル: `docs/agents/hooks-settings-ui-and-plugin.md`
+- Setup 版（Velopack）の配信・自動更新・登録: `docs/agents/setup-installer-velopack.md`
+- Setup 版の検証の隔離: `docs/agents/testing.md`
+- 配信 CI の起動・やり直し: `docs/agents/release-process.md`
+- 9 言語の表示とローカライズの決め方: `docs/agents/localization.md`
 
 ## 検証
 
