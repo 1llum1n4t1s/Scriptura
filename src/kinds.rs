@@ -1563,12 +1563,18 @@ pub enum Violation {
         path: String,
         heading: String,
     },
+    /// 分割先の直下のファイル `file` への案内が、親文書 `path` に無い。
+    MissingSplitLink {
+        name: String,
+        path: String,
+        file: String,
+    },
     /// 状態・読み取りを確認できない、UTF-8 ではない（検査不能。fail-closed）。
     Unverifiable { path: String, why: &'static str },
 }
 
 impl Violation {
-    /// 再実行で直せる利用者設定の違反か（上限・必須見出し）。検査不能は直せない。
+    /// 再実行で直せる利用者設定の違反か（上限・必須見出し・分割先への案内）。検査不能は直せない。
     pub fn is_soft(&self) -> bool {
         !matches!(self, Violation::Unverifiable { .. })
     }
@@ -1610,6 +1616,14 @@ impl Violation {
                 path = path,
                 heading = heading
             ),
+            Violation::MissingSplitLink { name, path, file } => {
+                crate::t!(
+                    "kinds.limit_split_link",
+                    name = name,
+                    path = path,
+                    file = file
+                )
+            }
             Violation::Unverifiable { path, why } => match *why {
                 "stat" => crate::t!("kinds.limit_stat", path = path),
                 "read" => crate::t!("kinds.limit_read", path = path),
@@ -1715,7 +1729,139 @@ pub fn check_documents(root: &Path, kinds: &[ResolvedKind], files: &[String]) ->
             }
         }
     }
+    problems.extend(check_split_links(root, kinds, files));
     problems
+}
+
+/// 通常ファイル（リンクでない）か。中身は読まない。
+fn is_plain_file(root: &Path, rel: &str) -> bool {
+    fs::symlink_metadata(root.join(rel))
+        .is_ok_and(|m| m.is_file() && !crate::maintenance::linked(&m))
+}
+
+/// 通常ファイル（リンクでない）の本文を、小文字・`/` 区切りに揃えて返す。
+/// 無い・読めない・UTF-8 でないときは None。
+fn read_plain_text_normalized(root: &Path, rel: &str) -> Option<String> {
+    if !is_plain_file(root, rel) {
+        return None;
+    }
+    let text = String::from_utf8(fs::read(root.join(rel)).ok()?).ok()?;
+    Some(text.to_lowercase().replace('\\', "/"))
+}
+
+/// 親文書（小文字・`/` 区切りのリポジトリ相対パス）のフォルダーから、分割先のファイルへの相対パス
+/// （必要なら `../` を含む）。
+fn relative_link(parent: &str, child: &str) -> String {
+    let mut up: Vec<&str> = parent.split('/').collect();
+    up.pop();
+    let down: Vec<&str> = child.split('/').collect();
+    let common = up
+        .iter()
+        .zip(&down[..down.len() - 1])
+        .take_while(|(a, b)| a == b)
+        .count();
+    format!(
+        "{}{}",
+        "../".repeat(up.len() - common),
+        down[common..].join("/")
+    )
+}
+
+/// リンクの前後の境界になれない文字（パス名・ファイル名の一部になる文字）か。非 ASCII は境界とみなす。
+fn is_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'/')
+}
+
+/// 本文（小文字・`/` 区切り）に `rel` が、前後をパス名の文字に挟まれずに現れるか。
+/// 直前の `./` とアンカー（`#…`）は許す。
+fn mentions_path(text: &str, rel: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.match_indices(rel).any(|(i, _)| {
+        let before = text[..i]
+            .strip_suffix("./")
+            .unwrap_or(&text[..i])
+            .as_bytes();
+        let after = bytes.get(i + rel.len());
+        before.last().is_none_or(|b| !is_name_byte(*b))
+            && after.is_none_or(|b| !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'/')))
+    })
+}
+
+/// 親文書の本文が、分割先のファイルを相対パスで案内しているか（大文字小文字は区別しない）。
+fn links_to_split_file(parent: &str, text: &str, child: &str) -> bool {
+    mentions_path(
+        text,
+        &relative_link(&parent.to_lowercase(), &child.to_lowercase()),
+    )
+}
+
+/// 分割先（`split_dir`）の直下にある各 Markdown が、親文書から案内されているかの保守後検査。
+/// `files` は検査する相対パス（許可パス）。案内の有無は、同じ種類の追跡済み文書すべて（`AGENTS.override.md`
+/// を含み、許可パスに無いものも読むだけ）と `files` の本文を見て、どれにも無いときだけ違反にする。
+/// 違反の宛先は、`files` の中で最も浅い親文書（`AGENTS.override.md` を除く）。`files` に親文書が
+/// 1 つも無ければ直せないので検査しない。権限モードに関係なく呼ぶこと。
+fn check_split_links(root: &Path, kinds: &[ResolvedKind], files: &[String]) -> Vec<Violation> {
+    if kinds.iter().all(|k| k.split_dir.is_none()) {
+        return Vec::new();
+    }
+    let tracked: Vec<String> =
+        crate::maintenance::run_git(root, &["-c", "core.quotepath=false", "ls-files", "-z"])
+            .map(|raw| {
+                String::from_utf8_lossy(&raw)
+                    .split('\0')
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+    kinds
+        .iter()
+        .filter(|k| k.split_dir.is_some())
+        .flat_map(|kind| split_link_problems(root, kinds, kind, files, &tracked))
+        .collect()
+}
+
+/// `check_split_links` の 1 種類分。
+fn split_link_problems(
+    root: &Path,
+    kinds: &[ResolvedKind],
+    kind: &ResolvedKind,
+    files: &[String],
+    tracked: &[String],
+) -> Vec<Violation> {
+    let same_kind = |f: &&String| {
+        !is_split_child(kind, &f.to_lowercase())
+            && kind_of_path(kinds, f).is_some_and(|k| k.id() == kind.id())
+    };
+    let Some(dest) = files
+        .iter()
+        .filter(same_kind)
+        .filter(|f| !f.to_lowercase().ends_with("agents.override.md"))
+        .min_by_key(|f| (f.matches('/').count(), f.len()))
+    else {
+        return Vec::new();
+    };
+    let children: Vec<&String> = files
+        .iter()
+        .filter(|f| is_split_child(kind, &f.to_lowercase()) && is_plain_file(root, f))
+        .collect();
+    let docs: BTreeSet<&String> = tracked.iter().chain(files).filter(same_kind).collect();
+    let texts: Vec<(&String, String)> = if children.is_empty() {
+        Vec::new()
+    } else {
+        docs.into_iter()
+            .filter_map(|d| Some((d, read_plain_text_normalized(root, d)?)))
+            .collect()
+    };
+    children
+        .into_iter()
+        .filter(|c| !texts.iter().any(|(p, t)| links_to_split_file(p, t, c)))
+        .map(|c| Violation::MissingSplitLink {
+            name: kind.document.name().to_string(),
+            path: dest.clone(),
+            file: c.clone(),
+        })
+        .collect()
 }
 
 /// `check_documents` の違反を日本語などの表示言語の 1 文にしたもの（無ければ None）。
@@ -1817,6 +1963,40 @@ pub fn agents_over_lines(agents: &[AgentsOver]) -> Vec<String> {
     lines
 }
 
+/// 文書の大きさの段階。上限の 80% を超えると分割の検討を促し（違反ではない）、上限に達すると既存の分割指示
+/// （`Splitting` 行）が働き、上限を超えると違反になる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeStage {
+    Within,
+    /// 上限の 80% を超えたが、上限には達していない。
+    Over80Percent,
+    /// ちょうど上限（違反ではないが、`Splitting` 行が「達したら分割」と指示する）。
+    AtLimit,
+    OverLimit,
+}
+
+/// 文字数 `chars`・バイト数 `bytes` の文書が、種類の上限（文字数・バイト数のどちらか一方でも）に対して
+/// どの段階か。80% は `n * 5 > 上限 * 4`（ちょうど 80% は含まない。u128 で比べ、あふれない）、
+/// 上限超過は `n > 上限`。AGENTS の 30,000 バイト未満は、種類の `max_bytes`（`AGENTS_MAX_BYTES` 以下に
+/// 丸め済み）で表す。
+pub fn size_stage(kind: &ResolvedKind, chars: u64, bytes: u64) -> SizeStage {
+    let pairs = [(chars, kind.max_chars), (bytes, kind.max_bytes)];
+    let any = |test: &dyn Fn(u128, u128) -> bool| {
+        pairs
+            .iter()
+            .any(|(n, max)| max.is_some_and(|m| test(u128::from(*n), u128::from(m))))
+    };
+    if any(&|n, m| n > m) {
+        SizeStage::OverLimit
+    } else if any(&|n, m| n == m) {
+        SizeStage::AtLimit
+    } else if any(&|n, m| n * 5 > m * 4) {
+        SizeStage::Over80Percent
+    } else {
+        SizeStage::Within
+    }
+}
+
 /// 保守の開始時点で既に AGENTS が上限を超えているときの、最初のプロンプトへの追記（無ければ空文字）。
 /// 超過の解消そのものが必須の作業だと伝え、現在のバイト数・内訳・削減量を数値で渡す。
 pub fn agents_required_note(agents: &[AgentsOver]) -> String {
@@ -1872,6 +2052,22 @@ pub fn fixup_prompt(
                 path,
                 format!("- {path}: the required heading \"{heading}\" is missing. Add it."),
             ),
+            Violation::MissingSplitLink { path, file, .. } => {
+                // 検査が求めるのは、この文書のフォルダーからの相対パス（入れ子の文書では `../` 付き）。
+                let rel = relative_link(path, file);
+                let example =
+                    if kind_of_path(kinds, path).is_some_and(|k| k.document == Document::Agents) {
+                        format!(" (a one-line pointer such as \"Before changing X, read {rel}\")")
+                    } else {
+                        String::new()
+                    };
+                (
+                    path,
+                    format!(
+                        "- {path}: it does not link to `{file}`. Add a short entry that links to that file by its path relative to this document's folder, `{rel}`{example}."
+                    ),
+                )
+            }
             Violation::Unverifiable { .. } => continue,
         };
         lines.push(line);
@@ -1975,11 +2171,16 @@ pub fn settings_frame_with(
                 limits.push(format!("at most {n} bytes"));
             }
             let mut now = Vec::new();
+            let mut early: Vec<String> = Vec::new();
             for file in scope.files(&kind.document) {
                 if let Ok(data) = fs::read(file) {
                     let rel = crate::maintenance::safe_relative(root, file)
                         .unwrap_or_else(|_| file.display().to_string());
                     let chars = String::from_utf8_lossy(&data).chars().count();
+                    if size_stage(kind, chars as u64, data.len() as u64) == SizeStage::Over80Percent
+                    {
+                        early.push(rel.clone());
+                    }
                     now.push(format!("{rel} is {chars} characters, {} bytes", data.len()));
                 }
             }
@@ -1998,7 +2199,7 @@ pub fn settings_frame_with(
                 let count = grant.remaining(&split);
                 let creation = split_creation_sentence(dir, count);
                 let agents_rule = if kind.document == Document::Agents {
-                    " Keep the rules that apply to all work in AGENTS.md and move only details, adding a line such as \"Before changing X, read docs/agents/x.md\" for each moved topic."
+                    " Keep the rules that apply to all work in AGENTS.md and move only details."
                 } else {
                     ""
                 };
@@ -2021,7 +2222,31 @@ pub fn settings_frame_with(
                         "- Splitting: when a file reaches or exceeds its limit, start splitting immediately instead of trimming first. Move detail into files under `{dir}/`, and consider what to condense or drop only while you do the splitting. Existing files there that you may edit: {existing}. {creation} Use one topic per file, and leave a one- or two-sentence summary with a relative link to that file in the main document.{naming}{agents_rule}"
                     )
                 });
+                // 上限に達した文書（ちょうど上限）は `Splitting` 行が「達したら分割」と指示するので、ここには入れない。
+                if !early.is_empty() && !(split.is_empty() && count == 0) {
+                    let (verb, pronoun) = if early.len() == 1 {
+                        ("is", "its")
+                    } else {
+                        ("are", "their")
+                    };
+                    lines.push(format!(
+                        "- Early split: {} {verb} over 80% of {pronoun} limit but still within it (not yet a violation). Consider splitting before it grows further: keep the rules and key points that apply to all work in the document, move the per-topic details into files under `{dir}/` (see the Splitting line), and link each moved topic from the document by its relative path.",
+                        early.join(", ")
+                    ));
+                }
             }
+        }
+        if let Some(dir) = &kind.split_dir {
+            let pointer = if kind.document == Document::Agents {
+                format!(
+                    " For AGENTS.md, use one-line pointers such as \"Before changing X, read {dir}/x.md\", written as a path relative to the AGENTS.md that holds the pointer (for example ../{dir}/x.md from sub/AGENTS.md)."
+                )
+            } else {
+                String::new()
+            };
+            lines.push(format!(
+                "- Split directory links: every Markdown file directly under `{dir}/` must be linked by its relative path from one of this kind's documents, preferably the one closest to the repository root.{pointer} Whenever you create, rename or delete a file there, update these links in the same run. The program checks this after maintenance."
+            ));
         }
         if let Some(lang) = &kind.language {
             lines.push(format!("- Language: write in {lang}."));

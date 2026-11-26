@@ -2386,7 +2386,13 @@ fn poll_repository_inner(
     // 保守が完了した（処理済み位置を error なしで保存した）ので、今回対象になった種類の最終完了を記録する。
     // 検査に違反して出力を破棄した回は完了に数えない（位置だけ進める）。
     if discarded.is_empty() {
-        crate::timing::record_kind_runs(&db, &repo_key, record, &processed, crate::timing::now_secs())?;
+        crate::timing::record_kind_runs(
+            &db,
+            &repo_key,
+            record,
+            &processed,
+            crate::timing::now_secs(),
+        )?;
     }
     // 保守履歴: 完了した publication 状態から、commit・push 済みか、変更なしか、破棄したかを分ける。
     if s(&finished, "phase") == "complete" {
@@ -3495,7 +3501,7 @@ fn push_note(state: &mut Value, note: String) {
         list.push(json!(note));
     }
 }
-/// 再実行で直せる違反（上限・必須見出し・AGENTS の 30,000 バイト超過）。AGENTS は編集を許した
+/// 再実行で直せる違反（上限・必須見出し・分割先の案内・AGENTS の 30,000 バイト超過）。AGENTS は編集を許した
 /// ファイルだけを対象にする（許可パスに無いものは worker が直せない）。
 fn fixable_problems(
     root: &Path,
@@ -4613,9 +4619,7 @@ pub fn publish_locked_with(
             // commit もせず失敗扱いにする。対象外の変更は自動では戻さない（利用者の作業を損なわないため）。
             // 記録して再実行を止める。
             let mut violation = serde_json::Map::new();
-            let mut error = outcome
-                .filter(|f| !f.timed_out)
-                .map(|f| f.message);
+            let mut error = outcome.filter(|f| !f.timed_out).map(|f| f.message);
             let post_snapshot = pre_snapshot
                 .as_ref()
                 .map(|_| worktree_snapshot_with(root, false));
@@ -4725,10 +4729,8 @@ pub fn publish_locked_with(
                         )
                     });
                     if violated.is_none() {
-                        let warning = crate::t!(
-                            "maint.fixup_timeout_warning",
-                            seconds = timeout.as_secs()
-                        );
+                        let warning =
+                            crate::t!("maint.fixup_timeout_warning", seconds = timeout.as_secs());
                         if let Some(text) = not_restored {
                             return fail(path, &mut state, text);
                         }
@@ -4748,8 +4750,11 @@ pub fn publish_locked_with(
                     })));
                 }
                 // 追い修正の直前の内容を持てていない（ready からの再開）: 戻せないので停止する。
-                let stopped =
-                    crate::t!("maint.timeout_not_restored", error = message, paths = paths());
+                let stopped = crate::t!(
+                    "maint.timeout_not_restored",
+                    error = message,
+                    paths = paths()
+                );
                 if violated.is_none() {
                     return fail(path, &mut state, stopped);
                 }
@@ -4814,7 +4819,7 @@ pub fn publish_locked_with(
     // 検査対象は worker に編集を許したパス（記録済みの `before` のキー）。
     // - ハード違反（AGENTS の 30,000 バイト・階層の超過、CHANGELOG のリリース済みエントリの変更、検査不能）は
     //   再実行しても残るので、worker の出力を破棄して完了にする（処理済み位置を進め、止まり続けない）。
-    // - ソフト違反（利用者設定の上限・必須見出し）は、警告を記録したうえで commit・push する。
+    // - ソフト違反（利用者設定の上限・必須見出しと、分割先のファイルへの案内）は、警告を記録したうえで commit・push する。
     let editable: Vec<String> = state["before"]
         .as_object()
         .ok_or(crate::t!("maint.state_field_invalid", field = "before"))?

@@ -3634,7 +3634,9 @@ fn head_move_with_hard_violation_is_held_not_rejected() {
     // 続く push では新しい保守が全範囲を処理する（古い書きかけは戻される）。
     unsafe { env::remove_var("HOOK_STUB_HEAD_CHANGE") };
     f.push_change("next push");
-    f.writes(json!({f.changelog_path(): KAC_CHANGELOG.replace("- 新機能 A", "- 新機能 A\n- 新機能 B")}));
+    f.writes(
+        json!({f.changelog_path(): KAC_CHANGELOG.replace("- 新機能 A", "- 新機能 A\n- 新機能 B")}),
+    );
     // 古い出力の破棄の通知つきで、新しい保守が走る。
     let note = f.hook("Stop").expect("古い出力を破棄した通知があるはず");
     assert!(note.contains("破棄"), "{note}");
@@ -4487,7 +4489,10 @@ fn an_unverifiable_kind_document_is_a_hard_violation_and_the_output_is_discarded
         None
     );
     assert_eq!(f.git(&["rev-parse", "HEAD"]), head, "commit しない");
-    assert_eq!(fs::read_to_string(f.root.join("README.md")).unwrap(), "readme");
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "readme"
+    );
     let state = f.state();
     assert_eq!(state["phase"], "complete");
     assert!(state["error"].is_null());
@@ -4570,6 +4575,39 @@ fn split_files_are_allowed_committed_and_checked_per_file() {
             .get("docs/readme/usage.md")
             .is_some_and(Value::is_null),
         "{state}"
+    );
+}
+
+#[test]
+fn an_unlinked_split_file_triggers_a_fixup_and_then_only_a_warning() {
+    let f = Fixture::split_fixture(Permission::Restricted);
+    let head = f.head();
+    // 分割先に新しいファイルを作るが、README から案内せず、追い修正も直さない。
+    f.writes(json!([
+        {
+            f.readme_path(): "# 題\n## 概要\n本文を更新\n",
+            f.split_path("usage.md"): "詳細な説明",
+        },
+        {f.readme_path(): "# 題\n## 概要\n追い修正 1\n"},
+        {f.readme_path(): "# 題\n## 概要\n追い修正 2\n"},
+    ]));
+    // 警告は hook の返答にも載る（失敗ではない）。
+    let reply = f.hook("Stop").unwrap_or_default();
+    assert!(reply.contains("案内がありません"), "{reply}");
+    // (a) 追い修正のプロンプトが、案内の欠けたファイルを名指しする。
+    let second = f.prompt_of_run(2);
+    assert!(
+        second.contains("README.md: it does not link to `docs/readme/usage.md`"),
+        "{second}"
+    );
+    // (b) 直らなくても worker_failed にならず、警告つきで commit・push して完了する。
+    let state = f.state();
+    assert_eq!(state["phase"], "complete", "{state}");
+    assert_ne!(f.head(), head);
+    let warning = state["limit_warning"].as_str().unwrap();
+    assert!(
+        warning.contains("docs/readme/usage.md") && warning.contains("案内がありません"),
+        "{warning}"
     );
 }
 
@@ -4862,17 +4900,14 @@ fn a_split_dir_cleared_by_the_user_is_granted_again_on_retry() {
     unsafe { env::remove_var("HOOK_STUB_EXIT") };
     fs::remove_file(&draft).unwrap();
     f.writes(json!({
-        f.readme_path(): "再試行",
+        f.readme_path(): "再試行 docs/readme/usage.md",
         f.split_path("usage.md"): "新規",
     }));
     assert_eq!(f.hook("Stop"), None);
     assert_eq!(f.worker_runs(), 2);
     assert!(f.has_split_rule(), "{:?}", f.allowed_rules());
     assert_eq!(f.state()["split_dirs"][0]["granted"], true);
-    assert!(
-        f.head_files()
-            .contains(&"docs/readme/usage.md".to_string())
-    );
+    assert!(f.head_files().contains(&"docs/readme/usage.md".to_string()));
 }
 
 #[cfg(windows)]
@@ -5446,7 +5481,7 @@ fn a_timed_out_fixup_is_reverted_and_the_first_run_is_committed_with_a_warning()
     unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "2:60") };
     let head = f.head();
     let new_file = f.root.join("docs/readme/overview.md");
-    let first =format!("# 題\n## 概要\n{}", "r".repeat(60));
+    let first = format!("# 題\n## 概要\n{}", "r".repeat(60));
     // 1 回目は上限（40 文字）超過。追い修正は書きかけ（README の別内容と分割先の新規ファイル）のまま期限切れになる。
     f.writes(json!([
         {f.readme_path(): first},
@@ -5458,7 +5493,11 @@ fn a_timed_out_fixup_is_reverted_and_the_first_run_is_committed_with_a_warning()
         "{message}"
     );
     assert_eq!(f.worker_runs(), 2);
-    assert_eq!(f.written_run(), "2", "追い修正は書いたあとで期限切れになった");
+    assert_eq!(
+        f.written_run(),
+        "2",
+        "追い修正は書いたあとで期限切れになった"
+    );
     assert_ne!(f.head(), head, "最初の起動の内容を commit する");
     assert_eq!(f.git(&["rev-parse", "origin/main"]).trim(), f.head());
     assert_eq!(fs::read_to_string(f.root.join("README.md")).unwrap(), first);
@@ -5546,7 +5585,10 @@ fn a_timed_out_first_run_is_reverted_and_not_retried_until_a_new_push_or_run_now
         None
     );
     assert_eq!(f.worker_runs(), 2);
-    assert_eq!(fs::read_to_string(f.root.join("README.md")).unwrap(), "retried");
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "retried"
+    );
     assert_eq!(f.state()["phase"], "complete");
 }
 
@@ -5627,8 +5669,15 @@ fn a_timed_out_first_run_restores_a_gitignored_shared_document() {
     let message = f.hook("Stop").expect("失敗の通知があるはず");
     assert!(message.contains("戻しました"), "{message}");
     assert_eq!(f.written_run(), "1");
-    assert!(f.state()["before"].get("README.md").is_some_and(|v| !v.is_null()));
-    assert_eq!(fs::read_to_string(f.root.join("README.md")).unwrap(), "readme");
+    assert!(
+        f.state()["before"]
+            .get("README.md")
+            .is_some_and(|v| !v.is_null())
+    );
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "readme"
+    );
     assert_eq!(f.state()["phase"], "worker_failed");
 }
 
@@ -5657,7 +5706,10 @@ fn a_timed_out_resumed_fixup_goes_back_to_the_ready_content() {
     let state = f.state();
     assert_eq!(state["phase"], "complete");
     assert!(
-        state["discarded"].as_str().unwrap().contains("追い修正に残っていた時間"),
+        state["discarded"]
+            .as_str()
+            .unwrap()
+            .contains("追い修正に残っていた時間"),
         "{state}"
     );
 }
@@ -5675,7 +5727,10 @@ fn a_timeout_on_non_windows_reverts_nothing_and_stops() {
     let message = f.hook("Stop").expect("停止の通知があるはず");
     assert!(message.contains("終了状態が不確定"), "{message}");
     assert_eq!(f.written_run(), "1");
-    assert_eq!(fs::read_to_string(f.root.join("README.md")).unwrap(), "partial");
+    assert_eq!(
+        fs::read_to_string(f.root.join("README.md")).unwrap(),
+        "partial"
+    );
     assert_eq!(f.state()["phase"], "worker_running");
 }
 

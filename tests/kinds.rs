@@ -599,9 +599,9 @@ fn runtime_dir(name: &str) -> PathBuf {
     let base = std::env::var_os("SCRIPTURA_TEST_BASE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("validation"));
-    let dir = base
-        .join("kinds-runtime")
-        .join(format!("{name}-{}-{}", std::process::id(), run_stamp()));
+    let dir =
+        base.join("kinds-runtime")
+            .join(format!("{name}-{}-{}", std::process::id(), run_stamp()));
     fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -1459,7 +1459,11 @@ fn new_split_entries_counts_files_and_respects_ungranted_directories() {
 #[test]
 fn files_in_the_split_dir_share_the_limits_but_not_the_required_headings() {
     let root = runtime_dir("split-limits");
-    write(&root, "README.md", "# 題\n## 概要\n");
+    write(
+        &root,
+        "README.md",
+        "# 題\n## 概要\n[詳細](docs/readme/part.md)\n",
+    );
     write(&root, "docs/readme/part.md", "ありあまるほど長い本文");
     let kinds = resolve(
         "[kinds.readme]\nmax_chars = 5\nrequired_headings = [\"## 概要\"]\n",
@@ -1496,6 +1500,204 @@ fn files_in_the_split_dir_share_the_limits_but_not_the_required_headings() {
     fs::write(root.join("docs/readme/part.md"), [0xff, 0xfe]).unwrap();
     let found = kinds::check_documents(&root, &kinds, &files);
     assert!(found.iter().any(|v| !v.is_soft()));
+}
+
+#[test]
+fn every_split_dir_file_must_be_linked_from_the_parent_document() {
+    let root = git_repo("split-links");
+    write(
+        &root,
+        "README.md",
+        "# 題\nlinked: docs/readme/Alpha.md#top and [g](./docs\\readme\\gamma.md)\n",
+    );
+    write(&root, "docs/readme/alpha.md", "a");
+    write(&root, "docs/readme/beta.md", "b");
+    write(&root, "docs/readme/gamma.md", "g");
+    write(&root, "docs/readme/sub/deep.md", "c");
+    let kinds = resolve("[kinds.readme]\nmax_chars = 1000\n", "\"README.md\"");
+    let files: Vec<String> = [
+        "README.md",
+        "docs/readme/alpha.md",
+        "docs/readme/beta.md",
+        "docs/readme/gamma.md",
+        "docs/readme/gone.md",
+        "docs/readme/sub/deep.md",
+    ]
+    .map(String::from)
+    .to_vec();
+    let missing = |found: Vec<kinds::Violation>| -> Vec<String> {
+        found
+            .into_iter()
+            .filter_map(|v| match v {
+                kinds::Violation::MissingSplitLink { path, file, .. } => {
+                    Some(format!("{path}:{file}"))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    // 大文字小文字を区別せずに案内を認め、案内の無い既存ファイルだけを返す（存在しないファイルは対象外）。
+    let found = kinds::check_documents(&root, &kinds, &files);
+    assert!(found.iter().all(|v| v.is_soft()));
+    assert_eq!(missing(found), ["README.md:docs/readme/beta.md"]);
+    // 親文書のフォルダーからの相対パスで書く（入れ子の親文書）。別のフォルダーの同名の末尾には一致しない。
+    write(
+        &root,
+        "docs/DESIGN.md",
+        "see docs/old-design/beta.md and old-design/beta.md\n",
+    );
+    write(&root, "docs/design/beta.md", "b");
+    let nested = resolve("[kinds.design]\nmax_chars = 1000\n", "\"DESIGN.md\"");
+    let design_files = [
+        "docs/DESIGN.md".to_string(),
+        "docs/design/beta.md".to_string(),
+    ];
+    let found = kinds::check_documents(&root, &nested, &design_files);
+    assert_eq!(missing(found), ["docs/DESIGN.md:docs/design/beta.md"]);
+    write(&root, "docs/DESIGN.md", "see design/beta.md\n");
+    assert!(missing(kinds::check_documents(&root, &nested, &design_files)).is_empty());
+    // AGENTS: ルートの AGENTS.override.md（許可パスに無い）の案内を認め、入れ子の AGENTS.md からは
+    // `../` 付きの案内でも認める。どこにも無いものは、許可パスの中で最も浅い親文書へ向ける。
+    write(&root, "AGENTS.override.md", "- docs/agents/a.md\n");
+    write(&root, "AGENTS.md", "# 全体\n");
+    write(&root, "sub/AGENTS.md", "- [b](../docs/agents/b.md)\n");
+    for name in ["a", "b", "c"] {
+        write(&root, &format!("docs/agents/{name}.md"), "x");
+    }
+    git_ok(&root, &["add", "-A"]);
+    let agents = resolve("[kinds.agents]\nmax_bytes = 20000\n", "\"AGENTS.md\"");
+    let agents_files: Vec<String> = [
+        "sub/AGENTS.md",
+        "docs/agents/a.md",
+        "docs/agents/b.md",
+        "docs/agents/c.md",
+    ]
+    .map(String::from)
+    .to_vec();
+    let found = kinds::check_documents(&root, &agents, &agents_files);
+    assert_eq!(missing(found.clone()), ["sub/AGENTS.md:docs/agents/c.md"]);
+    // 追い修正の文は、宛先（入れ子の AGENTS.md）からの相対パスを示す。リポジトリ基準の例は出さない。
+    let prompt = kinds::fixup_prompt(&agents, &found, &[], &agents_files, &[]);
+    assert!(
+        prompt.contains("`../docs/agents/c.md`")
+            && prompt.contains("Before changing X, read ../docs/agents/c.md"),
+        "{prompt}"
+    );
+    // 許可パスに親文書が 1 つも無ければ直せないので検査しない。
+    assert!(missing(kinds::check_documents(&root, &agents, &agents_files[1..])).is_empty());
+    // 検査対象に親文書が無い、または分割先を持たない種類は何も検査しない。
+    let only_children = vec!["docs/readme/beta.md".to_string()];
+    assert!(missing(kinds::check_documents(&root, &kinds, &only_children)).is_empty());
+    let unlimited = resolve("", "\"README.md\"");
+    assert!(missing(kinds::check_documents(&root, &unlimited, &files)).is_empty());
+    // worker 向けの再実行文は、案内の欠けたファイルを名指しする。
+    let prompt = kinds::fixup_prompt(
+        &kinds,
+        &[kinds::Violation::MissingSplitLink {
+            name: "README".into(),
+            path: "README.md".into(),
+            file: "docs/readme/beta.md".into(),
+        }],
+        &[],
+        &files,
+        &[],
+    );
+    assert!(
+        prompt.contains("README.md: it does not link to `docs/readme/beta.md`"),
+        "{prompt}"
+    );
+}
+
+#[test]
+fn size_stage_flips_strictly_above_80_percent_then_at_and_above_the_limit_for_either_limit() {
+    use kinds::SizeStage::{AtLimit, Over80Percent, OverLimit, Within};
+    let chars = resolve("[kinds.readme]\nmax_chars = 100\n", "\"README.md\"");
+    let stage = |k: &ResolvedKind, c, b| kinds::size_stage(k, c, b);
+    // ちょうど 80% は含まない。
+    assert_eq!(stage(&chars[0], 80, 9999), Within);
+    assert_eq!(stage(&chars[0], 81, 0), Over80Percent);
+    assert_eq!(stage(&chars[0], 99, 0), Over80Percent);
+    assert_eq!(stage(&chars[0], 100, 0), AtLimit);
+    assert_eq!(stage(&chars[0], 101, 0), OverLimit);
+    // バイト数の上限は別に効く（どちらか一方でも該当）。割り切れない上限（80% = 80.8）は小数まで厳密に比べる。
+    let both = resolve(
+        "[kinds.agents]\nmax_chars = 1000\nmax_bytes = 101\n",
+        "\"AGENTS.md\"",
+    );
+    assert_eq!(stage(&both[0], 10, 80), Within);
+    assert_eq!(stage(&both[0], 10, 81), Over80Percent);
+    assert_eq!(stage(&both[0], 801, 10), Over80Percent);
+    assert_eq!(stage(&both[0], 800, 10), Within);
+    assert_eq!(stage(&both[0], 10, 101), AtLimit);
+    assert_eq!(stage(&both[0], 10, 102), OverLimit);
+    // 大きな上限でも、u64 であふれる掛け算（n * 5）をしない。
+    let huge = resolve(
+        "[kinds.readme]\nmax_chars = 9000000000000000000\n",
+        "\"README.md\"",
+    );
+    assert_eq!(stage(&huge[0], 7_200_000_000_000_000_000, 0), Within);
+    assert_eq!(stage(&huge[0], 7_200_000_000_000_000_001, 0), Over80Percent);
+    // 上限の無い種類は常に範囲内。
+    let none = resolve("", "\"README.md\"");
+    assert_eq!(stage(&none[0], 1_000_000, 1_000_000), Within);
+}
+
+#[test]
+fn the_settings_frame_suggests_an_early_split_only_between_80_percent_and_the_limit() {
+    let root = split_repo("early-split");
+    let kinds = resolve("[kinds.readme]\nmax_chars = 100\n", "\"README.md\"");
+    let scope = Scope {
+        readme: vec![root.join("README.md")],
+        ..Scope::default()
+    };
+    let active: Vec<&ResolvedKind> = kinds.iter().collect();
+    let frame_of = |n: usize| {
+        write(&root, "README.md", &"a".repeat(n));
+        commit_all(&root);
+        settings_frame(&root, &scope, &active, &[])
+    };
+    let early = |n: usize| frame_of(n).contains("Early split: README.md is over 80% of its limit");
+    assert!(!early(80));
+    assert!(early(81));
+    assert!(early(99));
+    // ちょうど上限・上限超過は既存の分割指示（Splitting 行）だけで、早めの分割の文は出ない。
+    assert!(!early(100));
+    assert!(!early(101));
+    let frame = frame_of(100);
+    assert!(
+        frame.contains("when a file reaches or exceeds its limit, start splitting immediately"),
+        "{frame}"
+    );
+    assert!(!frame.contains("Early split"), "{frame}");
+    // 分割先へ何も置けない状態（追跡済みの .md が無く、未追跡の .md が新規作成を止める）では出さない。
+    write(&root, "README.md", &"a".repeat(90));
+    write(&root, "docs/readme/draft.md", "x");
+    let frame = settings_frame(&root, &scope, &active, &[]);
+    assert!(
+        frame.contains("there is no file under `docs/readme/` that you may edit"),
+        "{frame}"
+    );
+    assert!(!frame.contains("Early split"), "{frame}");
+    // 分割先を持たない種類（上限の無い種類）には、枠ごと出ない。
+    let none = resolve("", "\"README.md\"");
+    let active: Vec<&ResolvedKind> = none.iter().collect();
+    assert!(!settings_frame(&root, &scope, &active, &[]).contains("Early split"));
+}
+
+#[test]
+fn the_settings_frame_always_asks_for_links_to_split_dir_files() {
+    let root = runtime_dir("split-link-prompt");
+    write(&root, "AGENTS.md", "# 規則\n");
+    let kinds = resolve("[kinds.agents]\nmax_bytes = 20000\n", "\"AGENTS.md\"");
+    let refs: Vec<&ResolvedKind> = kinds.iter().collect();
+    let frame = settings_frame(&root, &Scope::default(), &refs, &[]);
+    for needle in [
+        "Split directory links: every Markdown file directly under `docs/agents/`",
+        "Before changing X, read docs/agents/x.md",
+        "create, rename or delete a file there, update these links in the same run",
+    ] {
+        assert!(frame.contains(needle), "{needle}\n{frame}");
+    }
 }
 
 #[test]
