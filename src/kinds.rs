@@ -1017,86 +1017,277 @@ pub fn plan_documents_with(
 
 /// 1 種類の分割先に置いてよいファイル数の上限。
 pub const MAX_SPLIT_FILES: usize = 20;
-/// 分割先の既定の予約名（組み込みの対象名と衝突させない）。
+/// 分割先の新規ファイルに使えない名前（組み込みの対象名と衝突させない）。
 const SPLIT_RESERVED_STEMS: &[&str] = &["agents", "design", "readme", "changelog"];
-
-/// 見出しから名前が取れない（日本語の見出しなど）ときのために、内容を表す汎用の主題名を候補の末尾へ足す。
-/// `section-NN` のような内容の分からない名前しか選べなくならないようにするためで、worker には内容に合う名前を選ばせる。
-const SPLIT_TOPIC_STEMS: &[&str] = &[
-    "overview",
-    "architecture",
-    "workflow",
-    "configuration",
-    "commands",
-    "testing",
-    "security",
-    "release-process",
-    "troubleshooting",
-    "data-model",
-    "conventions",
-    "api-reference",
+/// 内容を表さない仮置き語。数字とこれらだけでできた名前は受け付けない。
+const SPLIT_PLACEHOLDER_WORDS: &[&str] = &[
+    "section", "part", "chapter", "page", "topic", "item", "misc", "other", "others", "untitled",
+    "new", "file", "doc", "docs", "document", "note", "notes", "detail", "details", "more",
+    "extra",
 ];
 
-/// 分割先のファイル名と内容を一致させる規則（worker が読む文なので英語に固定）。
-const SPLIT_NAMING_RULE: &str = "Each file name must describe its content: choose, from the allowed files, the name that matches the topic you move (for example a topic about testing goes in testing.md), and never put content in a file whose name does not describe it. Use a `section-NN` name only when no other allowed name fits the topic; a file that already exists keeps only content that matches its name.";
+/// 分割先の新規ファイル名の規則（worker が読む文なので英語に固定）。検査は `split_file_name_ok`。
+const SPLIT_NAMING_RULE: &str = "Name each new file yourself after the topic you move into it, in English even when the document is written in another language: only lowercase ASCII letters, digits and single hyphens, starting with a letter, 3 to 40 characters, followed by `.md` (for example release-process.md or api-compatibility.md). The program rejects numbered or placeholder names (such as section-05.md, part-1.md, details.md or misc.md), the names agents, design, readme and changelog, any other format and subfolders, and then the whole maintenance fails. Use one topic per file, and never add content to a file whose name does not describe it.";
 
-/// 本文（フェンス付きコードブロックの外）の `## ` 見出しの文字列。
-pub fn h2_headings(text: &str) -> Vec<String> {
-    let mut fence: Option<char> = None;
-    let mut out = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if line.len() - trimmed.len() > 3 {
-            continue;
-        }
-        if let Some(marker) = ['`', '~']
-            .into_iter()
-            .find(|m| trimmed.starts_with(&m.to_string().repeat(3)))
-        {
-            match fence {
-                None => fence = Some(marker),
-                Some(open) if open == marker => fence = None,
-                _ => {}
-            }
-            continue;
-        }
-        if fence.is_some() {
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("## ") {
-            out.push(rest.trim().trim_end_matches('#').trim().to_string());
+/// 分割先の直下に新規作成を許すかの記録。保守の状態（`split_dirs`）にこの形で保存する。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SplitGrant {
+    /// 分割先（リポジトリルート相対・`/` 区切り）。
+    pub dir: String,
+    /// worker の起動前から直下にあった全エントリの名前（小文字）。
+    pub existing: Vec<String>,
+    /// 新規ファイルの作成を許すか。
+    pub granted: bool,
+}
+
+impl SplitGrant {
+    /// あと何件の新規ファイルを作れるか。`allowed` は編集を許す相対パス（受理済みの新規ファイルも含む）。
+    pub fn remaining(&self, allowed: &[String]) -> usize {
+        if self.granted {
+            split_room(&self.dir, allowed)
+        } else {
+            0
         }
     }
+}
+
+/// `new_split_entries` の結果（リポジトリルート相対・名前順）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NewSplitEntries {
+    /// 受理する新規ファイル。
+    pub accepted: Vec<String>,
+    /// 違反になる新規エントリ（分割先そのものが調べられなくなったときは分割先）。
+    pub rejected: Vec<String>,
+}
+
+/// 相対パス `rel` が `dir` の直下の Markdown なら、そのファイル名（大文字小文字は区別しない）。
+fn direct_markdown<'a>(dir: &str, rel: &'a str) -> Option<&'a str> {
+    let (parent, name) = rel.rsplit_once('/')?;
+    (parent.eq_ignore_ascii_case(dir) && is_markdown_name(name)).then_some(name)
+}
+
+fn is_markdown_name(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".md")
+}
+
+/// `allowed` にある分割先のファイル数を上限から引いた残り。
+fn split_room(dir: &str, allowed: &[String]) -> usize {
+    let used = allowed
+        .iter()
+        .filter(|path| direct_markdown(dir, path).is_some())
+        .count();
+    MAX_SPLIT_FILES.saturating_sub(used)
+}
+
+/// 分割先の新規ファイル名として受け付けるか（`SPLIT_NAMING_RULE` の検査）。
+pub fn split_file_name_ok(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".md") else {
+        return false;
+    };
+    let charset = stem
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    let shape = (3..=40).contains(&stem.len())
+        && stem.starts_with(|c: char| c.is_ascii_lowercase())
+        && stem.split('-').all(|part| !part.is_empty());
+    let reserved = SPLIT_RESERVED_STEMS.contains(&stem) || windows_reserved(stem);
+    let meaningless = stem.split('-').all(|part| {
+        part.bytes().all(|b| b.is_ascii_digit()) || SPLIT_PLACEHOLDER_WORDS.contains(&part)
+    });
+    charset && shape && !reserved && !meaningless
+}
+
+/// 分割先の位置の状態。
+enum SplitDirState {
+    /// 途中にリンクの無いディレクトリ。
+    Present,
+    /// 存在しない。
+    Missing,
+    /// リンク・ファイルなど。中を読まない。
+    Unsafe,
+}
+
+fn split_dir_state(root: &Path, dir: &str) -> SplitDirState {
+    let mut current = root.to_path_buf();
+    for segment in dir.split('/') {
+        current.push(segment);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.is_dir() && !crate::maintenance::linked(&meta) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return SplitDirState::Missing,
+            _ => return SplitDirState::Unsafe,
+        }
+    }
+    SplitDirState::Present
+}
+
+/// 直下の全エントリの名前（名前順）。
+fn entry_names(path: &Path) -> std::io::Result<Vec<String>> {
+    let mut names = fs::read_dir(path)?
+        .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    names.sort();
+    Ok(names)
+}
+
+/// permission rule（`Edit(./<dir>/*.md)`）にそのまま書ける、リポジトリ内の相対パスか。
+fn rule_safe_dir(dir: &str) -> bool {
+    dir.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+        && dir.split('/').all(|s| !matches!(s, "" | "." | ".."))
+}
+
+/// 分割先の直下の Markdown が、すべて編集を許した追跡済みの未変更ファイルか。調べられなければ false。
+/// 許可の規則はグロブなので、許可一覧に無いファイルが 1 つでもあれば新規作成を許さない。
+fn only_allowed_markdown(root: &Path, dir: &str, allowed: &[String]) -> bool {
+    let prefix = format!("{dir}/");
+    let direct = |path: &str| {
+        path.strip_prefix(&prefix)
+            .is_some_and(|name| !name.contains('/') && is_markdown_name(name))
+    };
+    let allows = |path: &str| allowed.iter().any(|a| a == path);
+    let Some(status) = crate::maintenance::run_git(
+        root,
+        &[
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=all",
+            "--ignored",
+            "--",
+            dir,
+        ],
+    ) else {
+        return false;
+    };
+    // 各項目は `XY パス`。名前変更の元のパスだけは状態の 2 文字が付かない。
+    let changed = String::from_utf8_lossy(&status)
+        .split('\0')
+        .any(|item| direct(item) || item.get(3..).is_some_and(direct));
+    if changed {
+        return false;
+    }
+    // status に出ない追跡済みのファイル（非 ASCII 名など、候補に入らないもの）も許可一覧と突き合わせる。
+    let Some(tracked) = crate::maintenance::run_git(root, &["ls-files", "-z", "--", dir]) else {
+        return false;
+    };
+    let tracked_allowed = String::from_utf8_lossy(&tracked)
+        .split('\0')
+        .filter(|path| direct(path))
+        .all(allows);
+    // 実体の側も確かめる（設定と index で分割先の大文字小文字が違うと、git の一覧には出ない）。
+    let on_disk = match entry_names(&root.join(dir)) {
+        Ok(names) => names
+            .iter()
+            .filter(|name| is_markdown_name(name) && !root.join(dir).join(name).is_dir())
+            .all(|name| allows(&format!("{prefix}{name}"))),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    };
+    tracked_allowed && on_disk
+}
+
+/// 種類の分割先に新規作成を許すかを、worker の起動前の状態から決める。分割先の無い種類は `None`。
+/// `allowed` は編集を許す相対パス。許すのは、分割先がリンクでないリポジトリ内の場所で、Git の無視対象でなく、
+/// 直下の Markdown がすべて許可一覧にあり、件数が上限未満のときだけ。
+pub fn split_grant(root: &Path, kind: &ResolvedKind, allowed: &[String]) -> Option<SplitGrant> {
+    let dir = kind.split_dir.clone()?;
+    let existing = match split_dir_state(root, &dir) {
+        SplitDirState::Present => entry_names(&root.join(&dir)).ok(),
+        SplitDirState::Missing => Some(Vec::new()),
+        SplitDirState::Unsafe => None,
+    };
+    let granted = existing.is_some()
+        && rule_safe_dir(&dir)
+        && split_room(&dir, allowed) > 0
+        && crate::maintenance::git_ignore_status(root, &root.join(&dir).join("probe.md")).0
+            == "not_ignored"
+        && only_allowed_markdown(root, &dir, allowed);
+    let mut existing: Vec<String> = existing
+        .unwrap_or_default()
+        .iter()
+        .map(|name| name.to_lowercase())
+        .collect();
+    existing.sort();
+    Some(SplitGrant {
+        dir,
+        existing,
+        granted,
+    })
+}
+
+/// worker の実行後に、分割先の直下に増えたエントリを受理と拒否に分ける。`grants` は起動前の記録、
+/// `allowed` は編集を許す相対パス（受理済みの新規ファイルを足したもの）。許可していない分割先では、
+/// 新しい Markdown だけを拒否する。
+pub fn new_split_entries(
+    root: &Path,
+    grants: &[SplitGrant],
+    allowed: &[String],
+) -> NewSplitEntries {
+    let mut out = NewSplitEntries::default();
+    for grant in grants {
+        let names = match split_dir_state(root, &grant.dir) {
+            SplitDirState::Missing => continue,
+            SplitDirState::Present => entry_names(&root.join(&grant.dir)).ok(),
+            SplitDirState::Unsafe => None,
+        };
+        let Some(names) = names else {
+            if grant.granted {
+                out.rejected.push(grant.dir.clone());
+            }
+            continue;
+        };
+        // 既存名と、今回受理した名前（大文字小文字を区別しない重複の判定に使う）。
+        let mut taken: BTreeSet<String> = grant.existing.iter().cloned().collect();
+        taken.extend(
+            allowed
+                .iter()
+                .filter_map(|path| direct_markdown(&grant.dir, path))
+                .map(str::to_lowercase),
+        );
+        let mut room = grant.remaining(allowed);
+        for name in added_names(grant, allowed, names) {
+            let rel = format!("{}/{name}", grant.dir);
+            if !grant.granted {
+                if is_markdown_name(&name) {
+                    out.rejected.push(rel);
+                }
+                continue;
+            }
+            let regular = fs::symlink_metadata(root.join(&rel))
+                .is_ok_and(|meta| meta.is_file() && !crate::maintenance::linked(&meta));
+            if room > 0 && regular && split_file_name_ok(&name) && taken.insert(name) {
+                room -= 1;
+                out.accepted.push(rel);
+            } else {
+                out.rejected.push(rel);
+            }
+        }
+    }
+    out.accepted.sort();
+    out.rejected.sort();
     out
 }
 
-/// 見出しから分割先のファイル名（拡張子なし）を作る。ASCII の英数字を小文字にして `-` でつなぎ、
-/// 3 文字以上取れなければ `section-NN`（NN は見出しの通し番号）。組み込みの対象名・Windows 予約名と
-/// 一致するときは `-section` を付ける。
-fn split_stem(heading: &str, index: usize) -> String {
-    let mut slug = String::new();
-    for c in heading.chars() {
-        if c.is_ascii_alphanumeric() {
-            slug.push(c.to_ascii_lowercase());
-        } else if !slug.ends_with('-') && !slug.is_empty() {
-            slug.push('-');
-        }
+/// 直下の名前 `names` のうち、起動前の記録にも許可一覧にも無いもの。記録は小文字なので、大文字小文字だけが
+/// 違う名前が増えた場合に備えて、記録の 1 件は 1 つのエントリにだけ対応させる（許可一覧と一致する名前を先に）。
+fn added_names(grant: &SplitGrant, allowed: &[String], names: Vec<String>) -> Vec<String> {
+    let mut unclaimed = grant.existing.clone();
+    let mut claim = |name: &str| {
+        let lower = name.to_lowercase();
+        let found = unclaimed.iter().position(|e| *e == lower);
+        found.map(|index| unclaimed.swap_remove(index)).is_some()
+    };
+    let (listed, others): (Vec<String>, Vec<String>) = names.into_iter().partition(|name| {
+        let rel = format!("{}/{name}", grant.dir);
+        allowed.contains(&rel)
+    });
+    for name in &listed {
+        claim(name);
     }
-    let mut slug = slug.trim_matches('-').to_string();
-    slug.truncate(40);
-    let mut slug = slug.trim_matches('-').to_string();
-    if slug.len() < 3 {
-        slug = format!("section-{index:02}");
-    }
-    if SPLIT_RESERVED_STEMS.contains(&slug.as_str()) || windows_reserved(&slug) {
-        slug.push_str("-section");
-    }
-    slug
+    others.into_iter().filter(|name| !claim(name)).collect()
 }
 
-/// 種類の分割先に worker が置いてよいファイル（リポジトリルート相対）。
-/// (1) 分割先の直下に既に追跡されている `*.md`、(2) 本文の `## ` 見出しから作る新規ファイル名
-/// （既存と重複しないもの）。合計 `MAX_SPLIT_FILES` 件まで。分割先が無い種類・リンクなどの危険な実体は含めない。
+/// 種類の分割先に既にある、worker が編集してよいファイル（リポジトリルート相対）。分割先の直下に追跡されて
+/// いる安全な名前の `*.md` を `MAX_SPLIT_FILES` 件まで。分割先が無い種類・リンクなどの危険な実体は含めない。
 pub fn split_candidates(root: &Path, scope: &Scope, kind: &ResolvedKind) -> Vec<String> {
     split_candidates_checked(root, scope, kind, &mut true)
 }
@@ -1105,7 +1296,7 @@ pub fn split_candidates(root: &Path, scope: &Scope, kind: &ResolvedKind) -> Vec<
 /// （`SplitMemo` は失敗した結果を保持せず、次の問い合わせで取り直す）。
 fn split_candidates_checked(
     root: &Path,
-    scope: &Scope,
+    _scope: &Scope,
     kind: &ResolvedKind,
     complete: &mut bool,
 ) -> Vec<String> {
@@ -1114,11 +1305,6 @@ fn split_candidates_checked(
     };
     let mut out: Vec<String> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut push = |out: &mut Vec<String>, rel: String| {
-        if out.len() < MAX_SPLIT_FILES && seen.insert(rel.to_ascii_lowercase()) {
-            out.push(rel);
-        }
-    };
     let prefix = format!("{dir}/");
     let listed = crate::maintenance::run_git(
         root,
@@ -1149,31 +1335,12 @@ fn split_candidates_checked(
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
             && !windows_reserved(rest)
             && !rest.ends_with('.');
-        if safe && matches!(path_state(root, &name), PathState::File) {
-            push(&mut out, name);
-        }
-    }
-    let mut index = 0usize;
-    for file in scope.files(&kind.document) {
-        let Ok(data) = fs::read(file) else { continue };
-        for heading in h2_headings(&String::from_utf8_lossy(&data)) {
-            index += 1;
-            let name = format!("{prefix}{}.md", split_stem(&heading, index));
-            if matches!(
-                path_state(root, &name),
-                PathState::File | PathState::Missing
-            ) {
-                push(&mut out, name);
-            }
-        }
-    }
-    for stem in SPLIT_TOPIC_STEMS {
-        let name = format!("{prefix}{stem}.md");
-        if matches!(
-            path_state(root, &name),
-            PathState::File | PathState::Missing
-        ) {
-            push(&mut out, name);
+        if safe
+            && matches!(path_state(root, &name), PathState::File)
+            && out.len() < MAX_SPLIT_FILES
+            && seen.insert(name.to_ascii_lowercase())
+        {
+            out.push(name);
         }
     }
     out
@@ -1669,6 +1836,7 @@ pub fn fixup_prompt(
     violations: &[Violation],
     agents: &[AgentsOver],
     allowed: &[String],
+    split: &[(String, usize)],
 ) -> String {
     let target = |max: u64| max * FIXUP_TARGET_PERCENT / 100;
     let mut lines: Vec<String> = Vec::new();
@@ -1715,18 +1883,37 @@ pub fn fixup_prompt(
                 && matches!(v, Violation::MaxChars { .. } | Violation::MaxBytes { .. })
             {
                 note(format!(
-                    "Start by splitting right away, without trimming first: move detail into files under `{dir}/` that are in the editable paths below, one topic per file, and decide what to condense or drop only while splitting, leaving a one- or two-sentence summary and a relative link in the main document. {SPLIT_NAMING_RULE}"
+                    "Start by splitting right away, without trimming first: move detail into files under `{dir}/` that are in the editable paths below or that you are allowed to create (see the end), one topic per file, and decide what to condense or drop only while splitting, leaving a one- or two-sentence summary and a relative link in the main document."
                 ));
             }
         }
     }
     lines.extend(agents_over_lines(agents));
+    let mut creation: String = split
+        .iter()
+        .map(|(dir, count)| format!(" {}", split_creation_sentence(dir, *count)))
+        .collect();
+    if split.iter().any(|(_, count)| *count > 0) {
+        creation.push(' ');
+        creation.push_str(SPLIT_NAMING_RULE);
+    }
     format!(
-        "The maintenance result for this push still violates checks that the program enforces after every run. Fix only these violations and do not redo the rest of the maintenance:\n{}\nReduce size by splitting detail out where a split directory is given below; while splitting, also remove duplication, outdated statements and low-value detail and tighten wording. Do not simply cut text off.{}\nThe only editable paths are those in this JSON array: {}. Do not edit any other path.",
+        "The maintenance result for this push still violates checks that the program enforces after every run. Fix only these violations and do not redo the rest of the maintenance:\n{}\nReduce size by splitting detail out where a split directory is given below; while splitting, also remove duplication, outdated statements and low-value detail and tighten wording. Do not simply cut text off.{}\nThe only editable paths are those in this JSON array: {}. Do not edit any other path.{creation}",
         lines.join("\n"),
         notes.iter().map(|n| format!(" {n}")).collect::<String>(),
         serde_json::json!(allowed)
     )
+}
+
+/// 分割先に新規ファイルを何件作れるかの 1 文（worker が読む文なので英語に固定）。
+fn split_creation_sentence(dir: &str, count: usize) -> String {
+    if count == 0 {
+        format!("Do not create new files in `{dir}/` this time.")
+    } else {
+        format!(
+            "You may also create at most {count} new files directly under `{dir}/` (no subfolders)."
+        )
+    }
 }
 
 /// 種類の表示名（カスタムは id とパスを併記する）。プロンプト・メッセージ用。
@@ -1806,16 +1993,34 @@ pub fn settings_frame_with(
                 limits.join(", ")
             ));
             let split = memo.candidates(root, scope, kind);
-            if let Some(dir) = kind.split_dir.as_deref().filter(|_| !split.is_empty()) {
+            if let Some(grant) = split_grant(root, kind, &split) {
+                let dir = &grant.dir;
+                let count = grant.remaining(&split);
+                let creation = split_creation_sentence(dir, count);
                 let agents_rule = if kind.document == Document::Agents {
                     " Keep the rules that apply to all work in AGENTS.md and move only details, adding a line such as \"Before changing X, read docs/agents/x.md\" for each moved topic."
                 } else {
                     ""
                 };
-                lines.push(format!(
-                    "- Splitting: when a file reaches or exceeds its limit, start splitting immediately instead of trimming first. Move detail into files under `{dir}/`, and consider what to condense or drop only while you do the splitting. Create or edit only these files: {}. Use one topic per file, and leave a one- or two-sentence summary with a relative link to the new file in the main document. {SPLIT_NAMING_RULE}{agents_rule}",
+                let existing = if split.is_empty() {
+                    "none".to_string()
+                } else {
                     split.join(", ")
-                ));
+                };
+                let naming = if count > 0 {
+                    format!(" {SPLIT_NAMING_RULE}")
+                } else {
+                    String::new()
+                };
+                lines.push(if split.is_empty() && count == 0 {
+                    format!(
+                        "- Splitting: there is no file under `{dir}/` that you may edit. {creation} Reduce size within the existing document."
+                    )
+                } else {
+                    format!(
+                        "- Splitting: when a file reaches or exceeds its limit, start splitting immediately instead of trimming first. Move detail into files under `{dir}/`, and consider what to condense or drop only while you do the splitting. Existing files there that you may edit: {existing}. {creation} Use one topic per file, and leave a one- or two-sentence summary with a relative link to that file in the main document.{naming}{agents_rule}"
+                    )
+                });
             }
         }
         if let Some(lang) = &kind.language {

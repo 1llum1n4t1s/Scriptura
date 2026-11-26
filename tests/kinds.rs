@@ -1231,88 +1231,229 @@ fn split_dir_validation_rejects_unsafe_overlapping_and_changelog_values() {
     assert_eq!(kinds[0].split_dir, None);
 }
 
-#[test]
-fn split_candidates_come_from_tracked_files_and_h2_headings() {
-    let root = runtime_dir("split");
-    for args in [
-        vec!["init", "-q", "-b", "main"],
-        vec!["config", "user.email", "t@example.com"],
-        vec!["config", "user.name", "t"],
+fn git_ok(root: &Path, args: &[&str]) {
+    assert!(
+        Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success(),
+        "git {args:?}"
+    );
+}
+
+/// 使い捨ての git リポジトリを作る（利用者の署名・hook の設定は使わない）。
+fn split_repo(name: &str) -> PathBuf {
+    let root = runtime_dir(name);
+    git_ok(&root, &["init", "-q", "-b", "main"]);
+    for (key, value) in [
+        ("user.email", "t@example.com"),
+        ("user.name", "t"),
+        ("commit.gpgsign", "false"),
+        ("core.hooksPath", ".git/no-hooks"),
     ] {
-        assert!(
-            Command::new("git")
-                .args(&args)
-                .current_dir(&root)
-                .status()
-                .unwrap()
-                .success()
-        );
+        git_ok(&root, &["config", key, value]);
     }
+    root
+}
+
+fn commit_all(root: &Path) {
+    git_ok(root, &["add", "-A"]);
+    git_ok(root, &["commit", "-q", "-m", "t"]);
+}
+
+#[test]
+fn split_candidates_come_only_from_tracked_files() {
+    let root = split_repo("split");
     write(
         &root,
         "README.md",
-        "# 題\n## Install guide\n本文\n## 日本語の見出し\n```\n## コード内\n```\n## readme\n## Install guide\n",
+        "# 題\n## Install guide\n本文\n## 日本語の見出し\n",
     );
     write(&root, "docs/readme/existing.md", "x");
     write(&root, "docs/readme/not-md.txt", "x");
+    git_ok(&root, &["add", "-A"]);
     write(&root, "docs/readme/untracked.md", "x");
-    assert!(
-        Command::new("git")
-            .args([
-                "add",
-                "README.md",
-                "docs/readme/existing.md",
-                "docs/readme/not-md.txt"
-            ])
-            .current_dir(&root)
-            .status()
-            .unwrap()
-            .success()
-    );
     let kinds = resolve("[kinds.readme]\nmax_chars = 100\n", "\"README.md\"");
     let scope = Scope {
         readme: vec![root.join("README.md")],
         ..Scope::default()
     };
-    let got = kinds::split_candidates(&root, &scope, &kinds[0]);
+    // 追跡されている直下の *.md だけ（見出し由来の名前・未追跡・md 以外は入らない）。
     assert_eq!(
-        got,
-        vec![
-            // 既に追跡されている直下の *.md（未追跡・md 以外は入らない）
-            "docs/readme/existing.md",
-            // ASCII の slug が 3 文字以上ならそれ、取れなければ section-NN（通し番号は見出し順）
-            "docs/readme/install-guide.md",
-            "docs/readme/section-02.md",
-            // 組み込みの対象名は -section を付ける（重複した見出しは 1 件）
-            "docs/readme/readme-section.md",
-            // 見出しから名前が取れないときのための、内容を表す汎用の主題名（末尾）
-            "docs/readme/overview.md",
-            "docs/readme/architecture.md",
-            "docs/readme/workflow.md",
-            "docs/readme/configuration.md",
-            "docs/readme/commands.md",
-            "docs/readme/testing.md",
-            "docs/readme/security.md",
-            "docs/readme/release-process.md",
-            "docs/readme/troubleshooting.md",
-            "docs/readme/data-model.md",
-            "docs/readme/conventions.md",
-            "docs/readme/api-reference.md",
-        ]
+        kinds::split_candidates(&root, &scope, &kinds[0]),
+        vec!["docs/readme/existing.md"]
     );
     // 許可パスにも入る（分割先が無い種類は入らない）。
     let plan = rel(&root, &plan_documents(&root, &scope, &kinds, &[]));
-    assert!(plan.contains(&"README.md".to_string()));
-    assert!(plan.contains(&"docs/readme/section-02.md".to_string()));
+    assert_eq!(plan, ["README.md", "docs/readme/existing.md"]);
     let none = resolve("", "\"README.md\"");
     assert!(kinds::split_candidates(&root, &scope, &none[0]).is_empty());
     // 1 種類 20 件まで。
-    let many: String = (1..=30).map(|i| format!("## topic number {i}\n")).collect();
-    write(&root, "README.md", &many);
+    for i in 1..=25 {
+        write(&root, &format!("docs/readme/topic-{i:02}.md"), "x");
+    }
+    git_ok(&root, &["add", "-A"]);
     assert_eq!(
         kinds::split_candidates(&root, &scope, &kinds[0]).len(),
         kinds::MAX_SPLIT_FILES
     );
+}
+
+#[test]
+fn split_grant_allows_new_files_only_when_every_markdown_there_is_editable() {
+    let root = split_repo("grant");
+    write(&root, "README.md", "x");
+    let kinds = resolve("[kinds.readme]\nmax_chars = 100\n", "\"README.md\"");
+    let grant = |allowed: &[String]| kinds::split_grant(&root, &kinds[0], allowed).unwrap();
+    // 分割先を持たない種類には記録が無い。
+    let none = resolve("", "\"README.md\"");
+    assert_eq!(kinds::split_grant(&root, &none[0], &[]), None);
+    // 分割先がまだ無ければ許可する。
+    commit_all(&root);
+    let got = grant(&[]);
+    assert_eq!(
+        (got.dir.as_str(), got.existing.len(), got.granted),
+        ("docs/readme", 0, true)
+    );
+    assert_eq!(got.remaining(&[]), kinds::MAX_SPLIT_FILES);
+    // 追跡済みで未変更の .md が許可一覧にあれば許可する。.md 以外は妨げにしない。
+    write(&root, "docs/readme/Usage.md", "x");
+    write(&root, "docs/readme/sub/inner.txt", "x");
+    commit_all(&root);
+    write(&root, "docs/readme/memo.txt", "x");
+    let allowed = vec!["docs/readme/Usage.md".to_string()];
+    let got = grant(&allowed);
+    assert!(got.granted);
+    assert_eq!(got.existing, ["memo.txt", "sub", "usage.md"]);
+    assert_eq!(got.remaining(&allowed), kinds::MAX_SPLIT_FILES - 1);
+    // 許可一覧に無い .md（未追跡）があれば許可しない。
+    write(&root, "docs/readme/draft.MD", "x");
+    let got = grant(&allowed);
+    assert!(!got.granted);
+    assert_eq!(got.remaining(&allowed), 0);
+    // 追跡済みで未変更の非 ASCII 名は status には出ないが、許可一覧に入らないので許可しない。
+    fs::rename(
+        root.join("docs/readme/draft.MD"),
+        root.join("docs/readme/日本語.md"),
+    )
+    .unwrap();
+    commit_all(&root);
+    assert!(!grant(&allowed).granted);
+}
+
+#[test]
+fn new_split_entries_accepts_descriptive_names_and_rejects_everything_else() {
+    let root = runtime_dir("new-entries");
+    let long_ok = format!("{}.md", "a".repeat(40));
+    let long_ng = format!("{}.md", "a".repeat(41));
+    let good = [
+        long_ok.as_str(),
+        "api-compat.md",
+        "api-details.md",
+        "testing-2.md",
+        "testing.md",
+    ];
+    let bad = [
+        "-ab.md",
+        "1ab.md",
+        "Section.md",
+        "a--b.md",
+        long_ng.as_str(),
+        "ab-.md",
+        "ab.md",
+        "agents.md",
+        "changelog.md",
+        "com1.md",
+        "con.md",
+        "design.md",
+        "details.md",
+        "misc.md",
+        "new-file-2.md",
+        "part-1.md",
+        "readme.md",
+        "section-05.md",
+        "snake_case.md",
+        "two.dots.md",
+        "usage.txt",
+        "x.MD",
+        "日本語.md",
+    ];
+    for name in good.iter().chain(&bad) {
+        write(&root, &format!("docs/readme/{name}"), "x");
+    }
+    fs::create_dir_all(root.join("docs/readme/folder")).unwrap();
+    write(&root, "docs/readme/old.md", "x");
+    write(&root, "docs/readme/kept.txt", "x");
+    let grant = kinds::SplitGrant {
+        dir: "docs/readme".into(),
+        existing: vec!["old.md".into(), "kept.txt".into()],
+        granted: true,
+    };
+    let allowed = vec!["README.md".to_string(), "docs/readme/old.md".to_string()];
+    let got = kinds::new_split_entries(&root, std::slice::from_ref(&grant), &allowed);
+    let sorted = |names: &[&str]| {
+        let mut out: Vec<String> = names.iter().map(|n| format!("docs/readme/{n}")).collect();
+        out.sort();
+        out
+    };
+    let mut rejected = bad.to_vec();
+    rejected.push("folder");
+    assert_eq!(got.accepted, sorted(&good));
+    assert_eq!(got.rejected, sorted(&rejected));
+    // 受理済み（許可一覧に入ったもの）は次の起動では新規として数えない。
+    let mut allowed = allowed;
+    allowed.extend(got.accepted.clone());
+    let again = kinds::new_split_entries(&root, std::slice::from_ref(&grant), &allowed);
+    assert!(again.accepted.is_empty(), "{:?}", again.accepted);
+    assert_eq!(again.rejected, sorted(&rejected));
+}
+
+#[test]
+fn new_split_entries_counts_files_and_respects_ungranted_directories() {
+    let root = runtime_dir("new-entries-limit");
+    let mut allowed: Vec<String> = (1..kinds::MAX_SPLIT_FILES)
+        .map(|i| format!("docs/readme/topic-{i:02}.md"))
+        .collect();
+    for path in &allowed {
+        write(&root, path, "x");
+    }
+    let mut grant = kinds::SplitGrant {
+        dir: "docs/readme".into(),
+        existing: allowed
+            .iter()
+            .map(|p| p.rsplit('/').next().unwrap().to_string())
+            .collect(),
+        granted: true,
+    };
+    let entries = |grant: &kinds::SplitGrant, allowed: &[String]| {
+        kinds::new_split_entries(&root, std::slice::from_ref(grant), allowed)
+    };
+    // 残り 1 件: 名前順で先の 1 件だけを受理する。
+    write(&root, "docs/readme/bravo.md", "x");
+    write(&root, "docs/readme/alpha.md", "x");
+    let got = entries(&grant, &allowed);
+    assert_eq!(got.accepted, ["docs/readme/alpha.md"]);
+    assert_eq!(got.rejected, ["docs/readme/bravo.md"]);
+    allowed.extend(got.accepted);
+    let got = entries(&grant, &allowed);
+    assert!(got.accepted.is_empty());
+    assert_eq!(got.rejected, ["docs/readme/bravo.md"]);
+    // 許可していない分割先は、新しい .md だけを拒否する。
+    grant.granted = false;
+    write(&root, "docs/readme/note.txt", "x");
+    let got = entries(&grant, &allowed);
+    assert!(got.accepted.is_empty());
+    assert_eq!(got.rejected, ["docs/readme/bravo.md"]);
+    // 分割先が無ければ何も無い。許可した分割先がファイルに置き換わったら分割先を拒否する。
+    grant.dir = "docs/absent".into();
+    grant.existing.clear();
+    grant.granted = true;
+    let got = entries(&grant, &[]);
+    assert!(got.accepted.is_empty() && got.rejected.is_empty());
+    write(&root, "docs/absent", "x");
+    assert_eq!(entries(&grant, &[]).rejected, ["docs/absent"]);
 }
 
 #[test]
@@ -1383,7 +1524,22 @@ fn fixup_prompt_names_each_violation_with_numbers_and_the_editable_paths() {
         required_cut: 1_001,
     }];
     let allowed = vec!["README.md".to_string(), "docs/readme/a.md".to_string()];
-    let prompt = kinds::fixup_prompt(&kinds, &violations, &agents, &allowed);
+    // 許可が残っている分割先は件数と命名の規則を、残りの無い分割先は作らないことを示す。
+    let split = vec![
+        ("docs/readme".to_string(), 3),
+        ("docs/design".to_string(), 0),
+    ];
+    let prompt = kinds::fixup_prompt(&kinds, &violations, &agents, &allowed, &split);
+    for needle in [
+        "create at most 3 new files directly under `docs/readme/`",
+        "Do not create new files in `docs/design/` this time",
+        "Name each new file yourself",
+    ] {
+        assert!(prompt.contains(needle), "{needle}\n{prompt}");
+    }
+    assert_eq!(prompt.matches("Name each new file yourself").count(), 1);
+    let prompt = kinds::fixup_prompt(&kinds, &violations, &agents, &allowed, &[]);
+    assert!(!prompt.contains("new files directly under"), "{prompt}");
     for needle in [
         "README.md: currently 1500 characters, but at most 1000",
         "Remove at least 500 characters; aim for at most 900 characters",
@@ -1408,6 +1564,7 @@ fn fixup_prompt_names_each_violation_with_numbers_and_the_editable_paths() {
         }],
         &[],
         &["CHANGELOG.md".to_string()],
+        &[],
     );
     assert!(prompt.contains("Only the Unreleased section"), "{prompt}");
     assert!(!prompt.contains("files under"), "{prompt}");
@@ -1435,7 +1592,7 @@ fn chain_fixup_prompt_lists_members_sizes_editability_and_the_required_cut() {
         "AGENTS.md".to_string(),
         "apps/hikyaku/AGENTS.md".to_string(),
     ];
-    let prompt = kinds::fixup_prompt(&[], &[], std::slice::from_ref(&over), &allowed);
+    let prompt = kinds::fixup_prompt(&[], &[], std::slice::from_ref(&over), &allowed, &[]);
     for needle in [
         "applied to `apps/hikyaku`",
         "total 30639 bytes",
@@ -1465,6 +1622,7 @@ fn chain_fixup_prompt_lists_members_sizes_editability_and_the_required_cut() {
             ..locked
         }],
         &allowed,
+        &[],
     );
     assert!(
         prompt.contains("- AGENTS.md: 22392 bytes (NOT editable this time)"),
@@ -1494,8 +1652,9 @@ fn fixup_budget_shares_the_worker_timeout() {
 
 #[test]
 fn settings_frame_demands_the_limit_and_lists_the_split_files() {
-    let root = runtime_dir("frame");
+    let root = split_repo("frame");
     write(&root, "README.md", "# 題\n## 概要\n本文\n## Usage notes\n");
+    commit_all(&root);
     let kinds = resolve("[kinds.readme]\nmax_chars = 100\n", "\"README.md\"");
     let scope = Scope {
         readme: vec![root.join("README.md")],
@@ -1508,14 +1667,35 @@ fn settings_frame_demands_the_limit_and_lists_the_split_files() {
         "bringing it within the limit is itself a required part of this task",
         "aim for at most 90% of the limit",
         "files under `docs/readme/`",
-        "docs/readme/section-01.md",
-        "docs/readme/usage-notes.md",
+        "Existing files there that you may edit: none.",
+        "create at most 20 new files directly under `docs/readme/`",
         "relative link",
-        "Each file name must describe its content",
-        "docs/readme/testing.md",
+        "Name each new file yourself",
     ] {
         assert!(frame.contains(needle), "{needle}\n{frame}");
     }
+    // 固定の候補は出さない。
+    for needle in ["section-01.md", "testing.md", "usage-notes.md"] {
+        assert!(!frame.contains(needle), "{needle}\n{frame}");
+    }
+    // 追跡済みの分割先は編集できる一覧に出て、その分だけ新規の件数が減る。
+    write(&root, "docs/readme/usage.md", "x");
+    commit_all(&root);
+    let frame = settings_frame(&root, &scope, &active, &[]);
+    for needle in [
+        "Existing files there that you may edit: docs/readme/usage.md.",
+        "create at most 19 new files directly under `docs/readme/`",
+    ] {
+        assert!(frame.contains(needle), "{needle}\n{frame}");
+    }
+    // 新規作成を許せない状態（未追跡の .md がある）では作らせない。
+    write(&root, "docs/readme/draft.md", "x");
+    let frame = settings_frame(&root, &scope, &active, &[]);
+    assert!(
+        frame.contains("Do not create new files in `docs/readme/` this time"),
+        "{frame}"
+    );
+    assert!(!frame.contains("new files directly under"), "{frame}");
     // 上限の無い構成は枠ごと出ない（従来 3 種の既定構成のプロンプトを変えない）。
     let kinds = resolve("", "\"README.md\"");
     let active: Vec<&ResolvedKind> = kinds.iter().collect();

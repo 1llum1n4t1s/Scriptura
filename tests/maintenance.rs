@@ -394,6 +394,7 @@ impl Fixture {
                 "HOOK_STUB_HEAD_CHANGE",
                 "HOOK_GIT_UNCERTAIN_OPERATION",
                 "SCRIPTURA_TEST_GIT_TIMEOUT_MS",
+                "SCRIPTURA_TEST_FAIL_AFTER_SPLIT_SAVE",
                 "SCRIPTURA_HOME",
             ] {
                 env::remove_var(key);
@@ -597,6 +598,7 @@ impl Drop for Fixture {
                 "HOOK_STUB_HEAD_CHANGE",
                 "HOOK_GIT_UNCERTAIN_OPERATION",
                 "SCRIPTURA_TEST_GIT_TIMEOUT_MS",
+                "SCRIPTURA_TEST_FAIL_AFTER_SPLIT_SAVE",
             ] {
                 env::remove_var(k);
             }
@@ -4524,44 +4526,447 @@ fn split_files_are_allowed_committed_and_checked_per_file() {
     f.hook("UserPromptSubmit");
     f.push_change("later");
     let head = f.head();
-    let part = f.root.join("docs/readme/section-01.md");
-    f.writes(json!({
-        f.readme_path(): "# 題\n[概要](docs/readme/section-01.md)\n",
-        part.to_str().unwrap(): "詳細な説明".repeat(5),
-    }));
+    // 1 回目は上限超過のままで、追い修正が分割先に新しいファイルを作る。
+    f.writes(json!([
+        {f.readme_path(): format!("# 題\n## 概要\n{}", "r".repeat(60))},
+        {
+            f.readme_path(): "# 題\n[使い方](docs/readme/usage.md)\n",
+            f.split_path("usage.md"): "詳細な説明".repeat(5),
+        },
+    ]));
     assert_eq!(f.hook("Stop"), None);
     assert_ne!(f.head(), head);
     let files = f.head_files();
     assert!(
         files.contains(&"README.md".to_string())
-            && files.contains(&"docs/readme/section-01.md".to_string()),
+            && files.contains(&"docs/readme/usage.md".to_string()),
         "{files:?}"
     );
-    // restricted の許可規則に、分割先の新規ファイルが完全一致で入る。
+    // restricted の許可規則には分割先のグロブが入り、主プロンプトは残り件数を示す。
     assert!(
         f.allowed_rules()
-            .iter()
-            .any(|r| r.contains("docs/readme/section-01.md")),
+            .contains(&"Edit(./docs/readme/*.md)".to_string()),
         "{:?}",
         f.allowed_rules()
     );
-    assert_eq!(f.state()["phase"], "complete");
+    let first = f.prompt_of_run(1);
+    assert!(
+        first.contains(r#"[{"dir":"docs/readme","max_new_files":20}]"#),
+        "{first}"
+    );
+    let second = f.prompt_of_run(2);
+    assert!(
+        second.contains("at most 20 new files directly under `docs/readme/`"),
+        "{second}"
+    );
+    let state = f.state();
+    assert_eq!(state["phase"], "complete");
+    assert_eq!(state["split_dirs"][0]["dir"], "docs/readme");
+    assert_eq!(state["split_dirs"][0]["granted"], true);
+    assert!(
+        state["before"]
+            .as_object()
+            .unwrap()
+            .get("docs/readme/usage.md")
+            .is_some_and(Value::is_null),
+        "{state}"
+    );
+}
+
+impl Fixture {
+    fn split_path(&self, name: &str) -> String {
+        self.root
+            .join("docs/readme")
+            .join(name)
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+    /// 分割先を持つ README を push した直後の環境。
+    fn split_fixture(permission: Permission) -> Fixture {
+        let f = Fixture::with_config(Some(readme_limit_config(permission, 1000)));
+        f.commit_push_file("README.md", "# 題\n## 概要\n本文\n");
+        f.hook("UserPromptSubmit");
+        f.push_change("later");
+        f
+    }
+    fn has_split_rule(&self) -> bool {
+        self.allowed_rules()
+            .contains(&"Edit(./docs/readme/*.md)".to_string())
+    }
+    fn violation_paths(&self) -> Vec<String> {
+        let mut paths: Vec<String> = self.state()["violation"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        paths.sort();
+        paths
+    }
+    /// 違反の直後: 変更が残る間は worker を起動せず、`resolve` で消すか変えると再実行して完了する。
+    fn assert_blocked_until_changed(&self, resolve: impl FnOnce()) {
+        let head = self.head();
+        let rejected = self.violation_paths();
+        self.writes(json!({}));
+        for _ in 0..2 {
+            let message = self.hook("Stop").expect("違反が残る通知があるはず");
+            assert!(message.contains("前回"), "{message}");
+            for path in &rejected {
+                assert!(message.contains(path.as_str()), "{message}");
+            }
+        }
+        assert_eq!(self.worker_runs(), 1, "残っている間は再実行しない");
+        assert_eq!(self.state()["phase"], "worker_failed");
+        assert_eq!(self.head(), head);
+        resolve();
+        self.writes(json!({self.readme_path(): "再実行"}));
+        assert_eq!(self.hook("Stop"), None);
+        assert_eq!(self.worker_runs(), 2, "消すか変えると再実行する");
+        assert_eq!(self.state()["phase"], "complete");
+        assert_eq!(self.head_files(), vec!["README.md".to_string()]);
+    }
 }
 
 #[test]
-fn a_file_in_the_split_dir_that_was_not_listed_is_a_worker_violation() {
-    let config = readme_limit_config(Permission::Restricted, 1000);
-    let f = Fixture::with_config(Some(config));
-    f.commit_push_file("README.md", "# 題\n## 概要\n本文\n");
+fn a_badly_named_split_file_is_a_violation_in_every_permission_mode_until_removed() {
+    for permission in [Permission::Bypass, Permission::Restricted] {
+        let f = Fixture::split_fixture(permission);
+        let head = f.head();
+        let bad = f.split_path("section-01.md");
+        f.writes(json!({f.readme_path(): "partial", bad.as_str(): "番号だけの名前"}));
+        let message = f.hook("Stop").expect("名前の違反で失敗するはず");
+        assert!(
+            message.contains("docs/readme/section-01.md") && message.contains("消す"),
+            "{permission:?}: {message}"
+        );
+        // 同じパスを全体比較も検出するが、記録と通知は 1 つにまとめる。
+        assert!(!message.contains("許可文書以外"), "{message}");
+        assert_eq!(f.violation_paths(), ["docs/readme/section-01.md"]);
+        assert_eq!(f.head(), head, "commit しない");
+        assert_eq!(f.state()["phase"], "worker_failed");
+        assert!(std::path::Path::new(&bad).exists(), "自動では消さない");
+        f.assert_blocked_until_changed(|| fs::remove_file(&bad).unwrap());
+    }
+}
+
+#[test]
+fn a_split_subfolder_is_one_violation_and_out_of_scope_changes_are_still_reported() {
+    let f = Fixture::split_fixture(Permission::Restricted);
+    let nested = f.root.join("docs/readme/sub/topic-x.md");
+    f.writes(json!({
+        nested.to_str().unwrap(): "サブフォルダー",
+        f.root.join("outside.txt").to_str().unwrap(): "範囲外",
+    }));
+    let message = f.hook("Stop").expect("違反で失敗するはず");
+    assert!(
+        message.contains("docs/readme/sub")
+            && message.contains("outside.txt")
+            && message.contains("許可文書以外")
+            && !message.contains("topic-x.md"),
+        "{message}"
+    );
+    assert_eq!(f.violation_paths(), ["docs/readme/sub", "outside.txt"]);
+    f.assert_blocked_until_changed(|| {
+        fs::remove_dir_all(f.root.join("docs/readme/sub")).unwrap();
+        fs::remove_file(f.root.join("outside.txt")).unwrap();
+    });
+}
+
+#[test]
+fn an_ignored_split_dir_allows_no_new_files_and_resumes_once_they_are_removed_or_edited() {
+    // 無視対象のファイルは Git の状態の一覧に出ないので、違反の指紋はファイルそのものから取る。
+    for permission in [Permission::Bypass, Permission::Restricted] {
+        let f = Fixture::with_config(Some(readme_limit_config(permission, 1000)));
+        f.commit_push_file(".gitignore", "docs/readme/\n");
+        f.hook("UserPromptSubmit");
+        f.push_change("later");
+        let new_file = f.split_path("usage.md");
+        f.writes(json!({new_file.as_str(): "無視対象"}));
+        let message = f.hook("Stop").expect("違反で失敗するはず");
+        assert!(message.contains("docs/readme/usage.md"), "{message}");
+        assert_eq!(f.state()["split_dirs"][0]["granted"], false);
+        if permission == Permission::Restricted {
+            assert!(!f.has_split_rule(), "{:?}", f.allowed_rules());
+        }
+        // 片方は消し、もう片方は中身だけ変える（どちらも再実行する）。
+        f.assert_blocked_until_changed(|| match permission {
+            Permission::Bypass => fs::remove_file(&new_file).unwrap(),
+            Permission::Restricted => fs::write(&new_file, "利用者が書き換えた").unwrap(),
+        });
+    }
+}
+
+#[test]
+fn a_new_split_file_matching_an_ignore_pattern_is_rejected() {
+    let f = Fixture::with_config(Some(readme_limit_config(Permission::Bypass, 1000)));
+    f.commit_push_file(".gitignore", "*-api.md\n");
     f.hook("UserPromptSubmit");
     f.push_change("later");
     let head = f.head();
-    let other = f.root.join("docs/readme/other.md");
-    f.writes(json!({other.to_str().unwrap(): "列挙されていない名前"}));
-    let message = f.hook("Stop").expect("許可パス外の変更で失敗するはず");
-    assert!(message.contains("docs/readme/other.md"), "{message}");
+    f.writes(json!({f.split_path("web-api.md"): "無視される名前"}));
+    let message = f.hook("Stop").expect("違反で失敗するはず");
+    assert!(message.contains("docs/readme/web-api.md"), "{message}");
     assert_eq!(f.head(), head);
     assert_eq!(f.state()["phase"], "worker_failed");
+}
+
+#[test]
+fn an_untracked_markdown_in_the_split_dir_stops_new_files() {
+    let f = Fixture::split_fixture(Permission::Restricted);
+    let draft = f.split_path("draft-plan.md");
+    fs::create_dir_all(f.root.join("docs/readme")).unwrap();
+    fs::write(&draft, "利用者の下書き").unwrap();
+    let head = f.head();
+    f.writes(json!({f.split_path("usage.md"): "新規"}));
+    let message = f.hook("Stop").expect("違反で失敗するはず");
+    assert!(
+        message.contains("docs/readme/usage.md") && !message.contains("draft-plan.md"),
+        "{message}"
+    );
+    assert!(!f.has_split_rule(), "{:?}", f.allowed_rules());
+    assert!(!f.prompt_text().contains("max_new_files"));
+    assert_eq!(f.head(), head);
+    assert_eq!(fs::read_to_string(&draft).unwrap(), "利用者の下書き");
+}
+
+#[test]
+fn new_split_files_beyond_the_limit_are_rejected() {
+    let f = Fixture::with_config(Some(readme_limit_config(Permission::Restricted, 1000)));
+    fs::create_dir_all(f.root.join("docs/readme")).unwrap();
+    for letter in 'a'..='s' {
+        fs::write(f.split_path(&format!("guide-{letter}.md")), "既存").unwrap();
+    }
+    f.git(&["add", "docs/readme"]);
+    f.git(&["commit", "-m", "19 files"]);
+    f.git(&["push"]);
+    f.hook("UserPromptSubmit");
+    f.push_change("later");
+    let head = f.head();
+    f.writes(json!({
+        f.split_path("testing.md"): "20 件目",
+        f.split_path("usage.md"): "21 件目",
+    }));
+    let message = f.hook("Stop").expect("件数超過で失敗するはず");
+    assert!(
+        message.contains("docs/readme/usage.md") && !message.contains("testing.md"),
+        "{message}"
+    );
+    assert!(f.prompt_text().contains(r#""max_new_files":1}"#));
+    assert!(f.has_split_rule(), "{:?}", f.allowed_rules());
+    assert_eq!(f.violation_paths(), ["docs/readme/usage.md"]);
+    assert!(f.state()["before"].get("docs/readme/testing.md").is_some());
+    assert_eq!(f.head(), head);
+}
+
+#[test]
+fn files_created_by_a_failed_worker_are_recorded_and_discarded_at_the_next_push() {
+    let f = Fixture::split_fixture(Permission::Bypass);
+    let new_file = f.split_path("usage.md");
+    f.writes(json!({f.readme_path(): "partial", new_file.as_str(): "partial"}));
+    unsafe { env::set_var("HOOK_STUB_EXIT", "1") };
+    assert!(f.hook("Stop").is_some());
+    let state = f.state();
+    assert_eq!(state["phase"], "worker_failed");
+    assert!(
+        state["before"]
+            .as_object()
+            .unwrap()
+            .get("docs/readme/usage.md")
+            .is_some_and(Value::is_null),
+        "{state}"
+    );
+    assert!(
+        state["after"]["docs/readme/usage.md"].is_string(),
+        "{state}"
+    );
+    unsafe { env::remove_var("HOOK_STUB_EXIT") };
+    f.push_change("next");
+    f.writes(json!({f.readme_path(): "次の保守"}));
+    f.hook("Stop");
+    assert_eq!(f.worker_runs(), 2);
+    assert!(!std::path::Path::new(&new_file).exists(), "破棄で消える");
+    assert_eq!(f.state()["phase"], "complete");
+    assert_eq!(f.state()["split_dirs"][0]["granted"], true);
+    assert_eq!(f.git(&["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_file_the_user_adds_before_a_retry_is_not_treated_as_the_workers() {
+    let f = Fixture::split_fixture(Permission::Restricted);
+    unsafe { env::set_var("HOOK_STUB_EXIT", "1") };
+    assert!(f.hook("Stop").is_some());
+    assert!(f.has_split_rule());
+    unsafe { env::remove_var("HOOK_STUB_EXIT") };
+    let mine = f.split_path("user-guide.md");
+    fs::create_dir_all(f.root.join("docs/readme")).unwrap();
+    fs::write(&mine, "利用者のファイル").unwrap();
+    f.writes(json!({f.readme_path(): "再試行"}));
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.worker_runs(), 2);
+    assert!(!f.has_split_rule(), "{:?}", f.allowed_rules());
+    assert_eq!(f.head_files(), vec!["README.md".to_string()]);
+    assert_eq!(fs::read_to_string(&mine).unwrap(), "利用者のファイル");
+    assert!(
+        f.state()["before"]
+            .get("docs/readme/user-guide.md")
+            .is_none()
+    );
+}
+
+#[test]
+fn an_interruption_right_after_recording_a_split_file_recovers_without_deleting_it() {
+    let f = Fixture::split_fixture(Permission::Bypass);
+    let new_file = f.split_path("usage.md");
+    f.writes(json!({new_file.as_str(): "作りかけ"}));
+    unsafe { env::set_var("SCRIPTURA_TEST_FAIL_AFTER_SPLIT_SAVE", "1") };
+    let message = f.hook("Stop").expect("中断の通知があるはず");
+    assert!(message.contains("interrupted after recording"), "{message}");
+    unsafe { env::remove_var("SCRIPTURA_TEST_FAIL_AFTER_SPLIT_SAVE") };
+    let state = f.state();
+    assert_eq!(state["phase"], "worker_running");
+    for key in ["before", "after"] {
+        assert!(
+            state[key]
+                .as_object()
+                .unwrap()
+                .get("docs/readme/usage.md")
+                .is_some_and(Value::is_null),
+            "{key}: {state}"
+        );
+    }
+    fs::write(&new_file, "利用者が引き継いだ").unwrap();
+    // 書きかけを戻す処理は、記録と違うファイルがあれば何も消さない。
+    let mut recovered = state.clone();
+    discard_interrupted_outputs(&f.root, &mut recovered, &f.head());
+    assert_eq!(recovered, state);
+    // 中断した worker の終了確認は並列に動く他のテストの worker も数えるので、確認を済ませた段階から再開する。
+    let mut state = state;
+    state["phase"] = json!("interrupted_recovered");
+    f.save(&mut state);
+    f.writes(json!({f.readme_path(): "復旧後"}));
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.worker_runs(), 2);
+    assert_eq!(f.state()["phase"], "complete");
+    assert_eq!(f.head_files(), vec!["README.md".to_string()]);
+    assert_eq!(fs::read_to_string(&new_file).unwrap(), "利用者が引き継いだ");
+}
+
+#[test]
+fn a_split_dir_cleared_by_the_user_is_granted_again_on_retry() {
+    let f = Fixture::split_fixture(Permission::Restricted);
+    let draft = f.split_path("draft-plan.md");
+    fs::create_dir_all(f.root.join("docs/readme")).unwrap();
+    fs::write(&draft, "利用者の下書き").unwrap();
+    unsafe { env::set_var("HOOK_STUB_EXIT", "1") };
+    assert!(f.hook("Stop").is_some());
+    assert_eq!(f.state()["split_dirs"][0]["granted"], false);
+    unsafe { env::remove_var("HOOK_STUB_EXIT") };
+    fs::remove_file(&draft).unwrap();
+    f.writes(json!({
+        f.readme_path(): "再試行",
+        f.split_path("usage.md"): "新規",
+    }));
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.worker_runs(), 2);
+    assert!(f.has_split_rule(), "{:?}", f.allowed_rules());
+    assert_eq!(f.state()["split_dirs"][0]["granted"], true);
+    assert!(
+        f.head_files()
+            .contains(&"docs/readme/usage.md".to_string())
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_timed_out_first_run_with_a_rejected_split_file_is_reverted_and_not_retried() {
+    for permission in [Permission::Bypass, Permission::Restricted] {
+        let f = Fixture::split_fixture(permission);
+        short_worker_deadline(10);
+        unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "1:60") };
+        let head = f.head();
+        let good = f.split_path("usage.md");
+        let bad = f.split_path("section-01.md");
+        f.writes(json!({
+            f.readme_path(): "partial",
+            good.as_str(): "partial",
+            bad.as_str(): "partial",
+        }));
+        let message = f.hook("Stop").expect("失敗の通知があるはず");
+        assert!(
+            message.contains("戻しました") && message.contains("docs/readme/section-01.md"),
+            "{permission:?}: {message}"
+        );
+        // 同じ対象コミットでは自動で再実行しないので、「消すと再実行します」とは言わない。
+        assert!(
+            message.contains("次の push か「今すぐ保守」で再試行します")
+                && message.contains("ファイルは自動で消しません")
+                && !message.contains("消すと再実行します"),
+            "{permission:?}: {message}"
+        );
+        assert_eq!(f.written_run(), "1");
+        assert_eq!(
+            fs::read_to_string(f.root.join("README.md")).unwrap(),
+            "# 題\n## 概要\n本文\n"
+        );
+        assert!(!std::path::Path::new(&good).exists());
+        assert!(std::path::Path::new(&bad).exists(), "自動では消さない");
+        let state = f.state();
+        assert_eq!(state["phase"], "worker_failed");
+        assert_eq!(state["worker_timed_out"], true);
+        assert_eq!(state["after"], state["before"]);
+        assert_eq!(f.violation_paths(), ["docs/readme/section-01.md"]);
+        // 拒否されたファイルを消しても、同じ対象コミットでは自動で再実行しない。
+        fs::remove_file(&bad).unwrap();
+        assert_eq!(f.hook("Stop"), None);
+        assert_eq!(f.worker_runs(), 1);
+        assert_eq!(f.head(), head);
+        normal_worker_deadline();
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_timed_out_fixup_with_a_rejected_split_file_is_reverted_and_not_committed() {
+    let f = readme_over_limit_fixture(Permission::Bypass);
+    short_worker_deadline(10);
+    unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "2:60") };
+    let head = f.head();
+    let bad = f.split_path("section-01.md");
+    let first = format!("# 題\n## 概要\n{}", "r".repeat(60));
+    f.writes(json!([
+        {f.readme_path(): first},
+        {f.readme_path(): "p".repeat(80), bad.as_str(): "partial"},
+    ]));
+    let message = f.hook("Stop").expect("失敗の通知があるはず");
+    assert!(
+        message.contains("追い修正に残っていた時間")
+            && message.contains("docs/readme/section-01.md"),
+        "{message}"
+    );
+    // commit しないので「直前の内容を使います」とは言わず、自動の再実行も約束しない。
+    assert!(
+        message.contains("書きかけの変更は取り消しました")
+            && message.contains("ファイルは自動で消しません")
+            && !message.contains("直前の内容を使います")
+            && !message.contains("消すと再実行します"),
+        "{message}"
+    );
+    assert_eq!(f.written_run(), "2");
+    assert_eq!(fs::read_to_string(f.root.join("README.md")).unwrap(), first);
+    let state = f.state();
+    assert_eq!(state["phase"], "worker_failed");
+    assert_eq!(state["worker_timed_out"], true);
+    fs::remove_file(&bad).unwrap();
+    assert_eq!(f.hook("Stop"), None);
+    assert_eq!(f.worker_runs(), 2);
+    assert_eq!(f.head(), head, "commit しない");
+    // 新しい push では、残っていた最初の起動の出力を破棄したことを知らせてやり直す。
+    normal_worker_deadline();
+    f.push_change("next");
+    f.writes(json!({f.readme_path(): "次の保守"}));
+    let message = f.hook("Stop").expect("破棄の通知があるはず");
+    assert!(message.contains("前回の保守の出力を破棄"), "{message}");
+    assert_eq!(f.worker_runs(), 3);
+    assert_eq!(f.state()["phase"], "complete");
 }
 
 #[test]
@@ -5025,7 +5430,7 @@ impl Fixture {
 }
 
 fn readme_over_limit_fixture(permission: Permission) -> Fixture {
-    // 見出しのある README（分割先 `docs/readme/section-01.md` が許可パスに入る）。上限は 40 文字。
+    // 見出しのある README（分割先 `docs/readme/` に新規ファイルを作れる）。上限は 40 文字。
     let f = Fixture::with_config(Some(readme_limit_config(permission, 40)));
     f.commit_push_file("README.md", "# 題\n## 概要\n本文\n");
     f.hook("UserPromptSubmit");
@@ -5040,7 +5445,7 @@ fn a_timed_out_fixup_is_reverted_and_the_first_run_is_committed_with_a_warning()
     short_worker_deadline(10);
     unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "2:60") };
     let head = f.head();
-    let new_file = f.root.join("docs/readme/section-01.md");
+    let new_file = f.root.join("docs/readme/overview.md");
     let first =format!("# 題\n## 概要\n{}", "r".repeat(60));
     // 1 回目は上限（40 文字）超過。追い修正は書きかけ（README の別内容と分割先の新規ファイル）のまま期限切れになる。
     f.writes(json!([
@@ -5066,6 +5471,17 @@ fn a_timed_out_fixup_is_reverted_and_the_first_run_is_committed_with_a_warning()
     let state = f.state();
     assert_eq!(state["phase"], "complete");
     assert_eq!(state["fixups"], 1);
+    // 追い修正が作ったファイルは受理して記録したうえで取り消し、記録も「無い」に揃える。
+    for key in ["before", "after"] {
+        assert!(
+            state[key]
+                .as_object()
+                .unwrap()
+                .get("docs/readme/overview.md")
+                .is_some_and(Value::is_null),
+            "{key}: {state}"
+        );
+    }
     let last = f.runs().pop().unwrap().run;
     assert_eq!(last.outcome, "committed");
     assert!(last.message.unwrap().contains("追い修正に残っていた時間"));
@@ -5097,12 +5513,17 @@ fn a_timed_out_first_run_is_reverted_and_not_retried_until_a_new_push_or_run_now
     short_worker_deadline(10);
     unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "1:60") };
     let head = f.head();
-    let new_file = f.root.join("docs/readme/section-01.md");
+    let new_file = f.root.join("docs/readme/overview.md");
     f.writes(json!({f.readme_path(): "partial", new_file.to_str().unwrap(): "partial"}));
     let message = f.hook("Stop").expect("失敗の通知があるはず");
     assert!(message.contains("戻しました"), "{message}");
     assert_eq!(f.written_run(), "1", "書いたあとで期限切れになった");
     assert_eq!(f.worker_runs(), 1);
+    assert!(f.state()["before"].get("docs/readme/overview.md").is_some());
+    assert!(
+        !f.root.join("docs/readme").exists(),
+        "空の親フォルダーは残さない"
+    );
     assert_eq!(f.head(), head, "commit しない");
     assert_eq!(
         fs::read_to_string(f.root.join("README.md")).unwrap(),
@@ -5170,11 +5591,12 @@ fn a_timed_out_first_run_is_reverted_when_restricted() {
     short_worker_deadline(10);
     unsafe { env::set_var("HOOK_STUB_SLEEP_AFTER_WRITE", "1:60") };
     let head = f.head();
-    let new_file = f.root.join("docs/readme/section-01.md");
+    let new_file = f.root.join("docs/readme/overview.md");
     f.writes(json!({f.readme_path(): "partial", new_file.to_str().unwrap(): "partial"}));
     let message = f.hook("Stop").expect("失敗の通知があるはず");
     assert!(message.contains("戻しました"), "{message}");
     assert_eq!(f.written_run(), "1");
+    assert!(f.state()["before"].get("docs/readme/overview.md").is_some());
     assert_eq!(f.head(), head);
     assert_eq!(
         fs::read_to_string(f.root.join("README.md")).unwrap(),

@@ -1,5 +1,5 @@
 use crate::config::{self, Config, Decision, Document, Permission, SkipReason, Worker};
-use crate::kinds::ResolvedKind;
+use crate::kinds::{NewSplitEntries, ResolvedKind, SplitGrant};
 use crate::process::{Output, capture, command};
 use caseless::Caseless;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -3093,6 +3093,18 @@ fn rule_unsafe_path(path: &str) -> bool {
 ///   拒否すること（公式も Bash 規則は境界ではないと説明している）。実機の Claude Code での確認は未実施。
 ///   そのため最終防御はこの規則だけに頼らず、事後検査（作業ツリーの対象外変更の検出）と併用する。
 pub fn worker_args(worker: &Worker, allowed: &[String], exclude: &[String]) -> Vec<String> {
+    worker_args_with(worker, allowed, exclude, &[])
+}
+
+/// `worker_args` に、新規ファイルを作ってよい分割先 `grant_dirs` を足した版。restricted では分割先ごとに
+/// 直下の Markdown の編集規則 `Edit(./<dir>/*.md)` を足す（`*` は 1 階層）。名前と件数は worker の終了後に
+/// `kinds::new_split_entries` が検査する。
+pub fn worker_args_with(
+    worker: &Worker,
+    allowed: &[String],
+    exclude: &[String],
+    grant_dirs: &[String],
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "-p".into(),
         "--model".into(),
@@ -3130,6 +3142,9 @@ pub fn worker_args(worker: &Worker, allowed: &[String], exclude: &[String]) -> V
                     continue;
                 }
                 args.push(format!("Edit(./{path})"));
+            }
+            for dir in grant_dirs.iter().filter(|dir| !rule_unsafe_path(dir)) {
+                args.push(format!("Edit(./{dir}/*.md)"));
             }
             args.extend(
                 [
@@ -3187,6 +3202,7 @@ pub fn run_maintenance_worker_with(
         root,
         reason,
         allowed,
+        &[],
         options,
         Duration::from_secs(options.worker.timeout_secs),
     )
@@ -3208,6 +3224,7 @@ fn run_worker_outcome(
     root: &Path,
     reason: &str,
     allowed: &[String],
+    grant_dirs: &[String],
     options: &MaintenanceOptions,
     timeout: Duration,
 ) -> Option<WorkerFailure> {
@@ -3222,9 +3239,14 @@ fn run_worker_outcome(
     let mut c = command(&executable.to_string_lossy());
     // 非対話（-p）でプロンプトは stdin から渡す。
     // WORKER_ENV=1 により、worker 自身の hook から本フックが再帰起動しても即終了する。
-    c.args(worker_args(&options.worker, allowed, &options.exclude))
-        .current_dir(root)
-        .env(WORKER_ENV, "1");
+    c.args(worker_args_with(
+        &options.worker,
+        allowed,
+        &options.exclude,
+        grant_dirs,
+    ))
+    .current_dir(root)
+    .env(WORKER_ENV, "1");
     // Claude デスクトップのセッションから hook 経由で起動されると、ホスト用の環境変数
     // （中継先の ANTHROPIC_BASE_URL、CLAUDECODE、CLAUDE_CODE_SIMPLE などの CLAUDE_CODE_*）を継承する。
     // そのままでは worker が親セッション向けの中継・認証設定で起動して認証に失敗したり、
@@ -3729,6 +3751,100 @@ fn fixup_budget(timeout_secs: u64, elapsed: Duration) -> Option<Duration> {
     }
     crate::kinds::fixup_budget(timeout_secs, elapsed)
 }
+/// 分割先の違反の記録（`violation`）で、指紋をファイルそのものから取ったことを示す印。
+/// 無視対象のファイル・空のフォルダー・フォルダーのパスは Git の状態の一覧に出ないので、一覧の指紋では
+/// 利用者が消しても「変わっていない」ままになる。
+const SPLIT_FINGERPRINT: &str = "split:";
+/// 起動前の分割先の記録を、今回の種類のうち本体の文書が `documents` にあるものについて作る。
+fn split_grants(
+    root: &Path,
+    kinds: &[ResolvedKind],
+    documents: &[PathBuf],
+    allowed: &[String],
+) -> Vec<SplitGrant> {
+    let paths: Vec<String> = documents
+        .iter()
+        .filter_map(|p| safe_relative(root, p).ok())
+        .collect();
+    kinds
+        .iter()
+        .filter(|kind| {
+            paths.iter().any(|path| {
+                !crate::kinds::is_split_child(kind, &path.to_lowercase())
+                    && crate::kinds::kind_of_path(std::slice::from_ref(*kind), path).is_some()
+            })
+        })
+        .filter_map(|kind| crate::kinds::split_grant(root, kind, allowed))
+        .collect()
+}
+/// 記録（`split_dirs`）。無い・読めない記録（旧版の状態）は空にし、新規作成を許さない。
+fn recorded_split_grants(state: &Value) -> Vec<SplitGrant> {
+    state
+        .get("split_dirs")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
+}
+/// 前回までの記録を使って再実行するときの取り直し。前回の起動より後に増えたもの（利用者のファイルなど）を
+/// 今回の worker が作ったものと扱わないよう、起動前の一覧と許可の有無を今の状態から取り直す。
+/// 今の種類に無い分割先は新規作成を許さない。
+fn refresh_split_grants(
+    root: &Path,
+    kinds: &[ResolvedKind],
+    recorded: Vec<SplitGrant>,
+    allowed: &[String],
+) -> Vec<SplitGrant> {
+    recorded
+        .into_iter()
+        .map(|old| {
+            kinds
+                .iter()
+                .find(|kind| kind.split_dir.as_deref() == Some(old.dir.as_str()))
+                .and_then(|kind| crate::kinds::split_grant(root, kind, allowed))
+                .unwrap_or(SplitGrant {
+                    granted: false,
+                    ..old
+                })
+        })
+        .collect()
+}
+/// worker の実行後に分割先へ増えたエントリ。名前と件数が正しくても、Git の無視対象になる（または確かめ
+/// られない）ファイルは commit できないので拒否する。
+fn split_entries_after_worker(
+    root: &Path,
+    grants: &[SplitGrant],
+    allowed: &[String],
+) -> NewSplitEntries {
+    let mut found = crate::kinds::new_split_entries(root, grants, allowed);
+    let (accepted, ignored): (Vec<String>, Vec<String>) = std::mem::take(&mut found.accepted)
+        .into_iter()
+        .partition(|path| git_ignore_status(root, &root.join(path)).0 == "not_ignored");
+    found.accepted = accepted;
+    found.rejected.extend(ignored);
+    found.rejected.sort();
+    found
+}
+/// プロンプトへ渡す、分割先ごとの残り件数。
+fn split_remaining(grants: &[SplitGrant], allowed: &[String]) -> Vec<(String, usize)> {
+    grants
+        .iter()
+        .map(|g| (g.dir.clone(), g.remaining(allowed)))
+        .collect()
+}
+/// 主プロンプトに足す、新規ファイルを作ってよい分割先の 1 文（英語固定）。許可が無ければ空。
+fn split_creation_note(grants: &[SplitGrant], allowed: &[String]) -> String {
+    let open: Vec<Value> = split_remaining(grants, allowed)
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(dir, count)| json!({"dir": dir, "max_new_files": count}))
+        .collect();
+    if open.is_empty() {
+        return String::new();
+    }
+    format!(
+        " In addition to those paths, you may create new Markdown files directly under the split directories listed in this JSON array, at most the given number in each, named as the Splitting rules describe: {}.",
+        Value::Array(open)
+    )
+}
 /// 追い修正を起動する直前の、許可パスの生バイト列（ファイルが無いパスは None）。
 type Checkpoint = Vec<(String, Option<Vec<u8>>)>;
 /// 許可パスの現在の内容を、記録（`state[key]`: `before` か `after`）と一致することを確かめたうえで持つ。
@@ -4119,6 +4235,8 @@ pub fn publish_locked_with(
             save_publication(path, &mut state)?;
         }
     }
+    // 分割先の記録（`split_dirs`）をこの呼び出しで作ったか。前の呼び出しの記録は起動前に取り直す。
+    let mut split_recorded_now = false;
     // 検査に違反して止まったままの記録（ready・worker_failed）は、HEAD が進んだ（新しい push や利用者の
     // commit があった）ら、worker の出力のうち現在も記録どおりのものだけを戻して、新しい保守として処理する
     // （そのまま失敗にすると以後ずっと保守されない）。
@@ -4132,7 +4250,10 @@ pub fn publish_locked_with(
     {
         let kept = discard_outputs(root, &state);
         // 期限切れで出力を戻し済みの記録は、違反の出力を破棄した旨の通知を出さない（既に戻して通知済み）。
-        let restored_on_timeout = kept.is_empty() && state["worker_timed_out"] == json!(true);
+        // 追い修正の期限切れは最初の起動の出力が残る（`after`≠`before`）ので、破棄を通知する。
+        let restored_on_timeout = kept.is_empty()
+            && state["worker_timed_out"] == json!(true)
+            && state["after"] == state["before"];
         stale_note = (!restored_on_timeout).then(|| {
             if kept.is_empty() {
                 crate::t!("maint.stale_output_discarded").to_string()
@@ -4279,7 +4400,19 @@ pub fn publish_locked_with(
                     .collect::<Vec<_>>()
             ),
         };
-        state = json!({"phase":"worker_pending","head":head,"branch":branch,"remote":remote,"ref":reference,"destination":destination,"before":before,"after":before,"ignored_before":ignored,"error":null,"history":history,"poll_fingerprint":fingerprint,"validation_dirs":validations,"kinds":kind_ids});
+        let split_kinds: Vec<ResolvedKind> = options
+            .resolved_kinds()
+            .into_iter()
+            .filter(|k| {
+                kind_ids
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|id| id == k.id()))
+            })
+            .collect();
+        let editable: Vec<String> = before.keys().cloned().collect();
+        let split_dirs = split_grants(root, &split_kinds, documents, &editable);
+        split_recorded_now = true;
+        state = json!({"phase":"worker_pending","head":head,"branch":branch,"remote":remote,"ref":reference,"destination":destination,"before":before,"after":before,"ignored_before":ignored,"error":null,"history":history,"poll_fingerprint":fingerprint,"validation_dirs":validations,"kinds":kind_ids,"split_dirs":split_dirs});
         if let Some(note) = stale_note {
             push_note(&mut state, note);
         }
@@ -4310,7 +4443,7 @@ pub fn publish_locked_with(
                 crate::t!("maint.paths_undetermined", error = e),
             );
         }
-        let allowed: Vec<_> = state["before"]
+        let mut allowed: Vec<String> = state["before"]
             .as_object()
             .ok_or(crate::t!("maint.state_field_invalid", field = "before"))?
             .keys()
@@ -4338,7 +4471,11 @@ pub fn publish_locked_with(
             let remaining: Vec<&str> = recorded
                 .iter()
                 .filter(|(k, fp)| {
-                    now.get(*k).map(String::as_str).unwrap_or("clean") == fp.as_str().unwrap_or("")
+                    let fp = fp.as_str().unwrap_or("");
+                    match fp.strip_prefix(SPLIT_FINGERPRINT) {
+                        Some(recorded) => path_fingerprint(root, k) == recorded,
+                        None => now.get(*k).map(String::as_str).unwrap_or("clean") == fp,
+                    }
                 })
                 .map(|(k, _)| k.as_str())
                 .collect();
@@ -4379,9 +4516,20 @@ pub fn publish_locked_with(
             .into_iter()
             .filter(crate::kinds::AgentsOver::is_absorbable)
             .collect();
+        // 上限・必須見出し・AGENTS の大きさに違反が残っていれば、違反だけを直す再実行を最大 `MAX_FIXUPS` 回
+        // 同じ hook の中で行う。期限は最初の起動から `timeout_secs` を共有する。
+        let resolved_kinds = options.resolved_kinds();
+        let mut grants = recorded_split_grants(&state);
+        if !split_recorded_now {
+            grants = refresh_split_grants(root, &resolved_kinds, grants, &allowed);
+            if state.get("split_dirs").is_some() {
+                state["split_dirs"] = json!(grants);
+            }
+        }
         let prompt = format!(
-            "{reason} To protect uncommitted changes that existed at the start, the only editable paths are those in this JSON array: {}. Even for candidate documents, do not edit paths that are not in this array (they have existing changes or similar), and skip maintaining them this time. Even within the array, edit only the files that actually need it.{}",
+            "{reason} To protect uncommitted changes that existed at the start, the only editable paths are those in this JSON array: {}. Even for candidate documents, do not edit paths that are not in this array (they have existing changes or similar), and skip maintaining them this time. Even within the array, edit only the files that actually need it.{}{}",
             json!(allowed),
+            split_creation_note(&grants, &allowed),
             crate::kinds::agents_required_note(&existing_agents)
         );
         state["phase"] = json!("worker_running");
@@ -4390,9 +4538,6 @@ pub fn publish_locked_with(
             m.remove("timeout_note");
         }
         save_publication(path, &mut state)?;
-        // 上限・必須見出し・AGENTS の大きさに違反が残っていれば、違反だけを直す再実行を最大 `MAX_FIXUPS` 回
-        // 同じ hook の中で行う。期限は最初の起動から `timeout_secs` を共有する。
-        let resolved_kinds = options.resolved_kinds();
         let started = std::time::Instant::now();
         let mut fixups = 0u32;
         let mut pre_snapshot = pre_snapshot;
@@ -4403,7 +4548,8 @@ pub fn publish_locked_with(
         let mut prompt = if resume_fix.is_empty() {
             prompt
         } else {
-            crate::kinds::fixup_prompt(&resolved_kinds, &[], &resume_fix, &allowed)
+            let split = split_remaining(&grants, &allowed);
+            crate::kinds::fixup_prompt(&resolved_kinds, &[], &resume_fix, &allowed, &split)
         };
         let mut timeout = Duration::from_secs(loop_timeout_secs(options));
         // 追い修正（ready からの再開による最初の起動を含む）を起動する直前の内容と記録。その追い修正が
@@ -4421,7 +4567,13 @@ pub fn publish_locked_with(
         let mut prev_after = state["after"].clone();
         let error = loop {
             crate::activity::worker(fixups, timeout);
-            let outcome = run_worker_outcome(root, &prompt, &allowed, options, timeout);
+            let grant_dirs: Vec<String> = grants
+                .iter()
+                .filter(|g| g.remaining(&allowed) > 0)
+                .map(|g| g.dir.clone())
+                .collect();
+            let outcome =
+                run_worker_outcome(root, &prompt, &allowed, &grant_dirs, options, timeout);
             crate::activity::phase("checking");
             // 終了を確認できないタイムアウトは、何も戻さず従来どおり停止する（子孫がまだ書くかもしれない）。
             if let Some(failure) = outcome.as_ref().filter(|f| f.timed_out && !f.confirmed) {
@@ -4436,8 +4588,31 @@ pub fn publish_locked_with(
                 .as_ref()
                 .filter(|f| f.timed_out)
                 .map(|f| f.message.clone());
-            // 事後検査（Restricted のみ）: 許可文書以外が変わっていれば、commit もせず失敗扱いにする。
-            // 対象外の変更は自動では戻さない（利用者の作業を損なわないため）。記録して再実行を止める。
+            // 分割先の新しいエントリは、正常・期限切れ・失敗のどれでも worker が終わるたびに調べる。受理した
+            // ファイルは許可パスと記録（変更前は「無い」）へ足してすぐ保存し、復元・破棄で消せるようにする。
+            let split = split_entries_after_worker(root, &grants, &allowed);
+            if !split.accepted.is_empty() {
+                for relative in &split.accepted {
+                    allowed.push(relative.clone());
+                    state["before"][relative.as_str()] = Value::Null;
+                    // `before` と `after` のキーがそろわないと、直後に中断した記録を復旧できない。
+                    state["after"][relative.as_str()] = Value::Null;
+                    prev_after[relative.as_str()] = Value::Null;
+                    if let Some(points) = checkpoint.as_mut() {
+                        points.push((relative.clone(), None));
+                    }
+                }
+                save_publication(path, &mut state)?;
+                // テスト用: 受理したファイルを記録した直後の中断を再現する。
+                #[cfg(feature = "test-support")]
+                if env::var_os("SCRIPTURA_TEST_FAIL_AFTER_SPLIT_SAVE").is_some() {
+                    return Err("interrupted after recording split files (test)".into());
+                }
+            }
+            // 事後検査: 分割先の拒否（権限モードに関係なく）と、許可文書以外の変更（Restricted のみ）があれば、
+            // commit もせず失敗扱いにする。対象外の変更は自動では戻さない（利用者の作業を損なわないため）。
+            // 記録して再実行を止める。
+            let mut violation = serde_json::Map::new();
             let mut error = outcome
                 .filter(|f| !f.timed_out)
                 .map(|f| f.message);
@@ -4446,18 +4621,21 @@ pub fn publish_locked_with(
                 .map(|_| worktree_snapshot_with(root, false));
             match (pre_snapshot.take(), post_snapshot) {
                 (Some(pre), Some(Ok(post))) => {
-                    let bad = out_of_scope_changes(root, &pre, &post, &allowed);
+                    let mut bad = out_of_scope_changes(root, &pre, &post, &allowed);
+                    // 分割先で拒否するパス（とその中）は、下の分割先の記録にまとめる。
+                    bad.retain(|path| {
+                        !split.rejected.iter().any(|r| {
+                            path.strip_prefix(r.as_str())
+                                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+                        })
+                    });
                     if !bad.is_empty() {
-                        let record: serde_json::Map<String, Value> = bad
-                            .iter()
-                            .map(|k| {
-                                (
-                                    k.clone(),
-                                    json!(post.get(k).cloned().unwrap_or_else(|| "clean".into())),
-                                )
-                            })
-                            .collect();
-                        state["violation"] = json!(record);
+                        violation.extend(bad.iter().map(|k| {
+                            (
+                                k.clone(),
+                                json!(post.get(k).cloned().unwrap_or_else(|| "clean".into())),
+                            )
+                        }));
                         error = Some(crate::t!(
                             "maint.worker_violation",
                             paths = bad.join(crate::t!("list.separator"))
@@ -4469,18 +4647,51 @@ pub fn publish_locked_with(
                 (Some(_), Some(Err(e))) => {
                     error = Some(crate::t!("maint.worktree_after_unknown", error = e));
                 }
-                // Bypass は全体比較をしない（commit 対象のハッシュ検査だけ）。
+                // Bypass は全体比較をしない（commit 対象のハッシュ検査と上の分割先の検査だけ）。
                 _ => {}
+            }
+            if !split.rejected.is_empty() {
+                let paths = split.rejected.join(crate::t!("list.separator"));
+                // 期限切れが重なると、消しても同じ対象コミットでは再実行しないので、再実行の一文を含めない。
+                let message = if timed_out_message.is_some() {
+                    crate::t!("maint.split_name_invalid_no_retry", paths = paths)
+                } else {
+                    crate::t!("maint.split_name_invalid", paths = paths)
+                };
+                // 範囲外の変更もあるときは、両方を知らせる。それ以外の失敗はこの違反に置き換える。
+                error = Some(match error.filter(|_| !violation.is_empty()) {
+                    Some(first) => {
+                        crate::t!("maint.join_sentences", first = first, second = message)
+                    }
+                    None => message,
+                });
+                violation.extend(split.rejected.iter().map(|k| {
+                    let fingerprint = format!("{SPLIT_FINGERPRINT}{}", path_fingerprint(root, k));
+                    (k.clone(), json!(fingerprint))
+                }));
+            }
+            if !violation.is_empty() {
+                state["violation"] = Value::Object(violation);
             }
             let mut after = serde_json::Map::new();
             for relative in &allowed {
                 after.insert(relative.clone(), json!(document_hash(root, relative)?));
             }
             state["after"] = json!(after);
-            if error.is_none()
+            // 分割先の拒否が重なった期限切れも、先に書きかけを戻す（拒否したファイルは消さない）。
+            let rejected = !split.rejected.is_empty();
+            if (error.is_none() || rejected)
                 && let Some(message) = timed_out_message
             {
                 let paths = || allowed.join(crate::t!("list.separator"));
+                // 拒否があるときの `error` は違反の通知文。期限切れの通知の後ろに続ける。
+                let violated = if rejected { error.take() } else { None };
+                let with_violation = |text: String| match &violated {
+                    Some(second) => {
+                        crate::t!("maint.join_sentences", first = text, second = second)
+                    }
+                    None => text,
+                };
                 if fixups == 0 && resume_fix.is_empty() {
                     // 最初の起動の期限切れ: 変更前へ戻し、同じ対象コミットでは自動で再実行しない
                     // （新しい push か run-now まで待つ）。起動前に持った生バイト列で戻す（gitignore 済みの
@@ -4493,7 +4704,7 @@ pub fn publish_locked_with(
                     // 失敗しないように）。戻せなかったパスは、worker 終了時の記録のまま残す。
                     align_after_to_before(&mut state, &kept);
                     state["worker_timed_out"] = json!(true);
-                    break Some(if kept.is_empty() {
+                    break Some(with_violation(if kept.is_empty() {
                         crate::t!("maint.timeout_restored", error = message)
                     } else {
                         crate::t!(
@@ -4501,35 +4712,49 @@ pub fn publish_locked_with(
                             error = message,
                             paths = kept.join(crate::t!("list.separator"))
                         )
-                    });
+                    }));
                 } else if let Some(points) = checkpoint.take() {
                     // 追い修正の期限切れ: その追い修正が書いた変更だけを直前の内容へ戻し、追い修正を打ち切る。
                     // 以降は「残り時間が足りず追い修正を省いた」場合と同じ経路（保守後検査）へ進む。
                     let failed = restore_checkpoint(root, &points, &state["after"]);
-                    if !failed.is_empty() {
-                        return fail(
-                            path,
-                            &mut state,
-                            crate::t!(
-                                "maint.timeout_not_restored",
-                                error = message,
-                                paths = failed.join(crate::t!("list.separator"))
-                            ),
+                    let not_restored = (!failed.is_empty()).then(|| {
+                        crate::t!(
+                            "maint.timeout_not_restored",
+                            error = message,
+                            paths = failed.join(crate::t!("list.separator"))
+                        )
+                    });
+                    if violated.is_none() {
+                        let warning = crate::t!(
+                            "maint.fixup_timeout_warning",
+                            seconds = timeout.as_secs()
                         );
+                        if let Some(text) = not_restored {
+                            return fail(path, &mut state, text);
+                        }
+                        state["after"] = prev_after.clone();
+                        state["timeout_note"] = json!(warning);
+                        break None;
                     }
-                    state["after"] = prev_after.clone();
-                    state["timeout_note"] = json!(crate::t!(
-                        "maint.fixup_timeout_warning",
-                        seconds = timeout.as_secs()
-                    ));
-                    break None;
+                    // 拒否もある追い修正は commit できないので、期限切れとして止める。戻せたパスは記録も
+                    // 直前の内容に揃える。
+                    for relative in allowed.iter().filter(|p| !failed.contains(p)) {
+                        state["after"][relative.as_str()] = prev_after[relative.as_str()].clone();
+                    }
+                    state["worker_timed_out"] = json!(true);
+                    // commit しないので、「直前の内容を使う」とは知らせない。
+                    break Some(with_violation(not_restored.unwrap_or_else(|| {
+                        crate::t!("maint.fixup_timeout_reverted", seconds = timeout.as_secs())
+                    })));
                 }
                 // 追い修正の直前の内容を持てていない（ready からの再開）: 戻せないので停止する。
-                return fail(
-                    path,
-                    &mut state,
-                    crate::t!("maint.timeout_not_restored", error = message, paths = paths()),
-                );
+                let stopped =
+                    crate::t!("maint.timeout_not_restored", error = message, paths = paths());
+                if violated.is_none() {
+                    return fail(path, &mut state, stopped);
+                }
+                state["worker_timed_out"] = json!(true);
+                break Some(with_violation(stopped));
             }
             if error.is_some() {
                 break error;
@@ -4563,7 +4788,9 @@ pub fn publish_locked_with(
             fixups += 1;
             state["fixups"] = json!(fixups);
             save_publication(path, &mut state)?;
-            prompt = crate::kinds::fixup_prompt(&resolved_kinds, &violations, &agents, &allowed);
+            let split = split_remaining(&grants, &allowed);
+            prompt =
+                crate::kinds::fixup_prompt(&resolved_kinds, &violations, &agents, &allowed, &split);
             timeout = budget;
         };
         state["phase"] = json!(if error.is_some() {
