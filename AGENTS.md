@@ -22,7 +22,8 @@ Scriptura は、利用者が登録したリポジトリへの push 後に `AGENT
 
 - モジュールの構成と責務（`src/`・`plugins/`・`xtask/`）: `docs/agents/modules-and-responsibilities.md`
 - 設定の書き込み・schema・保守の検査・CHANGELOG・保守履歴: `docs/agents/settings-and-maintenance-contracts.md`
-- 分割先（`split_dir`）の名前・新規作成の許可・案内の検査・違反の扱い: `docs/agents/split-dir-contract.md`
+- 分割先（`split_dir`）の名前・新規作成の許可・違反の扱い: `docs/agents/split-dir-contract.md`
+- 分割先の案内の規則と検査（`check_split_links`）: `docs/agents/split-link-check.md`
 - CHANGELOG の編集範囲・未リリース節・リリース済み節の不変: `docs/agents/changelog-contract.md`
 - hook からの保守の起動・タイミング・worker の期限切れ: `docs/agents/workflow.md`
 - 中断・期限切れからの復旧: `docs/agents/troubleshooting.md`
