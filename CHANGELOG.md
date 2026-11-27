@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.0.21] - 2026-11-27
+
 ### Changed
 
 - 旧 agents-maintenance の hook の検出をやめた。`status`・`doctor`・引数なし起動・Setup 版の登録で旧 hook の案内を出さなくなり、`connect claude-code --apply` も旧 agents-maintenance の hook を置き換えずに残す（外すのは Scriptura 自身の hook だけ）。
