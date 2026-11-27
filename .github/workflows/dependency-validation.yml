@@ -1,0 +1,61 @@
+name: Dependency validation
+
+# Dependabot の PR（Cargo の依存更新）をビルド・テストで検証する。dependabot-auto-merge.yml が、この workflow の成功を
+# マージの必須条件にする。Linux の GitHub 提供ランナーだけで動かし、Secrets・Environment は使わない。
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-validation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      # テストの判定にデバッグ情報と増分ビルドの中間物は不要（ディスクの節約）。
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install locked Rust toolchain
+        run: rustup toolchain install 1.100.0 --profile minimal && rustup default 1.100.0
+
+      - name: Test
+        run: |
+          set -euo pipefail
+          # テストが利用者の設定・状態へ書かないよう、保存場所を作業フォルダーへ隔離する。
+          export SCRIPTURA_HOME="$RUNNER_TEMP/scriptura-home"
+          export NO_PROXY=127.0.0.1,localhost,::1
+          # cargo-nextest は公式リリースの固定版バイナリを SHA-256 と照合してから展開する。版を上げるときは版と SHA-256 を同時に変える。
+          nextest_version=0.9.152
+          nextest_sha256=d039b43c3e0958441b6ad0a39c8884d018b3d2e8fb9928f209074b1100b5e17a
+          mkdir -p "$RUNNER_TEMP/nextest"
+          curl -fsSL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$nextest_version/cargo-nextest-$nextest_version-x86_64-unknown-linux-gnu.tar.gz" -o "$RUNNER_TEMP/nextest.tar.gz"
+          printf '%s  %s\n' "$nextest_sha256" "$RUNNER_TEMP/nextest.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/nextest.tar.gz" -C "$RUNNER_TEMP/nextest"
+          export PATH="$RUNNER_TEMP/nextest:$PATH"
+          cargo nextest --version
+          cargo nextest run --locked --features test-support
+          # 他のテストと同時に動かせない 1 件（.config/nextest.toml の quiescence）を単独で実行する。
+          cargo nextest run --locked --features test-support --profile quiescence
+
+      - name: Check the build without the management screen
+        run: cargo check --locked --no-default-features --bin scriptura
+
+      - name: Check the xtask packaging tool
+        run: cargo check --locked --manifest-path xtask/Cargo.toml
