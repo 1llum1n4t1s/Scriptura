@@ -24,6 +24,8 @@ worker の期限切れ・中断時の復元と再試行、実行中に HEAD が�
 
 同意と propose の廃止、旧設定の変換、hook 経路で tokio を使わないこと、Setup 版の適用タイミング、上限違反の扱い、保守履歴、管理画面の常駐などを、理由とトレードオフとともに記録しています。詳細は [docs/design/design-decisions.md](docs/design/design-decisions.md) を参照してください。
 
+上限違反の扱いの詳細は [docs/design/limit-violation-handling.md](docs/design/limit-violation-handling.md) を参照してください。
+
 管理画面の更新後の再ログイン（引き継ぎ鍵）と「実行中」表示の判断は [docs/design/security.md](docs/design/security.md) を参照してください。
 
 ## ローカライズ
