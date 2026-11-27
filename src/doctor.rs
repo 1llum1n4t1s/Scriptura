@@ -463,8 +463,7 @@ fn settings_items() -> Vec<Value> {
     // （Linux で AppImage の名前を変えた場合も二重登録を見落とさないため）。
     let own = crate::app_update::setup_executable();
     let scan = connect::scan_settings(&settings, own.as_deref());
-    let (scriptura_hook, legacy_hook, plugin_enabled) =
-        (scan.scriptura_hook, scan.legacy_hook, scan.plugin_enabled);
+    let (scriptura_hook, plugin_enabled) = (scan.scriptura_hook, scan.plugin_enabled);
     let mut items = Vec::new();
     items.push(if scriptura_hook && plugin_enabled {
         item("hookDuplicate", "warn", crate::t!("doctor.hook_duplicate"))
@@ -487,9 +486,6 @@ fn settings_items() -> Vec<Value> {
             crate::t!("doctor.hook_policy_warn", settings = policy.join(" / ")),
         )
     });
-    if legacy_hook {
-        items.push(item("legacyHook", "warn", crate::t!("doctor.legacy_hook")));
-    }
     // 旧登録の Stop hook（毎ターン発火する）が残っている。プラグインとの重複は hookDuplicate が案内する。
     if scan.old_stop_hook && !plugin_enabled {
         items.push(item(

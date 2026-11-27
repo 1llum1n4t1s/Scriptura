@@ -2,13 +2,11 @@
 
 # Scriptura
 
-自分のリポジトリへ push したあとに、`AGENTS.md` / `DESIGN.md` / `README.md`（と、オプトインで `CHANGELOG.md` や利用者が定義したカスタムの文書）をバックグラウンドで保守するツールです。Claude Code の hook（Bash・PowerShell ツールでの `git push` の直後と、取りこぼしを回収するセッション開始時）から起動し、保守の worker には Claude Code CLI（既定は `claude -p --model claude-sonnet-5-5 --effort medium`）を使います。Codex には依存しません。
+自分のリポジトリへ push したあとに、`AGENTS.md` / `DESIGN.md` / `README.md`（と、オプトインで `CHANGELOG.md` や利用者が定義したカスタムの文書）をバックグラウンドで保守するツールです。Claude Code の hook（Bash・PowerShell ツールでの `git push` の直後と、取りこぼしを回収するセッション開始時）から起動し、保守の worker には Claude Code CLI（既定は `claude -p --model claude-sonnet-5-5 --effort medium`）を使います。
 
 - **既定は安全側**です。`scriptura enable`（または管理画面）でリポジトリを登録するまで何も動かず、有効化には remote と upstream が必要です。確認の手順はなく、push のたびに worker が対象の文書を更新し、Scriptura が自動で commit と push をします。保守後の検査で、対象の文書以外が変わっていれば commit しません。同意の記録と、以前の `propose` モード（更新案）は廃止しました（「旧設定の移行」を参照）。
 - 設定は利用者のホーム配下の 1 ファイル（`config.toml`）と、同じフォルダーの `templates/` だけから読みます。リポジトリ内のファイルからの有効化・設定は読みません（他人のリポジトリを clone しただけで自動動作が始まる経路を作らないため）。
 - 設定は `scriptura ui`（ブラウザーの管理画面）でも編集できます（後述）。
-
-以前の `agents-maintenance`（CodexHooks）から文書保守の部分だけを独立させたもので、保守の判断・状態管理・公開（commit と push）の契約は同じです。
 
 ## 導入
 
@@ -20,7 +18,7 @@ Claude Code のプラグインとして入れると、hook と操作用のスキ
 
 Windows は `ScripturaApp-win-Setup.exe`、macOS は `ScripturaApp-osx-Setup.pkg`、Linux（x64 / arm64）は AppImage の `ScripturaApp-linux-x64.AppImage` / `ScripturaApp-linux-arm64.AppImage` を実行すると、管理者権限なしで利用者ごとに導入されます（Windows の導入先は `%LOCALAPPDATA%\ScripturaApp\current\scriptura.exe`）。配信元は `https://scriptura-updates.kagayoi.com`（Velopack のフィード `releases.<channel>.json`、チャネルは `win` / `osx` / `linux-x64` / `linux-arm64`）です。Windows の配布物は Certum の署名付き、macOS の配布物は Developer ID で署名して公証済みです。動作要件は、macOS が 11 以降の Apple Silicon（Intel は非対応）、Linux が glibc 2.39 以降です。
 
-- **登録は自動**: 導入時（Windows はインストールのフック、macOS・Linux は導入後の引数なしの起動）に、Claude Code の `settings.json` の hook を Setup 版の実行ファイルへ向けます。置き換えるのは Scriptura 自身の hook だけです（旧単独導入 `%LOCALAPPDATA%\Programs\Scriptura\bin\scriptura.exe` を指す hook は Setup 版へ置き換わり、旧ファイルは消しません）。従来の `agents-maintenance` の hook は置き換えず、`status` / `doctor` / 引数なしの起動で `scriptura connect claude-code --apply` を案内します。
+- **登録は自動**: 導入時（Windows はインストールのフック、macOS・Linux は導入後の引数なしの起動）に、Claude Code の `settings.json` の hook を Setup 版の実行ファイルへ向けます。置き換えるのは Scriptura 自身の hook だけです（旧単独導入 `%LOCALAPPDATA%\Programs\Scriptura\bin\scriptura.exe` を指す hook は Setup 版へ置き換わり、旧ファイルは消しません）。
 - **プラグインとの重複を避ける**: `settings.json` の `enabledPlugins` で `scriptura@*` が有効なら、Setup 版は `settings.json` へ登録しません（二重に保守が動くため）。プラグインを使い続けるか、プラグインを無効にして Setup 版へ切り替えるかを選んでください。無効にした後は、引数なしの起動か次回ログオンで自動的に登録します。
 - **自動更新（既定 ON）**: hook の保守が終わった後に、1 日 1 回まで（成功・失敗とも 24 時間の間引き）新しい版を確認して取得だけします。**適用はログオン時だけ**で、ログオン時に起動する `scriptura update-apply`（Windows は HKCU の Run 値 `<packId> Update`、macOS は LaunchAgent `com.kagayoi.<packId>.update`、Linux は XDG autostart の `com.kagayoi.<packId>.update.desktop`）が、Scriptura の hook や管理画面が動いていないことと署名者を確かめてから、再起動なしで適用します。動いているものがあれば何もせず次のログオンに回します（保守中の hook を強制終了しないため）。 管理画面の「更新をインストール」（下）で、必要なときに手動で適用することもできます。
 - 状態は状態フォルダー（後述）の `app-update.json`（`auto_update`・前回の確認／失敗時刻）、`app-update.log`（診断用）、`setup-registration.json`（登録の結果）に置きます。
@@ -46,11 +44,11 @@ cargo build --release
 & "$env:LOCALAPPDATA\Programs\Scriptura\bin\scriptura.exe" connect claude-code --apply  # settings.json へ登録
 ```
 
-`connect claude-code --apply` は Claude Code の `settings.json`（`CLAUDE_CONFIG_DIR` または `~/.claude`）の hook に、導入先の固定パスを登録します。従来の `agents-maintenance` を呼ぶ hook と Scriptura の古い hook だけを hook 単位で置き換え（同じ項目に同居する別の hook は残し）、ほかの設定は保ちます。Scriptura の hook と見なすのは、コマンドが `<実行ファイル> hook` の形で実行ファイル名が `scriptura(.exe)` のものだけで、パスに scriptura を含むだけの別ツールは対象外です。最初の変更前に `settings.json.scriptura-backup` を作り、壊れた JSON は書き換えません。
+`connect claude-code --apply` は Claude Code の `settings.json`（`CLAUDE_CONFIG_DIR` または `~/.claude`）の hook に、導入先の固定パスを登録します。Scriptura の古い hook だけを hook 単位で置き換え（同じ項目に同居する別の hook は残し）、ほかの設定は保ちます。Scriptura の hook と見なすのは、コマンドが `<実行ファイル> hook` の形で実行ファイル名が `scriptura(.exe)` のものだけで、パスに scriptura を含むだけの別ツールは対象外です。最初の変更前に `settings.json.scriptura-backup` を作り、壊れた JSON は書き換えません。
 
-従来の登録は毎ターン発火する Stop hook でした。`--apply` と Setup 版の登録は、Scriptura の古い Stop hook を外して 3 種類の hook へ置き換えます。Bash・PowerShell ツールの `push` を含むコマンドへの PostToolUse と PostToolUseFailure（`git push && gh pr create` のように push のあとで失敗したときに発火します）、および `startup` / `resume` の SessionStart です。`--remove` は新旧どちらの hook も外します。コマンド後の hook は、ツールごとに 1 つの権限ルール `Bash(* push*)`（`PowerShell(* push*)` も同様）で絞るので、`git push`・`rtk git push`・`git -C <path> push`・`FOO=1 git push`・`bash -lc 'git push'`・`make push` のどれも拾います。`echo push x` のような余分な一致は、新しい push が見つからず何もせずに終わります。これらの hook は非同期で、別の保守が動いていても見送らず、終わるまで最長 25 分待ってから処理するので、保守中に行った push もあとで処理されます。Claude Code の外での push や、セッションの作業フォルダー以外のリポジトリへの push（`git -C <別のパス> push`）は、そのリポジトリで次にセッションを始めたときに回収されます。旧登録の Stop hook も（待たずに）引き続き受け付け、それで呼ばれたときは、ユーザー単位の settings.json の旧登録を新しい hook へ自動で 1 回だけ移行して、メッセージで知らせます（元の内容は `settings.json.scriptura-migration-backup[-N]` に退避し、プロジェクトの `.claude/settings*.json` には触れず、`--remove` した登録は戻しません）。scriptura プラグインが有効なときは、新しい hook を足さず旧 hook を外すだけです。Setup 版は自身の登録の経路で移行します。
+従来の登録は毎ターン発火する Stop hook でした。`--apply` と Setup 版の登録は、Scriptura の古い Stop hook を外して 3 種類の hook へ置き換えます。Bash・PowerShell ツールの `push` を含むコマンドへの PostToolUse と PostToolUseFailure（`git push && gh pr create` のように push のあとで失敗したときに発火します）、および `startup` / `resume` の SessionStart です。`--remove` は新旧どちらの hook も外します。コマンド後の hook は、ツールごとに 1 つの権限ルール `Bash(* push*)`（`PowerShell(* push*)` も同様）で絞るので、`git push`・`git -C <path> push`・`FOO=1 git push`・`bash -lc 'git push'`・`make push` のどれも拾います。`echo push x` のような余分な一致は、新しい push が見つからず何もせずに終わります。これらの hook は非同期で、別の保守が動いていても見送らず、終わるまで最長 25 分待ってから処理するので、保守中に行った push もあとで処理されます。Claude Code の外での push や、セッションの作業フォルダー以外のリポジトリへの push（`git -C <別のパス> push`）は、そのリポジトリで次にセッションを始めたときに回収されます。旧登録の Stop hook も（待たずに）引き続き受け付け、それで呼ばれたときは、ユーザー単位の settings.json の旧登録を新しい hook へ自動で 1 回だけ移行して、メッセージで知らせます（元の内容は `settings.json.scriptura-migration-backup[-N]` に退避し、プロジェクトの `.claude/settings*.json` には触れず、`--remove` した登録は戻しません）。scriptura プラグインが有効なときは、新しい hook を足さず旧 hook を外すだけです。Setup 版は自身の登録の経路で移行します。
 
-プラグインへ移るときは、二重に動かないよう単独登録を外します（Scriptura の項目だけを取り除き、`agents-maintenance` やほかの設定には触れません）。
+プラグインへ移るときは、二重に動かないよう単独登録を外します（Scriptura の項目だけを取り除き、ほかの設定には触れません）。
 
 ```powershell
 scriptura connect claude-code --remove           # プレビュー
@@ -251,7 +249,7 @@ CLI・hook・インストーラー案内の出力は 9 言語（ja・en・zh-CN�
 | `run-now [--repo <path>] [--documents <id,...>]` | push を待たず、いま 1 回保守を実行する（登録済みで一時停止中でないリポジトリだけ。タイミングは無視して有効な種類をすべて処理する）。文書は通常の実行と同じく commit・push される。`--documents` で処理する種類を絞れる（未定義・このリポジトリで無効な種類は worker を起動せず拒否）。**注意**: 絞った `run-now` も処理済み位置を進めるので、絞り込みの外の種類はその push について保守されない。成功すると `outcome` は `completed`。 |
 | `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | 文書の種類（組み込み・カスタム）の一覧と 1 件の詳細を表示する（有効・無効、対象パスと存在、上限、タイミング、テンプレートの状態、最終完了時刻。`show` は設定した指針・追加指示の本文も出す。読み取り専用で、文書の内容は出さない）。 |
 | `ui [--port <n>] [--no-open] [--tray]` / `ui --autostart on\|off` | 管理画面を起動する（前述。`--tray` で常駐）/ Setup 版のログオン時の常駐を切り替える。`--json` は使えない。 |
-| `connect claude-code [--apply] [--executable <絶対パス>]` / `--remove [--apply]` | settings.json の hook を登録（旧保守 hook は hook 単位で置換）/ Scriptura の hook だけ解除する。`--apply` を付けるまでプレビュー。 |
+| `connect claude-code [--apply] [--executable <絶対パス>]` / `--remove [--apply]` | settings.json の hook を登録（Scriptura の古い hook は hook 単位で置換）/ Scriptura の hook だけ解除する。`--apply` を付けるまでプレビュー。 |
 | `update [--check] [--auto on\|off]` | Setup 版の自動更新の状態を表示する / 今すぐ確認・取得する（適用はしない）/ 自動更新を切り替える。 |
 | `update-apply` | 取得済みの更新を、Scriptura の他のプロセスが動いていないときだけ署名者を確かめて適用する（ログオン時に自動で起動。結果は JSON 1 行で `status` は `unmanaged` / `disabled` / `nothingPending` / `busy` / `untrusted`（終了コード 2）/ `applied`）。 |
 | `uninstall-setup [--apply]` | Setup 版の登録（自分を指す hook とログオン時の適用）を外す。`--apply` を付けるまでプレビュー。 |
@@ -273,7 +271,7 @@ CLI・hook・インストーラー案内の出力は 9 言語（ja・en・zh-CN�
 
 `scriptura doctor [--verify] [--json]` は項目ごとに `{id, status, detail}`（status は `ok` / `warn` / `fail` / `info`）を返します。`fail` があると終了コードは 1 です。
 
-対応プラットフォーム、`git`、`claude`（実行ファイルの解決）、`claude auth status`（worker と同じ環境で実行し、終了コードと `authMethod` だけを見ます）、`gh`（有効な登録の GitHub リポジトリがあるときだけ）、設定（旧形式の設定の `configLegacy`、移行で止めた登録の `migratedStopped`、廃止した更新案のパッチが残っているときの `legacyProposals` を含む）、状態フォルダーへの書き込み可否、hook の二重登録、`allowManagedHooksOnly` / `disableAllHooks`、旧 `agents-maintenance` の残存登録を確認します。Setup 版では、プラグインと Setup 版の登録の重複（`setupPlugin`）、Setup 版の hook の有無（`setupHook`）、旧単独導入の残存（`legacyInstall`）、自動更新の状態（`autoUpdate`）も出します（Setup 版でなければ `setup` の `info` 1 項目だけ）。`kinds` 項目は、文書の種類のテンプレートが読めるか（場所とサイズ）を確認し、上限が既存の文書の現在の大きさより小さいとき（次の保守が棄却されうる）と、`CHANGELOG.md` を保守するリポジトリがあるとき（リリース手順との競合）に `info` を出します。`--verify` はプラグイン同梱の `SHA256SUMS` に載る本体（`bin/scriptura.exe`・`libexec/scriptura-*`）の SHA-256 だけを照合します（ランチャー・hooks・skills は対象外。プラグイン外の実行ファイルも対象外）。
+対応プラットフォーム、`git`、`claude`（実行ファイルの解決）、`claude auth status`（worker と同じ環境で実行し、終了コードと `authMethod` だけを見ます）、`gh`（有効な登録の GitHub リポジトリがあるときだけ）、設定（旧形式の設定の `configLegacy`、移行で止めた登録の `migratedStopped`、廃止した更新案のパッチが残っているときの `legacyProposals` を含む）、状態フォルダーへの書き込み可否、hook の二重登録、`allowManagedHooksOnly` / `disableAllHooks` を確認します。Setup 版では、プラグインと Setup 版の登録の重複（`setupPlugin`）、Setup 版の hook の有無（`setupHook`）、旧単独導入の残存（`legacyInstall`）、自動更新の状態（`autoUpdate`）も出します（Setup 版でなければ `setup` の `info` 1 項目だけ）。`kinds` 項目は、文書の種類のテンプレートが読めるか（場所とサイズ）を確認し、上限が既存の文書の現在の大きさより小さいとき（次の保守が棄却されうる）と、`CHANGELOG.md` を保守するリポジトリがあるとき（リリース手順との競合）に `info` を出します。`--verify` はプラグイン同梱の `SHA256SUMS` に載る本体（`bin/scriptura.exe`・`libexec/scriptura-*`）の SHA-256 だけを照合します（ランチャー・hooks・skills は対象外。プラグイン外の実行ファイルも対象外）。
 
 ## 状態と保存場所
 
@@ -282,11 +280,11 @@ CLI・hook・インストーラー案内の出力は 9 言語（ja・en・zh-CN�
 | 導入先（固定の実行ファイル `bin\scriptura(.exe)`） | `%LOCALAPPDATA%\Programs\Scriptura` | `~/Library/Application Support/Scriptura/app` | `$XDG_DATA_HOME/scriptura`（既定 `~/.local/share/scriptura`） |
 | 状態（DB・ロック・publications・保守履歴（DB 内）・設定の変更履歴 `config-history/`・実行中の保守の記録 `activity/`（終わると消える）・更新のインストール後の自動ログイン用の `ui-handoff.json`（鍵のハッシュだけ。次の起動時に消える）・常駐のログインを保つ `ui-sessions-<port>.json`（セッションのハッシュだけ。終了しても残る）） | `%LOCALAPPDATA%\Scriptura\state` | `~/Library/Application Support/Scriptura/state` | `$XDG_STATE_HOME/scriptura`（既定 `~/.local/state/scriptura`） |
 
-`SCRIPTURA_HOME` を絶対パスで設定すると、状態は `<SCRIPTURA_HOME>/state`、導入先は `<SCRIPTURA_HOME>/app`、設定は `<SCRIPTURA_HOME>/config.toml` になります。`SCRIPTURA_DB` で状態 DB だけを別の場所にもできます。テンプレートは設定ファイルと同じフォルダーの `templates/` に置きます。Codex や Claude Code のホームには書き込みません（`connect claude-code --apply` / `--remove` と、Setup 版の自動登録・`uninstall-setup --apply` が `settings.json` を書き換える場合を除く）。Setup 版の導入先（Windows `%LOCALAPPDATA%\ScripturaApp`）は Velopack が管理し、更新で入れ替わるため、状態や設定は置きません。
+`SCRIPTURA_HOME` を絶対パスで設定すると、状態は `<SCRIPTURA_HOME>/state`、導入先は `<SCRIPTURA_HOME>/app`、設定は `<SCRIPTURA_HOME>/config.toml` になります。`SCRIPTURA_DB` で状態 DB だけを別の場所にもできます。テンプレートは設定ファイルと同じフォルダーの `templates/` に置きます。Claude Code のホームには書き込みません（`connect claude-code --apply` / `--remove` と、Setup 版の自動登録・`uninstall-setup --apply` が `settings.json` を書き換える場合を除く）。Setup 版の導入先（Windows `%LOCALAPPDATA%\ScripturaApp`）は Velopack が管理し、更新で入れ替わるため、状態や設定は置きません。
 
 ## 旧利用者の自動移行
 
-旧版の Scriptura（設定ファイルを持たなかった版）で動かしていて状態 DB が残っている利用者が、設定ファイル無しで hook を実行すると、従来と同じ動作（全リポジトリ・`push` モード・権限バイパス）の設定を一度だけ自動で作り、その旨を通知します。新規の利用者には何も作りません。対象を絞りたいときは `enable` で登録し直し、`policy = "explicit"` にしてください。旧 `agents-maintenance`（`~/.codex/hooks/state`）の状態は引き継がず、空の状態から始めます。
+旧版の Scriptura（設定ファイルを持たなかった版）で動かしていて状態 DB が残っている利用者が、設定ファイル無しで hook を実行すると、従来と同じ動作（全リポジトリ・`push` モード・権限バイパス）の設定を一度だけ自動で作り、その旨を通知します。新規の利用者には何も作りません。対象を絞りたいときは `enable` で登録し直し、`policy = "explicit"` にしてください。
 
 ## 旧設定の移行（同意と propose の廃止）
 

@@ -1,6 +1,6 @@
 # Repository guidance
 
-Scriptura は、利用者が登録したリポジトリへの push 後に `AGENTS.md` / `DESIGN.md` / `README.md`（オプトインで `CHANGELOG.md` とカスタム種類）を保守する単独アプリです。既定は安全側に倒し、CodexHooks・`~/.codex` には依存しません。
+Scriptura は、利用者が登録したリポジトリへの push 後に `AGENTS.md` / `DESIGN.md` / `README.md`（オプトインで `CHANGELOG.md` とカスタム種類）を保守する単独アプリです。既定は安全側に倒します。
 
 ## 全作業に共通の規則
 

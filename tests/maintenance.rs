@@ -1283,7 +1283,6 @@ fn post_tool_use_payload_filter_accepts_push_words_and_skips_other_commands() {
     for pushed in [
         "git push",
         "git push origin main",
-        "rtk git push",
         "git -C D:/repo push origin HEAD",
         "git -c core.x=y push",
         "FOO=1 git push",
@@ -1393,7 +1392,7 @@ fn codex_shaped_payloads_process_a_push() {
     let payload = json!({
         "session_id":"s","transcript_path":"t","model":"gpt","permission_mode":"default",
         "hook_event_name":"PostToolUse","cwd":f.root,"tool_name":"Bash","tool_use_id":"u",
-        "tool_input":{"command":"rtk git -C . push origin HEAD"},
+        "tool_input":{"command":"git -C . push origin HEAD"},
         "tool_response":{"exit_code":0,"stdout":"ok"}
     });
     assert_eq!(handle_hook(&payload).unwrap(), None);

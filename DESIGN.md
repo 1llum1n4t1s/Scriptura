@@ -4,7 +4,7 @@
 
 ## 目的
 
-利用者が登録した自分のリポジトリへの push 後に、`AGENTS.md` / `DESIGN.md` / `README.md`（オプトインで `CHANGELOG.md` と利用者定義のカスタム種類）を AI（Claude Code の worker）で保守する単独アプリです。他人に配る製品として、既定は安全側（オプトイン）に倒します。Codex・`~/.codex` には依存しません。
+利用者が登録した自分のリポジトリへの push 後に、`AGENTS.md` / `DESIGN.md` / `README.md`（オプトインで `CHANGELOG.md` と利用者定義のカスタム種類）を AI（Claude Code の worker）で保守する単独アプリです。他人に配る製品として、既定は安全側（オプトイン）に倒します。
 
 ## 主要コンポーネントと責務
 

@@ -943,7 +943,7 @@ fn doctor_reports_leftover_proposal_patches_without_touching_them() {
 }
 
 #[test]
-fn doctor_warns_about_duplicate_registration_policy_and_legacy_hooks() {
+fn doctor_warns_about_duplicate_registration_policy_and_old_stop_hooks() {
     let fx = Fx::new();
     // 単独登録だけ・プラグインだけでは警告しない。
     fx.write_settings(&json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "\"C:/x/Scriptura/bin/scriptura.exe\" hook"}]}]}}));
@@ -996,7 +996,7 @@ fn doctor_warns_about_duplicate_registration_policy_and_legacy_hooks() {
     // 組織ポリシー・旧登録。
     fx.write_settings(&json!({
         "disableAllHooks": true,
-        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "bun C:/h/agents-maintenance.ts"}]}]}
+        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "bun C:/h/other-tool.ts"}]}]}
     }));
     let v = fx.run(&["doctor", "--json"]).json();
     assert_eq!(item(&v, "hookPolicy")["status"], "warn");
@@ -1006,7 +1006,6 @@ fn doctor_warns_about_duplicate_registration_policy_and_legacy_hooks() {
             .unwrap()
             .contains("disableAllHooks")
     );
-    assert_eq!(item(&v, "legacyHook")["status"], "warn");
 }
 
 #[test]
@@ -1133,7 +1132,7 @@ fn stop_hook_migrates_the_old_registration_once_without_creating_state() {
     let fx = Fx::new();
     let own = format!("\"{}\" hook", EXE.replace('\\', "/"));
     let original = json!({"model": "keep", "hooks": {"Stop": [
-        {"hooks": [{"type": "command", "command": "bun C:/h/agents-maintenance.ts"}]},
+        {"hooks": [{"type": "command", "command": "bun C:/h/other-tool.ts"}]},
         {"hooks": [{"type": "command", "command": own, "async": true, "timeout": 1800}]}
     ]}});
     fx.write_settings(&original);
@@ -1153,7 +1152,7 @@ fn stop_hook_migrates_the_old_registration_once_without_creating_state() {
         after["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("agents-maintenance")
+            .contains("other-tool")
     );
     assert_eq!(
         after["hooks"]["PostToolUse"][0]["hooks"][0]["if"],
@@ -1204,7 +1203,7 @@ fn connect_remove_drops_only_scriptura_entries_and_is_safe_and_idempotent() {
         "hooks": {
             "Stop": [
                 {"hooks": [{"type": "command", "command": "\"C:/x/Scriptura/bin/scriptura.exe\" hook", "async": true}]},
-                {"hooks": [{"type": "command", "command": "bun C:/h/agents-maintenance.ts"}]},
+                {"hooks": [{"type": "command", "command": "bun C:/h/other-tool.ts"}]},
                 {"hooks": [{"type": "command", "command": "other-tool stop"}]}
             ],
             "PostToolUse": [
@@ -1252,7 +1251,7 @@ fn connect_remove_drops_only_scriptura_entries_and_is_safe_and_idempotent() {
         stop[0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("agents-maintenance")
+            .contains("other-tool")
     );
     assert_eq!(stop[1]["hooks"][0]["command"], "other-tool stop");
     // 新しい登録（PostToolUse・SessionStart）の Scriptura の hook も外れ、他ツールの項目と空のイベントの整理は保たれる。

@@ -21,7 +21,7 @@
 //!   フック（install / updated / uninstall）からも呼び、いずれも必ず終了コード 0 で終える。macOS・Linux には
 //!   フックもアンインストーラーも無いため、引数なしの起動とログオン時の `update-apply` で登録し、解除は利用者が
 //!   `uninstall-setup --apply` で行う（[`uninstall_setup`]）。
-//! - Remnifold と違い、Scriptura には MCP も Codex への登録も CLI 呼び出しも無い。登録は `connect` が
+//! - Remnifold と違い、Scriptura には MCP も CLI 呼び出しも無い。登録は `connect` が
 //!   settings.json を直接編集するだけなので、CLI の時間制限の仕組みは持たない。
 //!
 //! # 保存先
@@ -1015,7 +1015,7 @@ fn doctor_item(id: &str, status: &str, detail: impl Into<String>) -> Value {
 }
 
 /// `doctor` の Setup 関連の項目。管理外では「Setup 版ではない」の 1 項目だけを返す。
-/// `plugin_enabled` / `legacy_hook` は doctor が settings.json から読んだ値。
+/// `plugin_enabled` / `own_hook` は doctor が settings.json から読んだ値。
 pub fn doctor_items(plugin_enabled: bool, own_hook: bool) -> Vec<Value> {
     let Some(context) = SetupContext::detect() else {
         return vec![doctor_item(
@@ -1094,7 +1094,7 @@ pub fn doctor_items(plugin_enabled: bool, own_hook: bool) -> Vec<Value> {
 
 /// 引数なしで起動されたとき（Setup 直後の初回起動・スタートメニュー・AppImage の直接起動）の案内。
 /// 管理下でなければ false を返し、呼び出し元は従来の使い方を表示する。
-/// 登録は同期で確かめてから、導入状態・自動更新・案内（プラグイン重複・旧 hook・旧単独導入の残存）を表示する。
+/// 登録は同期で確かめてから、導入状態・自動更新・案内（プラグイン重複・旧単独導入の残存）を表示する。
 pub fn welcome(first_run: bool) -> bool {
     use std::io::{BufRead, IsTerminal};
     let Some(context) = SetupContext::detect() else {
@@ -1124,9 +1124,6 @@ pub fn welcome(first_run: bool) -> bool {
     }
     if scan.plugin_enabled && scan.own_hook {
         println!("{}", crate::t!("setup.welcome_duplicate"));
-    }
-    if scan.legacy_hook {
-        println!("{}", crate::t!("setup.welcome_legacy_hook"));
     }
     if let Some(exe) = legacy_install() {
         println!(

@@ -14,7 +14,7 @@
 //!
 //! # 状態ファイル
 //! 状態フォルダーの `setup-registration.json` に、登録した実行ファイルのパス・版・Claude Code 登録の結果
-//! （`registered` / `plugin` / `failed`）・ログオン時の適用の登録の有無・旧 agents-maintenance の hook の有無を覚え、
+//! （`registered` / `plugin` / `failed`）・ログオン時の適用の登録の有無を覚え、
 //! 次の場合だけ処理する。普段は状態ファイルと settings.json を読むだけで終わる。
 //! - パスが変わった（初回・導入先の移動）: ログオン時の適用と settings.json の登録を行う。
 //! - 版だけが変わった（更新の後）: ログオン時の適用の定義を張り直し、settings.json は「自分を指す hook が
@@ -54,8 +54,6 @@ pub struct State {
     pub claude: Option<String>,
     /// ログオン時の適用を登録したか（別の導入のエントリが残っていて触れなかった場合は false）。
     pub logon: bool,
-    /// settings.json に旧 agents-maintenance の Stop hook が残っていたか（置き換えずに案内だけする）。
-    pub legacy_hook: bool,
 }
 
 impl State {
@@ -66,7 +64,6 @@ impl State {
             "version": self.version,
             "claude": self.claude,
             "logon": self.logon,
-            "legacyHook": self.legacy_hook,
         })
     }
 }
@@ -106,7 +103,6 @@ pub fn parse(bytes: &[u8]) -> State {
             .filter(|s| [REGISTERED, PLUGIN, FAILED].contains(s))
             .map(str::to_owned),
         logon: value["logon"].as_bool().unwrap_or(false),
-        legacy_hook: value["legacyHook"].as_bool().unwrap_or(false),
     }
 }
 
@@ -231,16 +227,10 @@ pub fn ensure(state_dir: &Path, settings: &Path, context: &SetupContext, label: 
     if let Some(outcome) = outcome {
         log_line(state_dir, &format!("{label}: claude {outcome:?}"));
         match outcome {
-            SetupRegistration::Registered { legacy_hook, .. } => {
-                state.claude = Some(REGISTERED.into());
-                state.legacy_hook = legacy_hook;
-            }
-            SetupRegistration::Plugin { legacy_hook, .. } => {
-                state.claude = Some(PLUGIN.into());
-                state.legacy_hook = legacy_hook;
-            }
+            SetupRegistration::Registered { .. } => state.claude = Some(REGISTERED.into()),
+            SetupRegistration::Plugin { .. } => state.claude = Some(PLUGIN.into()),
             // 更新後の確認で自分の hook が無かった（利用者が外した）: 状態はそのまま（戻さない）。
-            SetupRegistration::Absent { legacy_hook } => state.legacy_hook = legacy_hook,
+            SetupRegistration::Absent => {}
             SetupRegistration::Failed(_) => state.claude = Some(FAILED.into()),
         }
     }
@@ -262,7 +252,6 @@ mod tests {
             version: Some("1.0.0".into()),
             claude: Some(REGISTERED.into()),
             logon: true,
-            legacy_hook: false,
         }
     }
 
@@ -384,12 +373,18 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         assert_eq!(load(&dir), State::default());
         let state = State {
-            legacy_hook: true,
             claude: Some(PLUGIN.into()),
             ..registered()
         };
         save(&dir, &state).unwrap();
         assert_eq!(load(&dir), state);
+        // 旧版が書いた `legacyHook` が残っていても読める（未知のフィールドは無視する）。
+        fs::write(
+            dir.join(STATE_FILE),
+            br#"{"claude":"plugin","legacyHook":true}"#,
+        )
+        .unwrap();
+        assert_eq!(load(&dir).claude.as_deref(), Some(PLUGIN));
         // 未知の語は未処理として扱う（やり直す側へ倒す）。
         fs::write(dir.join(STATE_FILE), br#"{"claude":"weird"}"#).unwrap();
         assert_eq!(load(&dir).claude, None);

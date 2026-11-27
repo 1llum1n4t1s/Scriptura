@@ -2548,7 +2548,7 @@ fn canonical_event(raw: &str) -> &'static str {
 /// 文字列または文字列の配列）。状態 DB・ロックに触れる前の軽い判定で、判定できない形（コマンドが取れない・未知のツール）は
 /// 処理側に倒す（push の有無は Git から検出するので、誤って通しても害がない）。
 /// コマンドに `push` の語（`pushd` などは含めない）があれば通す。`git` の語は要求しない。Claude Code の `if`
-/// （`* push*`）を通った `g push`・`make push`・`npm run push`・`$GIT push` や、`rtk git push`・`git -C <path> push`・
+/// （`* push*`）を通った `g push`・`make push`・`npm run push`・`$GIT push` や、`git -C <path> push`・
 /// 複合コマンド・`bash -c 'git push'` を落とさないため。ファイル編集・MCP のツールは対象外。
 pub fn payload_may_push(payload: &Value) -> bool {
     let tool = payload["tool_name"].as_str().unwrap_or("");

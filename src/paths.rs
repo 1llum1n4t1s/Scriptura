@@ -1,4 +1,4 @@
-// Scriptura 自身の保存場所を決める。Codex や Claude Code のホームには何も置かない。
+// Scriptura 自身の保存場所を決める。Claude Code のホームには何も置かない。
 //
 // 解決順:
 // 1. SCRIPTURA_HOME（明示の上書き。テストの隔離や、別の場所を使いたい場合）

@@ -256,9 +256,6 @@ fn render_setup(setup: &Value) -> Vec<String> {
         Some("registered") => lines.push(crate::t!("cli.setup.claude_registered").into()),
         _ => lines.push(crate::t!("cli.setup.claude_unregistered").into()),
     }
-    if setup["registration"]["legacyHook"] == json!(true) {
-        lines.push(crate::t!("cli.setup.legacy_hook").into());
-    }
     if let Some(path) = setup["legacyInstall"].as_str() {
         lines.push(crate::t!("cli.setup.legacy_install", path = path));
     }

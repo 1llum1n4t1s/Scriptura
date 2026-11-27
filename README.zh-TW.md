@@ -2,13 +2,11 @@
 
 # Scriptura
 
-Scriptura 會在你 push 到自己的儲存庫之後，於背景維護 `AGENTS.md` / `DESIGN.md` / `README.md`（以及可選擇啟用的 `CHANGELOG.md` 和使用者自訂文件）。它由 Claude Code 的 hook 啟動（在透過 Bash 或 PowerShell 工具執行 `git push` 之後，以及工作階段開始時補處理遺漏的 push），負責維護的 worker 是 Claude Code CLI（預設為 `claude -p --model claude-sonnet-5-5 --effort medium`）。它不依賴 Codex。
+Scriptura 會在你 push 到自己的儲存庫之後，於背景維護 `AGENTS.md` / `DESIGN.md` / `README.md`（以及可選擇啟用的 `CHANGELOG.md` 和使用者自訂文件）。它由 Claude Code 的 hook 啟動（在透過 Bash 或 PowerShell 工具執行 `git push` 之後，以及工作階段開始時補處理遺漏的 push），負責維護的 worker 是 Claude Code CLI（預設為 `claude -p --model claude-sonnet-5-5 --effort medium`）。
 
 - **預設即安全。** 在你用 `scriptura enable`（或在管理介面）註冊儲存庫之前，什麼都不會執行，而啟用需要 remote 與 upstream。沒有審核步驟：每次 push 之後，worker 會更新目標文件，Scriptura 會自動 commit 並 push；維護後檢查發現目標文件以外有變更時，不會 commit。同意紀錄與先前的 `propose` 模式（更新提案）已被移除（請見「舊設定的遷移」）。
 - 設定只會從使用者家目錄下的單一檔案（`config.toml`）及其旁邊的 `templates/` 資料夾讀取。儲存庫內的檔案一律不會被當作啟用或設定的來源（因此只是 clone 他人的儲存庫，也絕不會觸發自動行為）。
 - 設定也可以在 `scriptura ui`（以瀏覽器操作的管理介面，詳見後文）中編輯。
-
-本工具是從前身 `agents-maintenance`（CodexHooks）中，將文件維護的部分獨立出來的單機工具。維護判定、狀態管理與發布（commit 與 push）的契約皆與其相同。
 
 ## 安裝
 
@@ -20,7 +18,7 @@ Scriptura 會在你 push 到自己的儲存庫之後，於背景維護 `AGENTS.m
 
 執行 `ScripturaApp-win-Setup.exe`（Windows）、`ScripturaApp-osx-Setup.pkg`（macOS）或 AppImage `ScripturaApp-linux-x64.AppImage` / `ScripturaApp-linux-arm64.AppImage`（Linux x64 / arm64）即可以每位使用者為單位安裝，不需要系統管理員權限（在 Windows 上的安裝位置為 `%LOCALAPPDATA%\ScripturaApp\current\scriptura.exe`）。更新由 `https://scriptura-updates.kagayoi.com` 提供（Velopack 的摘要來源檔名為 `releases.<channel>.json`，頻道有 `win` / `osx` / `linux-x64` / `linux-arm64`）。Windows 版本以 Certum 憑證簽署，macOS 版本以 Developer ID 簽署並已公證。執行需求：macOS 11 以上的 Apple Silicon（不支援 Intel）；Linux 需要 glibc 2.39 以上。
 
-- **自動註冊**：安裝時（Windows 為安裝 hook；macOS 與 Linux 為安裝後第一次不帶參數的啟動），Claude Code `settings.json` 中的 hook 會被指向 Setup 版的執行檔。只會取代 Scriptura 自己的 hook（指向舊版單機安裝 `%LOCALAPPDATA%\Programs\Scriptura\bin\scriptura.exe` 的 hook 會被換成 Setup 版的，舊檔案不會被刪除）。既有的 `agents-maintenance` hook 不會被取代；`status` / `doctor` / 不帶參數的啟動會提示你使用 `scriptura connect claude-code --apply`。
+- **自動註冊**：安裝時（Windows 為安裝 hook；macOS 與 Linux 為安裝後第一次不帶參數的啟動），Claude Code `settings.json` 中的 hook 會被指向 Setup 版的執行檔。只會取代 Scriptura 自己的 hook（指向舊版單機安裝 `%LOCALAPPDATA%\Programs\Scriptura\bin\scriptura.exe` 的 hook 會被換成 Setup 版的，舊檔案不會被刪除）。
 - **避免與外掛程式重複**：若 `settings.json` 的 `enabledPlugins` 中啟用了 `scriptura@*`，Setup 版就不會註冊到 `settings.json`（否則維護會執行兩次）。請擇一：繼續使用外掛程式，或停用外掛程式並改用 Setup 版。停用之後，會在不帶參數的啟動或下一次登入時自動完成註冊。
 - **自動更新（預設開啟）**：hook 的維護結束後，最多每天檢查一次是否有新版本（成功與失敗都以 24 小時為間隔節流），並且只下載。**只會在登入時套用**：登入時執行的 `scriptura update-apply`（Windows 為 HKCU Run 值 `<packId> Update`；macOS 為 LaunchAgent `com.kagayoi.<packId>.update`；Linux 為 XDG autostart 項目 `com.kagayoi.<packId>.update.desktop`）會確認沒有任何 Scriptura hook 或管理介面正在執行，並檢查簽署者，然後在不重新啟動的情況下套用更新。只要有任何一個正在執行，它就什麼都不做，並把更新留到下次登入（因此維護進行中的 hook 絕不會被中止）。 也可以在需要時用管理介面中的「安裝更新」（見下文）手動套用。
 - 狀態存放於狀態資料夾（詳見後文）：`app-update.json`（`auto_update` 與最近的檢查／失敗時間）、`app-update.log`（診斷用）、`setup-registration.json`（註冊結果）。
@@ -46,11 +44,11 @@ cargo build --release
 & "$env:LOCALAPPDATA\Programs\Scriptura\bin\scriptura.exe" connect claude-code --apply  # 註冊到 settings.json
 ```
 
-`connect claude-code --apply` 會將固定的安裝路徑註冊到 Claude Code `settings.json`（`CLAUDE_CONFIG_DIR` 或 `~/.claude`）的 hook。它只會逐個 hook 取代呼叫舊版 `agents-maintenance` 以及舊版 Scriptura 的 hook（同一項目中的其他 hook 會保留），其餘設定一律不動。指令只有在形式為 `<executable> hook` 且執行檔名稱為 `scriptura(.exe)` 時，才會被視為 Scriptura 的 hook；僅僅是路徑中含有 scriptura 的其他工具不受影響。第一次變更之前，它會建立 `settings.json.scriptura-backup`，且不會改寫已損壞的 JSON。
+`connect claude-code --apply` 會將固定的安裝路徑註冊到 Claude Code `settings.json`（`CLAUDE_CONFIG_DIR` 或 `~/.claude`）的 hook。它只會逐個 hook 取代呼叫舊版 Scriptura 的 hook（同一項目中的其他 hook 會保留），其餘設定一律不動。指令只有在形式為 `<executable> hook` 且執行檔名稱為 `scriptura(.exe)` 時，才會被視為 Scriptura 的 hook；僅僅是路徑中含有 scriptura 的其他工具不受影響。第一次變更之前，它會建立 `settings.json.scriptura-backup`，且不會改寫已損壞的 JSON。
 
-舊的註冊使用每個回合都會觸發的 Stop hook。`--apply` 與 Setup 版的註冊會移除 Scriptura 舊的 Stop hook，改為註冊三種 hook：Bash、PowerShell 工具中含有 `push` 的指令之後的 PostToolUse 與 PostToolUseFailure（後者在 `git push && gh pr create` 這類指令於 push 之後失敗時觸發），以及 `startup` / `resume` 時的 SessionStart。`--remove` 會同時移除新舊 hook。指令之後的 hook 依每個工具一條權限規則 `Bash(* push*)`（`PowerShell(* push*)` 亦同）篩選，因此 `git push`、`rtk git push`、`git -C <path> push`、`FOO=1 git push`、`bash -lc 'git push'`、`make push` 都會命中；`echo push x` 之類多餘的命中只會因找不到新的 push 而不做任何事。這些 hook 是非同步的，即使另一次維護正在執行也不會跳過，而是最多等待 25 分鐘再處理，因此在維護期間進行的 push 之後也會被處理。在 Claude Code 之外進行的 push，或推送到工作階段工作目錄以外的儲存庫（`git -C <其他路徑> push`），會在該儲存庫下次開始工作階段時補處理。舊的 Stop hook 仍會被接受（不等待），被它呼叫時，Scriptura 會自動把使用者層級 settings.json 中的舊註冊遷移到新的 hook（僅一次），並以訊息告知（原內容備份為 `settings.json.scriptura-migration-backup[-N]`；不會更動專案的 `.claude/settings*.json`，也不會還原已用 `--remove` 移除的註冊）。啟用 scriptura 外掛程式時，只會移除舊 hook 而不新增新的。Setup 版透過它自己的註冊流程遷移。
+舊的註冊使用每個回合都會觸發的 Stop hook。`--apply` 與 Setup 版的註冊會移除 Scriptura 舊的 Stop hook，改為註冊三種 hook：Bash、PowerShell 工具中含有 `push` 的指令之後的 PostToolUse 與 PostToolUseFailure（後者在 `git push && gh pr create` 這類指令於 push 之後失敗時觸發），以及 `startup` / `resume` 時的 SessionStart。`--remove` 會同時移除新舊 hook。指令之後的 hook 依每個工具一條權限規則 `Bash(* push*)`（`PowerShell(* push*)` 亦同）篩選，因此 `git push`、`git -C <path> push`、`FOO=1 git push`、`bash -lc 'git push'`、`make push` 都會命中；`echo push x` 之類多餘的命中只會因找不到新的 push 而不做任何事。這些 hook 是非同步的，即使另一次維護正在執行也不會跳過，而是最多等待 25 分鐘再處理，因此在維護期間進行的 push 之後也會被處理。在 Claude Code 之外進行的 push，或推送到工作階段工作目錄以外的儲存庫（`git -C <其他路徑> push`），會在該儲存庫下次開始工作階段時補處理。舊的 Stop hook 仍會被接受（不等待），被它呼叫時，Scriptura 會自動把使用者層級 settings.json 中的舊註冊遷移到新的 hook（僅一次），並以訊息告知（原內容備份為 `settings.json.scriptura-migration-backup[-N]`；不會更動專案的 `.claude/settings*.json`，也不會還原已用 `--remove` 移除的註冊）。啟用 scriptura 外掛程式時，只會移除舊 hook 而不新增新的。Setup 版透過它自己的註冊流程遷移。
 
-改用外掛程式時，請移除單機版的註冊，以免維護執行兩次（這只會移除 Scriptura 的項目，不會動到 `agents-maintenance` 或其他設定）。
+改用外掛程式時，請移除單機版的註冊，以免維護執行兩次（這只會移除 Scriptura 的項目，不會動到其他設定）。
 
 ```powershell
 scriptura connect claude-code --remove           # 預覽
@@ -251,7 +249,7 @@ CLI、hook 與安裝程式的指引輸出提供 9 種語言（ja、en、zh-CN、
 | `run-now [--repo <path>] [--documents <id,...>]` | 不等待 push，立即執行一次維護（僅限已註冊且未暫停的儲存庫；忽略時機，並處理所有已啟用的種類）。文件會和一般執行一樣被 commit 並 push。`--documents` 可縮小要處理的種類（未定義的種類，或在該儲存庫中已停用的種類，會在不啟動 worker 的情況下被拒絕）。**注意**：縮小範圍的 `run-now` 同樣會推進已處理位置，因此縮小範圍之外的種類在該次 push 中不會被維護。成功時 `outcome` 為 `completed`。 |
 | `docs list [--repo <path>]` / `docs show <id> [--repo <path>]` | 列出文件種類（內建與自訂），並顯示單一種類的詳細資訊（啟用或停用、目標路徑及其是否存在、上限、時機、範本狀態、最後完成時間；`show` 也會印出已設定的 guidance 與額外指示。唯讀，且不會印出文件內容）。 |
 | `ui [--port <n>] [--no-open] [--tray]` / `ui --autostart on\|off` | 啟動管理介面（詳見前文；`--tray` 使其常駐）/ 切換 Setup 版的登入時常駐設定。不可使用 `--json`。 |
-| `connect claude-code [--apply] [--executable <absolute path>]` / `--remove [--apply]` | 註冊 settings.json 的 hook（逐個 hook 取代舊版維護 hook）／只移除 Scriptura 的 hook。在傳入 `--apply` 之前僅為預覽。 |
+| `connect claude-code [--apply] [--executable <absolute path>]` / `--remove [--apply]` | 註冊 settings.json 的 hook（逐個 hook 取代Scriptura 的舊版 hook）／只移除 Scriptura 的 hook。在傳入 `--apply` 之前僅為預覽。 |
 | `update [--check] [--auto on\|off]` | 顯示 Setup 版的自動更新狀態／立即檢查並下載（不套用）／切換自動更新。 |
 | `update-apply` | 僅在沒有其他 Scriptura 處理程序正在執行時，才在驗證簽署者之後套用已下載的更新（登入時自動啟動。結果為一行 JSON，其 `status` 為 `unmanaged` / `disabled` / `nothingPending` / `busy` / `untrusted`（結束碼 2）/ `applied`）。 |
 | `uninstall-setup [--apply]` | 移除 Setup 版的註冊（指向自己的 hook 與登入時套用）。在傳入 `--apply` 之前僅為預覽。 |
@@ -273,7 +271,7 @@ CLI、hook 與安裝程式的指引輸出提供 9 種語言（ja、en、zh-CN、
 
 `scriptura doctor [--verify] [--json]` 會為每個項目回傳 `{id, status, detail}`（status 為 `ok` / `warn` / `fail` / `info`）。只要有任何 `fail`，結束碼就是 1。
 
-它會檢查所支援的平台、`git`、`claude`（執行檔的解析）、`claude auth status`（在與 worker 相同的環境中執行，只查看結束碼與 `authMethod`）、`gh`（僅在有已啟用的 GitHub 儲存庫時）、設定（包含代表舊格式設定的 `configLegacy`、代表被遷移停止的註冊的 `migratedStopped`，以及代表已移除的更新提案遺留修補檔的 `legacyProposals`）、狀態資料夾是否可寫入、重複的 hook 註冊、`allowManagedHooksOnly` / `disableAllHooks`，以及舊版 `agents-maintenance` 遺留的註冊。對於 Setup 版，它還會回報外掛程式與 Setup 版之間的重複註冊（`setupPlugin`）、Setup 版的 hook 是否存在（`setupHook`）、遺留的舊版單機安裝（`legacyInstall`），以及自動更新狀態（`autoUpdate`）（非 Setup 版則只有單一個 `info` 項目 `setup`）。`kinds` 項目會檢查文件種類的範本是否可讀取（位置與大小），並在上限小於既有文件目前的大小時（下一次維護可能會被駁回），以及存在維護 `CHANGELOG.md` 的儲存庫時（與發布流程衝突），回報 `info`。`--verify` 只會檢查外掛程式隨附的 `SHA256SUMS` 中所列執行檔（`bin/scriptura.exe` 與 `libexec/scriptura-*`）的 SHA-256（啟動器、hook 與 skill 不在範圍內；外掛程式之外的執行檔也不在範圍內）。
+它會檢查所支援的平台、`git`、`claude`（執行檔的解析）、`claude auth status`（在與 worker 相同的環境中執行，只查看結束碼與 `authMethod`）、`gh`（僅在有已啟用的 GitHub 儲存庫時）、設定（包含代表舊格式設定的 `configLegacy`、代表被遷移停止的註冊的 `migratedStopped`，以及代表已移除的更新提案遺留修補檔的 `legacyProposals`）、狀態資料夾是否可寫入、重複的 hook 註冊，以及 `allowManagedHooksOnly` / `disableAllHooks`。對於 Setup 版，它還會回報外掛程式與 Setup 版之間的重複註冊（`setupPlugin`）、Setup 版的 hook 是否存在（`setupHook`）、遺留的舊版單機安裝（`legacyInstall`），以及自動更新狀態（`autoUpdate`）（非 Setup 版則只有單一個 `info` 項目 `setup`）。`kinds` 項目會檢查文件種類的範本是否可讀取（位置與大小），並在上限小於既有文件目前的大小時（下一次維護可能會被駁回），以及存在維護 `CHANGELOG.md` 的儲存庫時（與發布流程衝突），回報 `info`。`--verify` 只會檢查外掛程式隨附的 `SHA256SUMS` 中所列執行檔（`bin/scriptura.exe` 與 `libexec/scriptura-*`）的 SHA-256（啟動器、hook 與 skill 不在範圍內；外掛程式之外的執行檔也不在範圍內）。
 
 ## 狀態與儲存位置
 
@@ -282,11 +280,11 @@ CLI、hook 與安裝程式的指引輸出提供 9 種語言（ja、en、zh-CN、
 | 安裝位置（固定的執行檔 `bin\scriptura(.exe)`） | `%LOCALAPPDATA%\Programs\Scriptura` | `~/Library/Application Support/Scriptura/app` | `$XDG_DATA_HOME/scriptura`（預設為 `~/.local/share/scriptura`） |
 | 狀態（DB、鎖、發布、維護歷程（在 DB 中）、設定變更歷史 `config-history/`、執行中的維護記錄 `activity/`（結束後刪除）、更新安裝後自動登入用的 `ui-handoff.json`（只含金鑰的雜湊，下次啟動時刪除）、用於保持常駐登入的 `ui-sessions-<port>.json`（只含工作階段的雜湊，結束後保留）） | `%LOCALAPPDATA%\Scriptura\state` | `~/Library/Application Support/Scriptura/state` | `$XDG_STATE_HOME/scriptura`（預設為 `~/.local/state/scriptura`） |
 
-將 `SCRIPTURA_HOME` 設為絕對路徑時，狀態會放在 `<SCRIPTURA_HOME>/state`，安裝位置為 `<SCRIPTURA_HOME>/app`，設定則為 `<SCRIPTURA_HOME>/config.toml`。`SCRIPTURA_DB` 也可以只把狀態 DB 移到別處。範本放在與設定檔相同資料夾的 `templates/` 中。不會寫入任何東西到 Codex 或 Claude Code 的家目錄（除了 `connect claude-code --apply` / `--remove`、Setup 版的自動註冊，以及 `uninstall-setup --apply` 會改寫 `settings.json` 之外）。Setup 版的安裝位置（Windows 為 `%LOCALAPPDATA%\ScripturaApp`）由 Velopack 管理，並會在更新時被取代，因此不會在那裡保存任何狀態或設定。
+將 `SCRIPTURA_HOME` 設為絕對路徑時，狀態會放在 `<SCRIPTURA_HOME>/state`，安裝位置為 `<SCRIPTURA_HOME>/app`，設定則為 `<SCRIPTURA_HOME>/config.toml`。`SCRIPTURA_DB` 也可以只把狀態 DB 移到別處。範本放在與設定檔相同資料夾的 `templates/` 中。不會寫入任何東西到 Claude Code 的家目錄（除了 `connect claude-code --apply` / `--remove`、Setup 版的自動註冊，以及 `uninstall-setup --apply` 會改寫 `settings.json` 之外）。Setup 版的安裝位置（Windows 為 `%LOCALAPPDATA%\ScripturaApp`）由 Velopack 管理，並會在更新時被取代，因此不會在那裡保存任何狀態或設定。
 
 ## 舊版使用者的自動遷移
 
-曾執行過較舊的 Scriptura（沒有設定檔的版本）且仍保有狀態 DB 的使用者，在沒有設定檔的情況下執行 hook 時，會自動建立恰好一次設定檔，其行為與以往相同（所有儲存庫、`push` 模式、權限 bypass），並會收到通知。新使用者不會建立任何東西。若想縮小對象範圍，請以 `enable` 重新註冊，並設定 `policy = "explicit"`。舊版 `agents-maintenance` 的狀態（`~/.codex/hooks/state`）不會被沿用；它會從空的狀態開始。
+曾執行過較舊的 Scriptura（沒有設定檔的版本）且仍保有狀態 DB 的使用者，在沒有設定檔的情況下執行 hook 時，會自動建立恰好一次設定檔，其行為與以往相同（所有儲存庫、`push` 模式、權限 bypass），並會收到通知。新使用者不會建立任何東西。若想縮小對象範圍，請以 `enable` 重新註冊，並設定 `policy = "explicit"`。
 
 ## 舊設定的遷移（移除同意與 propose）
 

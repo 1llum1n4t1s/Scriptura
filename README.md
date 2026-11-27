@@ -2,7 +2,7 @@
 
 # Scriptura
 
-Scriptura maintains `AGENTS.md` / `DESIGN.md` / `README.md` (and, as opt-ins, `CHANGELOG.md` and custom documents) in the background after you push to your own repositories. Claude Code hooks start it, and its worker is the Claude Code CLI. It does not depend on Codex.
+Scriptura maintains `AGENTS.md` / `DESIGN.md` / `README.md` (and, as opt-ins, `CHANGELOG.md` and custom documents) in the background after you push to your own repositories. Claude Code hooks start it, and its worker is the Claude Code CLI.
 
 - **Safe by default.** Nothing runs until you register a repository with `scriptura enable` (or in the admin UI). After each push, the worker updates the target documents, and Scriptura commits and pushes them only if the post-run checks pass.
 - Settings are read only from `config.toml` in your user settings folder, never from files inside a repository.
