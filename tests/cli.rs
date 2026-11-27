@@ -5,7 +5,10 @@
 //! `~/.claude` は読み書きしない。`claude` / `gh` は既存のスタブ（本物の Claude は呼ばない）。
 //! 環境変数は各子プロセスにだけ渡すので、テスト同士は干渉しない（プロセス全体の環境は変えない）。
 //! fixture の置き場は `SCRIPTURA_TEST_BASE`（未指定なら既存テストと同じ `validation/`）。
+//! 作業フォルダーはテストの終わりに消す（残すときは `SCRIPTURA_KEEP_TEST_DIRS`。`tests/common/mod.rs`）。
 #![cfg(feature = "test-support")]
+mod common;
+use common::Scratch;
 use scriptura::config::{self, Config, Loaded, MigratedFrom};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -41,6 +44,8 @@ impl Out {
 struct Fx {
     base: PathBuf,
     repo: PathBuf,
+    /// 最後に手放す（テストの成否を問わず、作業フォルダーを消す）
+    _scratch: Scratch,
 }
 
 fn same_path(a: impl AsRef<Path>, b: impl AsRef<Path>) -> bool {
@@ -50,18 +55,20 @@ fn same_path(a: impl AsRef<Path>, b: impl AsRef<Path>) -> bool {
 impl Fx {
     /// 空の一時環境と、push 済みの Git リポジトリ（main が upstream を持つ）を作る。
     fn new() -> Self {
-        let parent = env::var_os("SCRIPTURA_TEST_BASE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("validation"));
-        let base = parent.join(format!(
-            "cli-{}-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::SeqCst),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let scratch = Scratch::create(
+            &common::base_dir(),
+            "cli-",
+            &format!(
+                "{}-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::SeqCst),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ),
+        );
+        let base = scratch.to_path_buf();
         for dir in ["bin", "home", "claude", "localappdata", "state"] {
             fs::create_dir_all(base.join(dir)).unwrap();
         }
@@ -76,7 +83,11 @@ impl Fx {
         )
         .unwrap();
         let repo = base.join("repo");
-        let fx = Self { base, repo };
+        let fx = Self {
+            base,
+            repo,
+            _scratch: scratch,
+        };
         let bare = fx.base.join("remote.git");
         fx.make_repo(&fx.repo);
         git_global(&["init", "--bare", "-b", "main", bare.to_str().unwrap()]);

@@ -322,4 +322,4 @@ Setup 판(Velopack)의 검증은 실제 설치, `~/.claude/settings.json`, HKCU 
 - 끝나면 테스트용 Run 값(`<test packId> Update`), 제거 정보, 설치 위치를 제거합니다.
 - 레지스트리 단위 테스트는 실제 Run 키가 아니라 파일에 가둔 전용 hive(`RegLoadAppKeyW`)를 사용합니다.
 
-테스트는 로컬의 격리된 Git 저장소와 네이티브 스텁을 사용하며, 실제 Claude CLI나 외부 저장소를 호출하지 않습니다. `validation` 폴더(또는 `SCRIPTURA_TEST_BASE`로 지정한 위치)는 자동으로 삭제되지 않으므로, 출력되는 절대 경로를 확인하고 Prunlet으로 정리하십시오. `hook-test-stub`은 `test-support` feature 전용이며 배포되지 않습니다.
+테스트는 로컬의 격리된 Git 저장소와 네이티브 스텁을 사용하며, 실제 Claude CLI나 외부 저장소를 호출하지 않습니다. 각 테스트는 작업 폴더를 `validation` 폴더(또는 `SCRIPTURA_TEST_BASE`로 지정한 위치) 아래에 만들고, 테스트가 실패하더라도 테스트가 끝날 때 삭제합니다. 실패를 조사하기 위해 폴더를 남기려면 환경 변수 `SCRIPTURA_KEEP_TEST_DIRS`에 아무 값이나 설정하십시오(삭제도 정리도 하지 않습니다). 실행할 때마다 남은 폴더(중단된 실행의 것이나, `SCRIPTURA_KEEP_TEST_DIRS`로 남긴 것이 1시간이 지난 뒤 이 변수 없이 다음 실행을 한 경우)도 정리합니다. 정리 대상은 테스트가 두는 표식 파일 `.scriptura-scratch`가 있고, 이름이 테스트가 쓰는 이름(예: `maintenance-`)으로 시작하며, 실제 디렉터리(링크·정션이 아님)이고, 마지막 수정이 1시간보다 오래된 폴더뿐입니다. 1시간보다 새로운 것(동시에 실행 중인 다른 실행의 것일 수 있음)과 표식이 없는 폴더는 지우지 않습니다. `ops` 테스트의 작업 폴더는 기본적으로 `validation`이 아니라 cargo의 `target/tmp`에 만들어지며 같은 규칙을 따릅니다. `compat-golden`은 고정 이름으로 재사용하므로 늘어나지 않습니다. `hook-test-stub`은 `test-support` feature 전용이며 배포되지 않습니다.

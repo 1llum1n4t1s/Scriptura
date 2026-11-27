@@ -2,6 +2,10 @@
 //! - 純粋関数: 節の分割、リリース済みエントリ不変の検査（規則 1〜6）、版とタグの照合、資料の上限。
 //! - I/O: 実際の Git リポジトリでの起点・範囲内のタグ・履歴の収集・遡り・release の期限判定・保守後検査。
 //! push 検知・worker との結合は tests/maintenance.rs。
+//!
+//! 作業フォルダーはテストの終わりに消す（残すときは `SCRIPTURA_KEEP_TEST_DIRS`。`tests/common/mod.rs`）。
+mod common;
+use common::Scratch;
 use scriptura::changelog::{
     self, CHANGELOG_PATH, MATERIAL_MAX_BYTES, OWN_COMMIT_SUBJECT, base_commit, builtin_template,
     check_released_entries, collect_material, fit_material, has_version_section, parse,
@@ -437,33 +441,36 @@ fn material_strings_are_sanitized_and_the_json_is_capped() {
 // I/O: 実際の Git リポジトリ
 // ---------------------------------------------------------------------------
 
-fn runtime_dir(name: &str) -> PathBuf {
-    let base = std::env::var_os("SCRIPTURA_TEST_BASE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("validation"));
-    let dir = base.join("changelog-runtime").join(format!(
-        "{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+/// 返した値を手放すと消える（残すときは `SCRIPTURA_KEEP_TEST_DIRS`）。
+fn runtime_dir(name: &str) -> Scratch {
+    Scratch::create(
+        &common::base_dir().join("changelog-runtime"),
+        "",
+        &format!(
+            "{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ),
+    )
 }
 
 /// コミット日時を固定して並びを決定的にした、テスト用の Git リポジトリ。
 struct Repo {
     root: PathBuf,
+    /// 最後に手放す（テストの成否を問わず、作業フォルダーを消す）
+    _scratch: Scratch,
     clock: std::cell::Cell<i64>,
 }
 
 impl Repo {
     fn new(name: &str) -> Self {
-        let root = runtime_dir(name);
+        let scratch = runtime_dir(name);
         let repo = Repo {
-            root,
+            root: scratch.to_path_buf(),
+            _scratch: scratch,
             clock: std::cell::Cell::new(1_767_225_600), // 2026-01-01
         };
         repo.git(&["init", "-q", "-b", "main"]);

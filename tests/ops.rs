@@ -3,6 +3,8 @@
 // 隔離: 場所は `config::Store` で明示し、環境変数（SCRIPTURA_* など）は一切触らない。
 // 実環境の設定・状態フォルダーは読み書きしない。fixture の置き場は `SCRIPTURA_TEST_BASE`
 // （未指定なら cargo の CARGO_TARGET_TMPDIR）。
+mod common;
+use common::Scratch;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -16,19 +18,32 @@ use scriptura::config::{
 };
 use scriptura::ops::{self, EnablePlan};
 
-fn base() -> PathBuf {
-    let parent = std::env::var_os("SCRIPTURA_TEST_BASE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
-    let dir = parent.join(format!("ops-{}", uuid::Uuid::new_v4().simple()));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+/// `Store` と、その作業フォルダー。手放すと（テストの成否を問わず）フォルダーごと消える
+/// （残すときは `SCRIPTURA_KEEP_TEST_DIRS`）。
+struct TestStore {
+    store: Store,
+    /// 最後に手放す
+    _scratch: Scratch,
+}
+
+impl std::ops::Deref for TestStore {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        &self.store
+    }
 }
 
 /// 設定ファイル（base/config/config.toml）と状態フォルダー（base/state）を分けた場所。
-fn store() -> Store {
-    let b = base();
-    Store::new(b.join("config").join("config.toml"), b.join("state"))
+/// 置き場は `SCRIPTURA_TEST_BASE`（未指定なら cargo の CARGO_TARGET_TMPDIR）。
+fn store() -> TestStore {
+    let parent = std::env::var_os("SCRIPTURA_TEST_BASE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
+    let b = Scratch::create(&parent, "ops-", &uuid::Uuid::new_v4().simple().to_string());
+    TestStore {
+        store: Store::new(b.join("config").join("config.toml"), b.join("state")),
+        _scratch: b,
+    }
 }
 
 fn repo(root: &str) -> Repository {

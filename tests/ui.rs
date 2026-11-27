@@ -6,12 +6,15 @@
 //! （先頭にスタブの claude）を一時フォルダーへ向ける。環境変数はプロセス全体の値なので、グローバルな Mutex で
 //! テストを直列化する（nextest はテストごとに別プロセスなので効かないが、`cargo test` でも安全なよう残す）。実環境の設定・状態は読み書きしない。
 //! fixture の置き場は `SCRIPTURA_TEST_BASE`（未指定なら既存テストと同じ `validation/`）。
+//! 作業フォルダーはテストの終わりに消す（残すときは `SCRIPTURA_KEEP_TEST_DIRS`。`tests/common/mod.rs`）。
 #![cfg(all(feature = "test-support", feature = "ui"))]
+mod common;
 use axum::{
     Router,
     body::Body,
     http::{HeaderMap, Request, StatusCode, header},
 };
+use common::Scratch;
 use http_body_util::BodyExt;
 use regex::Regex;
 use scriptura::{
@@ -92,24 +95,28 @@ struct Fx {
     app: Router,
     cookie: String,
     csrf: String,
+    /// 最後に手放す（テストの成否を問わず、作業フォルダーを消す）
+    _scratch: Scratch,
 }
 
 impl Fx {
     /// 空の一時環境と、push 済みの Git リポジトリ（main が upstream を持つ）を作り、画面へログインする。
     async fn new() -> Self {
         let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let parent = env::var_os("SCRIPTURA_TEST_BASE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("validation"));
-        let base = parent.join(format!(
-            "ui-{}-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::SeqCst),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let scratch = Scratch::create(
+            &common::base_dir(),
+            "ui-",
+            &format!(
+                "{}-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::SeqCst),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ),
+        );
+        let base = scratch.to_path_buf();
         // 状態フォルダー（state）は作らない（閲覧で作られないことを確かめるため）。
         for dir in ["bin", "home", "claude", "localappdata"] {
             fs::create_dir_all(base.join(dir)).unwrap();
@@ -183,6 +190,7 @@ impl Fx {
             app,
             cookie: String::new(),
             csrf: String::new(),
+            _scratch: scratch,
         };
         let r = fx.raw(get(&format!("/auth?key={key}"))).await;
         assert_eq!(r.status, StatusCode::SEE_OTHER, "{}", r.body);
@@ -445,9 +453,7 @@ async fn host_origin_cookie_and_one_time_key_are_enforced() {
 async fn session_cookie_is_http_only_strict_and_key_is_single_use() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 鍵の交換だけを見るので、設定・状態の場所は存在しないパスでよい（何も書かれない）。
-    let unused = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("validation")
-        .join("ui-unused");
+    let unused = common::base_dir().join("ui-unused");
     let store = Store::new(unused.join("config.toml"), unused.join("state"));
     let (state, key) = AppState::new(store, PORT);
     let app = ui::router(state);
@@ -474,9 +480,7 @@ async fn session_cookie_is_http_only_strict_and_key_is_single_use() {
 async fn reissued_keys_replace_old_ones_and_expired_sessions_are_refused() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 鍵と Cookie だけを見るので、設定・状態の場所は存在しないパスでよい（何も書かれない）。
-    let unused = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("validation")
-        .join("ui-unused");
+    let unused = common::base_dir().join("ui-unused");
     let store = Store::new(unused.join("config.toml"), unused.join("state"));
     let (state, first) = AppState::new(store, PORT);
     let app = ui::router(state.clone());
@@ -1973,30 +1977,57 @@ fn http(port: u16, request: &str) -> (String, String, String) {
     (status.to_string(), headers.to_string(), body.to_string())
 }
 
+/// 手放すときに子プロセスを止めて待つ（終了済みなら何もしない）
+struct KillOnDrop(std::process::Child);
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn real_server_binds_loopback_on_port_zero_and_shuts_down_from_the_page() {
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let parent = env::var_os("SCRIPTURA_TEST_BASE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("validation"));
-    let base = parent.join(format!(
-        "ui-bind-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::SeqCst)
-    ));
+    let base = Scratch::create(
+        &common::base_dir(),
+        "ui-bind-",
+        &format!(
+            "{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::SeqCst)
+        ),
+    );
     fs::create_dir_all(base.join("claude")).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_scriptura"))
-        .args(["ui", "--port", "0", "--no-open"])
-        .env("SCRIPTURA_HOME", base.join("home"))
-        .env("SCRIPTURA_CONFIG", base.join("config.toml"))
-        .env("SCRIPTURA_DB", base.join("state").join("state.sqlite3"))
-        .env("CLAUDE_CONFIG_DIR", base.join("claude"))
-        .env("LOCALAPPDATA", base.join("localappdata"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    // `base` より後に宣言する（panic しても、子プロセスを止めてから作業フォルダーを消す）
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_scriptura"))
+            .args(["ui", "--port", "0", "--no-open"])
+            .env("SCRIPTURA_HOME", base.join("home"))
+            .env("SCRIPTURA_CONFIG", base.join("config.toml"))
+            .env("SCRIPTURA_DB", base.join("state").join("state.sqlite3"))
+            .env("CLAUDE_CONFIG_DIR", base.join("claude"))
+            .env("LOCALAPPDATA", base.join("localappdata"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     let first = lines.next().unwrap().unwrap();
     let url = first.split_whitespace().last().unwrap().to_string();

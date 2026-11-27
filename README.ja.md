@@ -322,4 +322,4 @@ Setup 版（Velopack）の検証は、本物の導入・`~/.claude/settings.json
 - 終わったらテスト用の Run 値（`<テスト用 packId> Update`）・アンインストール情報・導入先を外す。
 - レジストリの単体テストは実際の Run キーではなく、ファイルに閉じた専用のハイブ（`RegLoadAppKeyW`）を使います。
 
-テストはローカルの隔離 Git リポジトリとネイティブスタブを使い、実際の Claude CLI や外部リポジトリを呼びません。`validation` フォルダー（または `SCRIPTURA_TEST_BASE` で指定した場所）は自動削除しないので、出力された絶対パスを確認して Prunlet で清掃してください。`hook-test-stub` は `test-support` feature 専用で、配置しません。
+テストはローカルの隔離 Git リポジトリとネイティブスタブを使い、実際の Claude CLI や外部リポジトリを呼びません。各テストは作業フォルダーを `validation` フォルダー（または `SCRIPTURA_TEST_BASE` で指定した場所）の下に作り、テストの終わりに（失敗しても）消します。失敗の調査用に残すときは、環境変数 `SCRIPTURA_KEEP_TEST_DIRS` に何か値を設定してください（削除も掃除も行いません）。実行のたびに、取り残しのフォルダー（中断した実行のものや、`SCRIPTURA_KEEP_TEST_DIRS` で残したもので 1 時間を過ぎ、次に付けずに流した場合）も掃除します。掃除するのは、テストが置く印のファイル `.scriptura-scratch` があり、名前がテストの使う名前（例: `maintenance-`）で始まり、実体のディレクトリ（リンク・ジャンクションでない）で、更新から 1 時間より古いものだけです。1 時間より新しいもの（並行する別の実行のもの）と、印の無いフォルダーは消しません。`ops` テストの作業フォルダーは、既定では `validation` ではなく cargo の `target/tmp` に作り、同じ規則に従います。`compat-golden` は固定名で使い回すので増えません。`hook-test-stub` は `test-support` feature 専用で、配置しません。

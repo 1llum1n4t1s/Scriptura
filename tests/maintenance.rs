@@ -1,4 +1,6 @@
 #![cfg(feature = "test-support")]
+mod common;
+use common::Scratch;
 use rusqlite::Connection;
 use scriptura::config::{
     self, Config, Document, MigratedFrom, Permission, Policy, Repository, Worker,
@@ -331,6 +333,8 @@ struct Fixture {
     root: PathBuf,
     remote: PathBuf,
     old_path: std::ffi::OsString,
+    /// 最後に手放す（テストの成否を問わず、作業フォルダーを消す）
+    _scratch: Scratch,
 }
 impl Fixture {
     /// 旧動作相当の設定（policy=all・push・bypass・同意あり・3 文書）を置いた環境。
@@ -341,18 +345,20 @@ impl Fixture {
     fn with_config(config: Option<Config>) -> Self {
         let guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
         // 置き場は `SCRIPTURA_TEST_BASE` で変えられる（未指定なら従来どおり `validation/`）。
-        let parent = env::var_os("SCRIPTURA_TEST_BASE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("validation"));
-        let base = parent.join(format!(
-            "maintenance-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&base).unwrap();
+        // 作業フォルダーは Fixture を手放すとき（テストの成否を問わず）に消える。残すときは `SCRIPTURA_KEEP_TEST_DIRS`。
+        let scratch = Scratch::create(
+            &common::base_dir(),
+            "maintenance-",
+            &format!(
+                "{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ),
+        );
+        let base = scratch.to_path_buf();
         let root = base.join("repo");
         let remote = base.join("remote.git");
         let bin = base.join("bin");
@@ -406,6 +412,7 @@ impl Fixture {
             root,
             remote,
             old_path,
+            _scratch: scratch,
         };
         f.git(&["init", "-b", "main"]);
         f.git(&["config", "user.email", "test@example.invalid"]);
@@ -571,6 +578,11 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         if env::var_os("HOOK_CHILD_EXIT").is_some() {
             let _ = fs::write(self.base.join("child-exit"), "exit");
+            // 補助プロセスが終わるまで待つ（作業フォルダーを使ったまま消されないように）
+            let pid = fs::read_to_string(self.base.join("child.pid")).unwrap_or_default();
+            if pid.trim().parse::<u32>().is_ok() {
+                let _ = wait_process_exit(&pid, 5000);
+            }
         }
         unsafe {
             env::set_var("PATH", &self.old_path);

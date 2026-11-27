@@ -1,6 +1,8 @@
 //! プラグイン骨組み（plugins/scriptura・marketplace.json）の構造テスト。
 //! 本物のモデルは呼ばず、`claude plugin validate` だけを（claude がある場合に）実行する。
 
+mod common;
+use common::Scratch;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -282,11 +284,13 @@ fn find_sh() -> Option<PathBuf> {
 }
 
 /// 試験用の一時プラグインルートを作る（本物のランチャーを bin/ へ複製する）。
-fn temp_plugin_root(tag: &str) -> PathBuf {
-    let parent = std::env::var_os("SCRIPTURA_TEST_BASE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| root().join("validation"));
-    let dir = parent.join(format!("launcher-{tag}-{}", std::process::id()));
+/// 返した値を手放すと消える（残すときは `SCRIPTURA_KEEP_TEST_DIRS`）。
+fn temp_plugin_root(tag: &str) -> Scratch {
+    let dir = Scratch::create(
+        &common::base_dir(),
+        "launcher-",
+        &format!("{tag}-{}", std::process::id()),
+    );
     let _ = std::fs::create_dir_all(dir.join("bin"));
     std::fs::copy(
         plugin_dir().join("bin/scriptura"),

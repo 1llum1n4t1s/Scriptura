@@ -571,7 +571,10 @@ fn sensitive_matcher_matches_defaults_and_additions() {
 // 実行時（P2）: 対象パスの組み立て・上限と必須見出しの検査・テンプレートの場所検査・プロンプトの断片
 // ---------------------------------------------------------------------------
 //
-// 使い捨てフォルダーは `SCRIPTURA_TEST_BASE`（未指定なら `validation/`）の下に作る。実環境の設定・状態には触れない。
+// 使い捨てフォルダーは `SCRIPTURA_TEST_BASE`（未指定なら `validation/`）の下に作り、テストの終わりに消す
+// （残すときは `SCRIPTURA_KEEP_TEST_DIRS`。`tests/common/mod.rs`）。実環境の設定・状態には触れない。
+mod common;
+use common::Scratch;
 use scriptura::kinds::{
     LoadedTemplate, ResolvedKind, active_kinds, has_heading, keeps_deleted, kind_of_path,
     limit_error, load_templates, other_scope, plan_documents, settings_frame,
@@ -595,15 +598,13 @@ fn run_stamp() -> u128 {
     })
 }
 
-fn runtime_dir(name: &str) -> PathBuf {
-    let base = std::env::var_os("SCRIPTURA_TEST_BASE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("validation"));
-    let dir =
-        base.join("kinds-runtime")
-            .join(format!("{name}-{}-{}", std::process::id(), run_stamp()));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+/// 返した値を手放すと消える（残すときは `SCRIPTURA_KEEP_TEST_DIRS`）。
+fn runtime_dir(name: &str) -> Scratch {
+    Scratch::create(
+        &common::base_dir().join("kinds-runtime"),
+        "",
+        &format!("{name}-{}-{}", std::process::id(), run_stamp()),
+    )
 }
 
 fn write(root: &Path, rel: &str, body: &str) {
@@ -849,21 +850,23 @@ fn agents_limit_applies_to_override_and_nested_files() {
     );
 }
 
-fn template_setup(name: &str) -> (PathBuf, PathBuf, Vec<ResolvedKind>) {
-    let settings = runtime_dir(&format!("tpl-{name}")).join("settings");
+/// 先頭の `Scratch` はテストの間だけ持つ（手放すと消える）
+fn template_setup(name: &str) -> (Scratch, PathBuf, PathBuf, Vec<ResolvedKind>) {
+    let dir = runtime_dir(&format!("tpl-{name}"));
+    let settings = dir.join("settings");
     fs::create_dir_all(settings.join("templates")).unwrap();
-    let repo = runtime_dir(&format!("tpl-{name}")).join("repo");
+    let repo = dir.join("repo");
     fs::create_dir_all(&repo).unwrap();
     let kinds = resolve(
         &format!("{ARCH}template = \"templates/arch.md\"\n"),
         "\"architecture\"",
     );
-    (settings, repo, kinds)
+    (dir, settings, repo, kinds)
 }
 
 #[test]
 fn templates_are_loaded_with_normalization_and_a_hash_of_the_raw_bytes() {
-    let (settings, repo, kinds) = template_setup("ok");
+    let (_dir, settings, repo, kinds) = template_setup("ok");
     let raw = "# 概要\r\n\r\n- 責務\r\n";
     fs::write(settings.join("templates/arch.md"), raw).unwrap();
     let loaded = load_templates(&kinds, &settings, &repo).unwrap();
@@ -890,7 +893,7 @@ fn templates_are_loaded_with_normalization_and_a_hash_of_the_raw_bytes() {
 
 #[test]
 fn template_runtime_checks_hold_the_run() {
-    let (settings, repo, kinds) = template_setup("bad");
+    let (_dir, settings, repo, kinds) = template_setup("bad");
     let path = settings.join("templates/arch.md");
     let err = |kinds: &[ResolvedKind], settings: &Path, repo: &Path| {
         load_templates(kinds, settings, repo).unwrap_err()
@@ -936,7 +939,7 @@ fn template_inside_the_processed_repository_is_rejected() {
 #[cfg(windows)]
 #[test]
 fn template_directory_junction_is_rejected() {
-    let (settings, repo, _) = template_setup("junction");
+    let (_dir, settings, repo, _) = template_setup("junction");
     let outside = settings.parent().unwrap().join("outside");
     fs::create_dir_all(&outside).unwrap();
     fs::write(outside.join("arch.md"), "# outside").unwrap();
@@ -962,7 +965,7 @@ fn template_directory_junction_is_rejected() {
 
 #[test]
 fn template_links_and_escapes_are_rejected() {
-    let (settings, repo, kinds) = template_setup("link");
+    let (_dir, settings, repo, kinds) = template_setup("link");
     let outside = settings.parent().unwrap().join("outside.md");
     fs::write(&outside, "# outside").unwrap();
     // 権限が無い環境ではシンボリックリンクを作れないので、その場合は確認を省く（他の検査は別テストで行う）。
@@ -981,7 +984,7 @@ fn template_links_and_escapes_are_rejected() {
 // ---- プロンプトの断片 ------------------------------------------------------
 
 /// `.gitignore` 付きの使い捨てリポジトリ（ignore 判定の文面を再現するため `git init` する）。
-fn git_repo(name: &str) -> PathBuf {
+fn git_repo(name: &str) -> Scratch {
     let root = runtime_dir(name);
     assert!(
         Command::new("git")
@@ -1244,7 +1247,7 @@ fn git_ok(root: &Path, args: &[&str]) {
 }
 
 /// 使い捨ての git リポジトリを作る（利用者の署名・hook の設定は使わない）。
-fn split_repo(name: &str) -> PathBuf {
+fn split_repo(name: &str) -> Scratch {
     let root = runtime_dir(name);
     git_ok(&root, &["init", "-q", "-b", "main"]);
     for (key, value) in [

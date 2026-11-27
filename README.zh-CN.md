@@ -322,4 +322,4 @@ Setup 版（Velopack）的验证按如下方式隔离，以确保绝不会触及
 - 结束后，移除测试用的 Run 值（`<test packId> Update`）、卸载信息和安装位置。
 - 注册表的单元测试使用限定在文件中的专用 hive（`RegLoadAppKeyW`），而不是真实的 Run 键。
 
-测试使用本地隔离的 Git 仓库和原生桩，不会调用真实的 Claude CLI 或任何外部仓库。`validation` 文件夹（或 `SCRIPTURA_TEST_BASE` 指定的位置）不会被自动删除，因此请确认所输出的绝对路径，并用 Prunlet 清理。`hook-test-stub` 仅限 `test-support` feature 使用，不会被部署。
+测试使用本地隔离的 Git 仓库和原生桩，不会调用真实的 Claude CLI 或任何外部仓库。每个测试都会在 `validation` 文件夹（或 `SCRIPTURA_TEST_BASE` 指定的位置）下创建自己的工作文件夹，并在测试结束时（即使失败）将其删除。若要为排查失败而保留这些文件夹，请将环境变量 `SCRIPTURA_KEEP_TEST_DIRS` 设为任意值（此时不会删除，也不会清理）。每次运行还会清理遗留的文件夹（例如中断的运行留下的，或用 `SCRIPTURA_KEEP_TEST_DIRS` 保留的、已超过 1 小时且下一次运行未设置该变量的）。只有同时满足以下条件的文件夹才会被清理：含有测试放置的标记文件 `.scriptura-scratch`，名称以测试使用的名称（例如 `maintenance-`）开头，是真实目录（不是链接或联接点），且最后修改时间超过 1 小时。不足 1 小时的（可能属于并行的另一次运行）以及没有标记的文件夹不会被删除。`ops` 测试的工作文件夹默认创建在 cargo 的 `target/tmp` 而不是 `validation` 下，并遵循相同规则。`compat-golden` 使用固定名称并重复使用，因此不会增加。`hook-test-stub` 仅限 `test-support` feature 使用，不会被部署。
